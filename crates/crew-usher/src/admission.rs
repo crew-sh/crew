@@ -186,7 +186,7 @@ mod tests {
             mem_available: 64 * GIB,
             cpu_count: 24,
             unmanaged_cores: 0.0,
-            free_disk: vec![("/projects".into(), 500 * GIB), ("/".into(), 100 * GIB)],
+            free_disk: vec![("/data".into(), 500 * GIB), ("/".into(), 100 * GIB)],
             owner_present: false,
             now_ms: 0,
         }
@@ -353,7 +353,10 @@ mod tests {
 
     #[test]
     fn low_disk_refuses_builds_naming_the_path_but_not_games() {
-        let cfg = Config::default();
+        let cfg = Config {
+            min_free_disk_gib: [("/data".to_string(), 50), ("/".to_string(), 20)].into(),
+            ..Config::default()
+        };
         let mut f = facts();
         f.free_disk[0].1 = 30 * GIB;
         let v = verdicts(
@@ -369,7 +372,7 @@ mod tests {
         for verdict in &v[..2] {
             match verdict {
                 Verdict::Refuse(RefusalReason::DiskLow, d) => {
-                    assert!(d.contains("/projects") && d.contains("30"), "{d}")
+                    assert!(d.contains("/data") && d.contains("30"), "{d}")
                 }
                 other => panic!("{other:?}"),
             }

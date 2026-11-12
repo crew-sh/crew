@@ -1,7 +1,8 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io;
-use std::path::Path;
+use std::os::unix::fs::MetadataExt;
+use std::path::{Path, PathBuf};
 
 use crew_proto::JobKind;
 use serde::Deserialize;
@@ -92,6 +93,38 @@ pub struct KindSpec {
     pub exclusive: bool,
 }
 
+fn watched_paths_for(home: Option<&Path>) -> Vec<String> {
+    let mut paths = vec!["/".to_string()];
+    let device = |p: &Path| fs::metadata(p).map(|m| m.dev()).ok();
+    if let Some(home) = home
+        && let (Some(h), Some(root)) = (device(home), device(Path::new("/")))
+        && h != root
+    {
+        paths.push(home.display().to_string());
+    }
+    paths
+}
+
+/// `/`, plus `$HOME` when it lives on a different filesystem.
+fn default_watched_paths() -> Vec<String> {
+    watched_paths_for(std::env::var_os("HOME").map(PathBuf::from).as_deref())
+}
+
+fn tmp_root_for(runtime_dir: Option<&Path>, temp_dir: &Path) -> PathBuf {
+    match runtime_dir {
+        Some(d) if !d.as_os_str().is_empty() => d.join("crew/tmp"),
+        _ => temp_dir.join("crew"),
+    }
+}
+
+/// `$XDG_RUNTIME_DIR/crew/tmp`, else `<system temp dir>/crew`.
+fn default_tmp_root() -> String {
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
+    tmp_root_for(runtime.as_deref(), &std::env::temp_dir())
+        .display()
+        .to_string()
+}
+
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -114,13 +147,10 @@ impl Default for Config {
             min_free_mem_gib: 16,
             max_games: 4,
             cpu_oversub: 1.5,
-            watched_paths: vec!["/projects".into(), "/".into()],
-            min_free_disk_gib: BTreeMap::from([
-                ("/projects".to_string(), 50),
-                ("/".to_string(), 20),
-            ]),
+            watched_paths: default_watched_paths(),
+            min_free_disk_gib: BTreeMap::from([("/".to_string(), 20)]),
             owner_present_weights: OwnerWeights::default(),
-            tmp_root: "/projects/.hz-tmp/crew".into(),
+            tmp_root: default_tmp_root(),
             idle_timeout_secs: 120,
             starve_after_secs: 600,
             kinds: Kinds::default(),
@@ -210,11 +240,17 @@ impl Config {
 mod tests {
     use super::*;
 
+    fn device_of(p: &Path) -> u64 {
+        fs::metadata(p).unwrap().dev()
+    }
+
     #[test]
     fn defaults_match_the_spec() {
         let c = Config::default();
         assert_eq!((c.min_free_mem_gib, c.max_games), (16, 4));
-        assert_eq!(c.min_free_disk("/projects"), Some(50 * GIB));
+        assert_eq!(c.min_free_disk("/"), Some(20 * GIB));
+        assert_eq!(c.min_free_disk_gib.len(), 1);
+        assert_eq!(c.watched_paths[0], "/");
         assert_eq!(c.kind(JobKind::Game).mem_cap, Some(6 * GIB));
         assert_eq!(c.kind(JobKind::Lsp).cpu_weight, 20);
         assert!(c.kind(JobKind::Bench).exclusive);
@@ -223,11 +259,11 @@ mod tests {
 
     #[test]
     fn partial_toml_overrides_only_what_it_names() {
-        let c: Config = toml::from_str("max_games = 2\n[kinds.build]\nexpected_cores = 8.0\n[min_free_disk_gib]\n\"/projects\" = 10\n").unwrap();
+        let c: Config = toml::from_str("max_games = 2\n[kinds.build]\nexpected_cores = 8.0\n[min_free_disk_gib]\n\"/work\" = 10\n").unwrap();
         assert_eq!(c.max_games, 2);
         assert_eq!(c.kind(JobKind::Build).expected_cores, 8.0);
         assert_eq!(c.kind(JobKind::Build).cpu_weight, 100);
-        assert_eq!(c.min_free_disk("/projects"), Some(10 * GIB));
+        assert_eq!(c.min_free_disk("/work"), Some(10 * GIB));
         assert_eq!(c.min_free_disk("/"), None);
     }
 
@@ -237,6 +273,52 @@ mod tests {
         assert!(c.adopt.enabled && !c.adopt.move_ && !c.adopt.freeze);
         let c: Config = toml::from_str("[adopt]\nmove = true\nprotect = [\"lead\"]\n").unwrap();
         assert!(c.adopt.move_ && !c.adopt.freeze && c.adopt.protect == ["lead"]);
+    }
+
+    #[test]
+    fn defaults_name_no_machine_specific_path() {
+        let c = Config::default();
+        assert!(c.watched_paths.iter().all(|p| !p.starts_with("/srv-data")));
+        assert!(!c.tmp_root.contains("/srv-data"));
+        assert!(Path::new(&c.tmp_root).is_absolute());
+    }
+
+    #[test]
+    fn tmp_root_prefers_the_runtime_dir() {
+        let tmp = Path::new("/tmp");
+        assert_eq!(
+            tmp_root_for(Some(Path::new("/run/user/7")), tmp),
+            Path::new("/run/user/7/crew/tmp")
+        );
+        assert_eq!(tmp_root_for(None, tmp), Path::new("/tmp/crew"));
+        assert_eq!(
+            tmp_root_for(Some(Path::new("")), tmp),
+            Path::new("/tmp/crew")
+        );
+    }
+
+    #[test]
+    fn home_is_watched_only_when_it_is_on_another_filesystem() {
+        assert_eq!(watched_paths_for(None), ["/"]);
+        assert_eq!(watched_paths_for(Some(Path::new("/"))), ["/"]);
+        assert_eq!(
+            watched_paths_for(Some(Path::new("/nonexistent-home"))),
+            ["/"]
+        );
+        // /dev/shm is a tmpfs on every systemd machine.
+        let shm = Path::new("/dev/shm");
+        if shm.is_dir() && device_of(shm) != device_of(Path::new("/")) {
+            assert_eq!(watched_paths_for(Some(shm)), ["/", "/dev/shm"]);
+        }
+    }
+
+    #[test]
+    fn a_pre_neutral_usher_toml_still_loads() {
+        let text = "watched_paths = [\"/data\", \"/\"]\ntmp_root = \"/data/tmp/crew\"\n[min_free_disk_gib]\n\"/data\" = 50\n\"/\" = 20\n";
+        let c: Config = toml::from_str(text).unwrap();
+        assert_eq!(c.watched_paths, ["/data", "/"]);
+        assert_eq!(c.tmp_root, "/data/tmp/crew");
+        assert_eq!(c.min_free_disk("/data"), Some(50 * GIB));
     }
 
     #[test]
