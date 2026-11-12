@@ -1,9 +1,13 @@
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result};
 
 const TAIL_LINES: usize = 60;
+/// How much of the end of a check's output is read to find its last lines.
+const TAIL_WINDOW: u64 = 256 << 10;
 /// `crew run` exit codes for "refused" and "error": the check never ran, so nobody is to blame.
 const CREW_REFUSED: i32 = 75;
 const CREW_ERROR: i32 = 125;
@@ -87,27 +91,45 @@ impl CheckRunner {
             if std::env::var_os("CREW_AGENT").is_none() {
                 cmd.env("CREW_AGENT", "queue");
             }
-            let out = cmd
-                .output()
+            // Output goes to an unlinked file, so a chatty check costs disk, not memory; only its tail is read back.
+            let mut output = tempfile::tempfile().context("create the check's output file")?;
+            cmd.stdin(Stdio::null())
+                .stdout(Stdio::from(output.try_clone()?))
+                .stderr(Stdio::from(output.try_clone()?));
+            let status = cmd
+                .status()
                 .with_context(|| format!("spawn check `{command}`"))?;
-            if out.status.success() {
+            if status.success() {
                 return Ok(Attempt::Passed);
             }
-            let text = String::from_utf8_lossy(&out.stdout);
-            let code = out.status.code();
+            let text = tail_of(&mut output)?;
+            let code = status.code();
             let through_crew = self.crew_bin.is_some();
             let infrastructure = code.is_none()
                 || (through_crew
                     && matches!(code, Some(CREW_REFUSED | CREW_ERROR | KILLED | TERMINATED)));
             if infrastructure {
-                return Ok(Attempt::DidNotRun(format!(
-                    "exit {code:?}: {}",
-                    tail(&format!("{text}{}", String::from_utf8_lossy(&out.stderr)))
-                )));
+                return Ok(Attempt::DidNotRun(format!("exit {code:?}: {text}")));
             }
-            Ok(Attempt::Failed(tail(&text)))
+            Ok(Attempt::Failed(text))
         }
     }
+}
+
+/// The last lines of what a check wrote, reading no more than `TAIL_WINDOW` bytes of it.
+fn tail_of(output: &mut File) -> Result<String> {
+    let len = output.seek(SeekFrom::End(0))?;
+    let start = len.saturating_sub(TAIL_WINDOW);
+    output.seek(SeekFrom::Start(start))?;
+    let mut bytes = Vec::new();
+    output.read_to_end(&mut bytes)?;
+    let text = String::from_utf8_lossy(&bytes);
+    // A window that starts mid-line would show half a line first.
+    let text = match (start > 0, text.split_once('\n')) {
+        (true, Some((_, rest))) => rest,
+        _ => &text,
+    };
+    Ok(tail(text))
 }
 
 /// One run of a check command.

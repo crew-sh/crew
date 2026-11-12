@@ -759,3 +759,40 @@ fn gc_keeps_a_dead_owners_worktree_while_a_process_works_in_it() {
     assert!(!rows[0].removed && wt.exists());
     assert!(worktrees::gc(&fx.ctx).unwrap()[0].removed);
 }
+
+/// Peak resident memory of this process, in bytes.
+fn peak_rss() -> u64 {
+    let status = fs::read_to_string("/proc/self/status").unwrap();
+    let kib: u64 = status
+        .lines()
+        .find_map(|l| l.strip_prefix("VmHWM:"))
+        .and_then(|v| v.split_whitespace().next()?.parse().ok())
+        .unwrap();
+    kib * 1024
+}
+
+#[test]
+fn a_chatty_check_costs_no_memory_and_its_last_lines_are_still_reported() {
+    let t = tempdir("crew-queue-chatty-");
+    let before = peak_rss();
+    let cmds = vec![
+        "yes 'a line of output that nobody reads' | head -c 300000000; echo the-last-line; exit 3"
+            .to_string(),
+    ];
+    let out = CheckRunner::default().run_all(t.path(), &cmds).unwrap();
+    let CheckOutcome::Red { tail, .. } = out else {
+        panic!("{out:?}")
+    };
+    assert!(tail.ends_with("the-last-line"), "{tail:?}");
+    assert_eq!(tail.lines().count(), 60);
+    assert!(
+        tail.lines().all(|l| !l.is_empty()),
+        "the window must not start on half a line"
+    );
+    let grown = peak_rss().saturating_sub(before);
+    assert!(
+        grown < 100 << 20,
+        "300 MB of check output grew the process by {} MiB",
+        grown >> 20
+    );
+}
