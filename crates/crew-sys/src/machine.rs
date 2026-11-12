@@ -38,7 +38,10 @@ pub struct Snapshot {
 }
 
 fn read(path: &str) -> Result<String, MachineError> {
-    fs::read_to_string(path).map_err(|source| MachineError::Read { path: path.to_string(), source })
+    fs::read_to_string(path).map_err(|source| MachineError::Read {
+        path: path.to_string(),
+        source,
+    })
 }
 
 pub fn parse_meminfo(text: &str) -> Result<(u64, u64), MachineError> {
@@ -49,7 +52,9 @@ pub fn parse_meminfo(text: &str) -> Result<(u64, u64), MachineError> {
     };
     match (field("MemTotal:"), field("MemAvailable:")) {
         (Some(t), Some(a)) => Ok((t, a)),
-        _ => Err(MachineError::Parse { what: "/proc/meminfo" }),
+        _ => Err(MachineError::Parse {
+            what: "/proc/meminfo",
+        }),
     }
 }
 
@@ -57,7 +62,9 @@ pub fn parse_loadavg(text: &str) -> Result<f64, MachineError> {
     text.split_whitespace()
         .next()
         .and_then(|v| v.parse().ok())
-        .ok_or(MachineError::Parse { what: "/proc/loadavg" })
+        .ok_or(MachineError::Parse {
+            what: "/proc/loadavg",
+        })
 }
 
 /// A missing "some" line (PSI off) reads as zero.
@@ -70,8 +77,15 @@ pub fn parse_psi_some_avg10(text: &str) -> f64 {
 }
 
 pub fn parse_stat_busy_usec(text: &str, ticks_per_sec: u64) -> Result<u64, MachineError> {
-    let line = text.lines().find(|l| l.starts_with("cpu ")).ok_or(MachineError::Parse { what: "/proc/stat" })?;
-    let v: Vec<u64> = line.split_whitespace().skip(1).filter_map(|f| f.parse().ok()).collect();
+    let line = text
+        .lines()
+        .find(|l| l.starts_with("cpu "))
+        .ok_or(MachineError::Parse { what: "/proc/stat" })?;
+    let v: Vec<u64> = line
+        .split_whitespace()
+        .skip(1)
+        .filter_map(|f| f.parse().ok())
+        .collect();
     // user nice system idle iowait irq softirq steal; guest time is already inside user.
     if v.len() < 8 {
         return Err(MachineError::Parse { what: "/proc/stat" });
@@ -86,31 +100,48 @@ pub fn cpu_count() -> u32 {
 }
 
 fn ticks_per_sec() -> u64 {
-    u64::try_from(unsafe { libc::sysconf(libc::_SC_CLK_TCK) }).unwrap_or(100).max(1)
+    u64::try_from(unsafe { libc::sysconf(libc::_SC_CLK_TCK) })
+        .unwrap_or(100)
+        .max(1)
 }
 
 pub fn disk_free(path: &str) -> Result<u64, MachineError> {
-    let c = std::ffi::CString::new(path).map_err(|_| MachineError::Parse { what: "path with NUL" })?;
+    let c = std::ffi::CString::new(path).map_err(|_| MachineError::Parse {
+        what: "path with NUL",
+    })?;
     let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
     if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
-        return Err(MachineError::Statvfs { path: path.to_string(), source: io::Error::last_os_error() });
+        return Err(MachineError::Statvfs {
+            path: path.to_string(),
+            source: io::Error::last_os_error(),
+        });
     }
     Ok(st.f_bavail as u64 * st.f_frsize as u64)
 }
 
 pub fn snapshot(watched: &[String]) -> Result<Snapshot, MachineError> {
     let (mem_total, mem_available) = parse_meminfo(&read("/proc/meminfo")?)?;
-    let psi = |name: &str| fs::read_to_string(Path::new("/proc/pressure").join(name)).map_or(0.0, |t| parse_psi_some_avg10(&t));
+    let psi = |name: &str| {
+        fs::read_to_string(Path::new("/proc/pressure").join(name))
+            .map_or(0.0, |t| parse_psi_some_avg10(&t))
+    };
     let mut disk = Vec::new();
     for path in watched {
-        disk.push(DiskFree { path: path.clone(), free_bytes: disk_free(path)? });
+        disk.push(DiskFree {
+            path: path.clone(),
+            free_bytes: disk_free(path)?,
+        });
     }
     Ok(Snapshot {
         mem_total,
         mem_available,
         cpu_count: cpu_count(),
         load1: parse_loadavg(&read("/proc/loadavg")?)?,
-        psi: Psi { cpu_some_avg10: psi("cpu"), mem_some_avg10: psi("memory"), io_some_avg10: psi("io") },
+        psi: Psi {
+            cpu_some_avg10: psi("cpu"),
+            mem_some_avg10: psi("memory"),
+            io_some_avg10: psi("io"),
+        },
         disk,
         cpu_busy_usec: parse_stat_busy_usec(&read("/proc/stat")?, ticks_per_sec())?,
     })
@@ -123,7 +154,10 @@ mod tests {
     #[test]
     fn meminfo_gives_bytes() {
         let t = "MemTotal:       32768000 kB\nMemFree: 1 kB\nMemAvailable:   16384000 kB\n";
-        assert_eq!(parse_meminfo(t).unwrap(), (32_768_000 * 1024, 16_384_000 * 1024));
+        assert_eq!(
+            parse_meminfo(t).unwrap(),
+            (32_768_000 * 1024, 16_384_000 * 1024)
+        );
         assert!(parse_meminfo("MemTotal: 1 kB\n").is_err());
     }
 
@@ -143,7 +177,10 @@ mod tests {
     #[test]
     fn stat_busy_excludes_idle_and_iowait() {
         let t = "cpu  100 10 50 1000 500 5 5 5 0 0\ncpu0 1 1 1 1 1 1 1 1 0 0\n";
-        assert_eq!(parse_stat_busy_usec(t, 100).unwrap(), (100 + 10 + 50 + 5 + 5 + 5) * 10_000);
+        assert_eq!(
+            parse_stat_busy_usec(t, 100).unwrap(),
+            (100 + 10 + 50 + 5 + 5 + 5) * 10_000
+        );
     }
 
     #[test]

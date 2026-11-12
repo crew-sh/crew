@@ -10,21 +10,40 @@ const DISPLAY_VARS: [&str; 3] = ["WAYLAND_DISPLAY", "WAYLAND_SOCKET", "DISPLAY"]
 /// 128 random bits as a version-4 UUID.
 pub fn new_id() -> String {
     let mut b = [0u8; 16];
-    if File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut b)).is_err() {
-        let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
+    if File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut b))
+        .is_err()
+    {
+        let t = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
         b = (t ^ u128::from(std::process::id())).to_le_bytes();
     }
     b[6] = (b[6] & 0x0f) | 0x40;
     b[8] = (b[8] & 0x3f) | 0x80;
     let h: String = b.iter().map(|x| format!("{x:02x}")).collect();
-    format!("{}-{}-{}-{}-{}", &h[..8], &h[8..12], &h[12..16], &h[16..20], &h[20..])
+    format!(
+        "{}-{}-{}-{}-{}",
+        &h[..8],
+        &h[8..12],
+        &h[12..16],
+        &h[16..20],
+        &h[20..]
+    )
 }
 
 /// Basename of the nearest enclosing git checkout, else of `cwd` itself.
 pub fn project_of(cwd: &Path) -> String {
-    let top: Option<PathBuf> = cwd.ancestors().find(|d| d.join(".git").exists()).map(Path::to_path_buf);
+    let top: Option<PathBuf> = cwd
+        .ancestors()
+        .find(|d| d.join(".git").exists())
+        .map(Path::to_path_buf);
     let dir = top.as_deref().unwrap_or(cwd);
-    dir.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string()
+    dir.file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+        .to_string()
 }
 
 pub struct Inputs<'a> {
@@ -38,7 +57,11 @@ pub struct Inputs<'a> {
 }
 
 pub fn build(i: &Inputs<'_>) -> JobRequest {
-    let declared = (i.mem_bytes.is_some() || i.cpus.is_some()).then(|| Limits { mem_bytes: i.mem_bytes, cpus: i.cpus, ..Limits::default() });
+    let declared = (i.mem_bytes.is_some() || i.cpus.is_some()).then(|| Limits {
+        mem_bytes: i.mem_bytes,
+        cpus: i.cpus,
+        ..Limits::default()
+    });
     JobRequest {
         id: new_id(),
         kind: i.kind as i32,
@@ -49,7 +72,10 @@ pub fn build(i: &Inputs<'_>) -> JobRequest {
         declared,
         needs_display: i.display,
         hz_desktop: i.env.get("HZ_DESKTOP").is_some_and(|v| v == "1"),
-        display_env: DISPLAY_VARS.iter().filter_map(|k| i.env.get(*k).map(|v| ((*k).to_string(), v.clone()))).collect(),
+        display_env: DISPLAY_VARS
+            .iter()
+            .filter_map(|k| i.env.get(*k).map(|v| ((*k).to_string(), v.clone())))
+            .collect(),
     }
 }
 
@@ -79,13 +105,29 @@ mod tests {
 
     #[test]
     fn request_carries_env_derived_fields() {
-        let env: BTreeMap<String, String> = [("CREW_AGENT", "a1"), ("HZ_DESKTOP", "1"), ("DISPLAY", ":0"), ("HOME", "/h")]
-            .iter()
-            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
-            .collect();
+        let env: BTreeMap<String, String> = [
+            ("CREW_AGENT", "a1"),
+            ("HZ_DESKTOP", "1"),
+            ("DISPLAY", ":0"),
+            ("HOME", "/h"),
+        ]
+        .iter()
+        .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+        .collect();
         let argv = vec!["true".to_string()];
-        let r = build(&Inputs { kind: JobKind::Other, argv: &argv, cwd: Path::new("/tmp"), env: &env, mem_bytes: Some(1), cpus: None, display: true });
-        assert_eq!((r.agent.as_str(), r.hz_desktop, r.needs_display), ("a1", true, true));
+        let r = build(&Inputs {
+            kind: JobKind::Other,
+            argv: &argv,
+            cwd: Path::new("/tmp"),
+            env: &env,
+            mem_bytes: Some(1),
+            cpus: None,
+            display: true,
+        });
+        assert_eq!(
+            (r.agent.as_str(), r.hz_desktop, r.needs_display),
+            ("a1", true, true)
+        );
         assert_eq!(r.display_env.len(), 1);
         assert_eq!(r.declared.unwrap().mem_bytes, Some(1));
     }

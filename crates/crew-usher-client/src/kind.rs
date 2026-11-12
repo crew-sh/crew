@@ -20,32 +20,65 @@ struct Rule {
 const WRAPPERS: &[&str] = &["hz"];
 
 const RULES: &[Rule] = &[
-    Rule { programs: &["cargo"], when: Match::Subcommand(&["build", "check", "clippy", "doc"]), kind: JobKind::Build },
-    Rule { programs: &["cargo"], when: Match::Subcommand(&["test", "nextest"]), kind: JobKind::Test },
-    Rule { programs: &["python3", "python"], when: Match::Script(&["tools/parity.py", "tools/lan_e2e.py"]), kind: JobKind::Harness },
-    Rule { programs: &["horizon-client"], when: Match::Always, kind: JobKind::Game },
-    Rule { programs: &["horizon-ctl"], when: Match::AnyArg(&["launch"]), kind: JobKind::Game },
+    Rule {
+        programs: &["cargo"],
+        when: Match::Subcommand(&["build", "check", "clippy", "doc"]),
+        kind: JobKind::Build,
+    },
+    Rule {
+        programs: &["cargo"],
+        when: Match::Subcommand(&["test", "nextest"]),
+        kind: JobKind::Test,
+    },
+    Rule {
+        programs: &["python3", "python"],
+        when: Match::Script(&["tools/parity.py", "tools/lan_e2e.py"]),
+        kind: JobKind::Harness,
+    },
+    Rule {
+        programs: &["horizon-client"],
+        when: Match::Always,
+        kind: JobKind::Game,
+    },
+    Rule {
+        programs: &["horizon-ctl"],
+        when: Match::AnyArg(&["launch"]),
+        kind: JobKind::Game,
+    },
 ];
 
 fn program_name(arg: &str) -> &str {
-    Path::new(arg).file_name().and_then(|n| n.to_str()).unwrap_or(arg)
+    Path::new(arg)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(arg)
 }
 
 fn matches(when: &Match, args: &[String]) -> bool {
     match when {
         Match::Always => true,
         Match::AnyArg(names) => args.iter().any(|a| names.contains(&a.as_str())),
-        Match::Subcommand(names) => args.iter().find(|a| !a.starts_with('+')).is_some_and(|a| names.contains(&a.as_str())),
-        Match::Script(suffixes) => args.first().is_some_and(|a| suffixes.iter().any(|s| Path::new(a).ends_with(s))),
+        Match::Subcommand(names) => args
+            .iter()
+            .find(|a| !a.starts_with('+'))
+            .is_some_and(|a| names.contains(&a.as_str())),
+        Match::Script(suffixes) => args
+            .first()
+            .is_some_and(|a| suffixes.iter().any(|s| Path::new(a).ends_with(s))),
     }
 }
 
 pub fn infer(argv: &[String]) -> JobKind {
     let mut argv = argv;
-    while argv.first().is_some_and(|a| WRAPPERS.contains(&program_name(a))) {
+    while argv
+        .first()
+        .is_some_and(|a| WRAPPERS.contains(&program_name(a)))
+    {
         argv = &argv[1..];
     }
-    let Some(program) = argv.first().map(|a| program_name(a)) else { return JobKind::Other };
+    let Some(program) = argv.first().map(|a| program_name(a)) else {
+        return JobKind::Other;
+    };
     RULES
         .iter()
         .find(|r| r.programs.contains(&program) && matches(&r.when, &argv[1..]))
@@ -57,7 +90,11 @@ mod tests {
     use super::*;
 
     fn kind(cmd: &str) -> JobKind {
-        infer(&cmd.split_whitespace().map(str::to_string).collect::<Vec<_>>())
+        infer(
+            &cmd.split_whitespace()
+                .map(str::to_string)
+                .collect::<Vec<_>>(),
+        )
     }
 
     #[test]

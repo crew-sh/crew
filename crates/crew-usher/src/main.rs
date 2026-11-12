@@ -7,7 +7,8 @@ use crew_usher::server::{IdleSource, Paths, Server};
 
 fn main() -> anyhow::Result<()> {
     let config_path = crew_sys::paths::config_dir().join("usher.toml");
-    let cfg = Config::load(&config_path).with_context(|| format!("loading {}", config_path.display()))?;
+    let cfg =
+        Config::load(&config_path).with_context(|| format!("loading {}", config_path.display()))?;
     let paths = Paths::from_env();
     signals::install_termination_handler();
     let server = Server::start(cfg, &paths, IdleSource::Wayland, true)?;

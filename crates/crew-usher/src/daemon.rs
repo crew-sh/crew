@@ -7,8 +7,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crew_proto::{
-    envelope, reply, Ack, Decision, DiskView, Envelope, Grant, JobDone, JobKind, JobRequest, JobView, Limits, MachineView, OwnerSet, OwnerSource,
-    Queued, Refusal, Reply, TopReply, WaitingOn,
+    Ack, Decision, DiskView, Envelope, Grant, JobDone, JobKind, JobRequest, JobView, Limits,
+    MachineView, OwnerSet, OwnerSource, Queued, Refusal, Reply, TopReply, WaitingOn, envelope,
+    reply,
 };
 use crew_sys::display::{self, Desktop};
 use crew_sys::idle::IdleEvent;
@@ -34,7 +35,10 @@ impl Conn {
     }
 
     fn send(&self, body: envelope::Body) {
-        let mut s = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut s = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _ = crew_proto::write_frame(&mut *s, &Envelope::of(body));
     }
 }
@@ -112,7 +116,10 @@ pub struct Daemon {
 }
 
 fn clean_id(id: &str) -> String {
-    id.chars().filter(char::is_ascii_alphanumeric).take(12).collect()
+    id.chars()
+        .filter(char::is_ascii_alphanumeric)
+        .take(12)
+        .collect()
 }
 
 fn command_of(req: &JobRequest) -> String {
@@ -171,8 +178,19 @@ impl Daemon {
                     Ok(OwnerSource::Auto) => self.set_owner(|o| o.manual = None),
                     _ => self.set_owner(|o| o.manual = Some(set.present)),
                 }
-                let msg = format!("owner {} ({})", if self.owner.present() { "present" } else { "away" }, source_name(self.owner.source()));
-                conn.send(envelope::Body::Ack(Ack { ok: true, message: msg }));
+                let msg = format!(
+                    "owner {} ({})",
+                    if self.owner.present() {
+                        "present"
+                    } else {
+                        "away"
+                    },
+                    source_name(self.owner.source())
+                );
+                conn.send(envelope::Body::Ack(Ack {
+                    ok: true,
+                    message: msg,
+                }));
             }
             Msg::Idle(ev) => self.set_owner(|o| o.idle = Some(ev == IdleEvent::Resumed)),
             Msg::Stop => {}
@@ -183,7 +201,10 @@ impl Daemon {
         let before = self.owner.present();
         change(&mut self.owner);
         let now = self.owner.present();
-        self.log.line(&format!("OWNER present={now} source={}", source_name(self.owner.source())));
+        self.log.line(&format!(
+            "OWNER present={now} source={}",
+            source_name(self.owner.source())
+        ));
         if before != now {
             self.apply_weights(now);
         }
@@ -198,7 +219,10 @@ impl Daemon {
 
     fn weights_for(&self, base: &Limits, owner_present: bool) -> (u32, u32) {
         if owner_present {
-            (base.cpu_weight.min(self.cfg.owner_present_weights.cpu), base.io_weight.min(self.cfg.owner_present_weights.io))
+            (
+                base.cpu_weight.min(self.cfg.owner_present_weights.cpu),
+                base.io_weight.min(self.cfg.owner_present_weights.io),
+            )
         } else {
             (base.cpu_weight, base.io_weight)
         }
@@ -207,8 +231,12 @@ impl Daemon {
     fn expectations(&self, req: &JobRequest, kind: JobKind) -> (u64, f64) {
         let spec = self.cfg.kind(kind);
         let learned = self.sizes.expected(&sizes::key(req));
-        let declared = req.declared.clone().unwrap_or_default();
-        let mem = learned.map(|l| l.peak_mem_bytes).filter(|m| *m > 0).or(declared.mem_bytes).unwrap_or(spec.expected_mem);
+        let declared = req.declared.unwrap_or_default();
+        let mem = learned
+            .map(|l| l.peak_mem_bytes)
+            .filter(|m| *m > 0)
+            .or(declared.mem_bytes)
+            .unwrap_or(spec.expected_mem);
         let cores = learned
             .map(|l| f64::from(l.cores_milli.max(MIN_LEARNED_CORES_MILLI)) / 1000.0)
             .or(declared.cpus.map(f64::from))
@@ -257,7 +285,12 @@ impl Daemon {
         let running: Vec<Running> = self
             .running
             .iter()
-            .map(|r| Running { kind: r.kind, expected_mem: r.expected_mem, expected_cores: r.expected_cores, observed_peak: r.stats.mem_peak })
+            .map(|r| Running {
+                kind: r.kind,
+                expected_mem: r.expected_mem,
+                expected_cores: r.expected_cores,
+                observed_peak: r.stats.mem_peak,
+            })
             .collect();
         let waiting: Vec<Waiting> = self
             .queue
@@ -274,7 +307,9 @@ impl Daemon {
         let verdicts = admission::schedule(&self.cfg, &facts, &running, &waiting);
         let mut position = 0u32;
         for (id, verdict) in verdicts {
-            let Some(at) = self.queue.iter().position(|q| q.req.id == id) else { continue };
+            let Some(at) = self.queue.iter().position(|q| q.req.id == id) else {
+                continue;
+            };
             match verdict {
                 Verdict::Grant => {
                     let job = self.queue.remove(at);
@@ -282,10 +317,18 @@ impl Daemon {
                 }
                 Verdict::Refuse(reason, detail) => {
                     let job = self.queue.remove(at);
-                    self.log.line(&format!("REFUSE id={} kind={} reason={} detail={detail:?}", job.req.id, job.kind.name(), reason.name()));
+                    self.log.line(&format!(
+                        "REFUSE id={} kind={} reason={} detail={detail:?}",
+                        job.req.id,
+                        job.kind.name(),
+                        reason.name()
+                    ));
                     job.conn.send(envelope::Body::Reply(Reply {
                         decision: Decision::Refused as i32,
-                        outcome: Some(reply::Outcome::Refusal(Refusal { reason: reason as i32, detail })),
+                        outcome: Some(reply::Outcome::Refusal(Refusal {
+                            reason: reason as i32,
+                            detail,
+                        })),
                     }));
                 }
                 Verdict::Wait(reason, detail) => {
@@ -296,16 +339,31 @@ impl Daemon {
         }
     }
 
-    fn notify_waiting(&mut self, at: usize, reason: WaitingOn, detail: &str, position: u32, now_ms: u64) {
+    fn notify_waiting(
+        &mut self,
+        at: usize,
+        reason: WaitingOn,
+        detail: &str,
+        position: u32,
+        now_ms: u64,
+    ) {
         let job = &mut self.queue[at];
         let changed = job.waiting != reason;
-        let due = job.last_notice_ms.is_none_or(|t| now_ms.saturating_sub(t) >= RENOTIFY_MS);
+        let due = job
+            .last_notice_ms
+            .is_none_or(|t| now_ms.saturating_sub(t) >= RENOTIFY_MS);
         job.waiting = reason;
         if !(changed || due) {
             return;
         }
         if job.last_notice_ms.is_none() || changed {
-            self.log.line(&format!("QUEUE id={} kind={} project={} waiting={} detail={detail:?}", job.req.id, job.kind.name(), job.req.project, reason.name()));
+            self.log.line(&format!(
+                "QUEUE id={} kind={} project={} waiting={} detail={detail:?}",
+                job.req.id,
+                job.kind.name(),
+                job.req.project,
+                reason.name()
+            ));
         }
         job.last_notice_ms = Some(now_ms);
         job.conn.send(envelope::Body::Reply(Reply {
@@ -321,7 +379,7 @@ impl Daemon {
 
     fn grant(&mut self, job: QueuedJob, owner_present: bool) {
         let spec = self.cfg.kind(job.kind);
-        let declared = job.req.declared.clone().unwrap_or_default();
+        let declared = job.req.declared.unwrap_or_default();
         let base_limits = Limits {
             mem_bytes: declared.mem_bytes.or(spec.mem_cap),
             cpu_weight: nonzero(declared.cpu_weight, spec.cpu_weight),
@@ -329,10 +387,19 @@ impl Daemon {
             cpus: declared.cpus,
         };
         let (cpu_weight, io_weight) = self.weights_for(&base_limits, owner_present);
-        let limits = Limits { cpu_weight, io_weight, ..base_limits.clone() };
+        let limits = Limits {
+            cpu_weight,
+            io_weight,
+            ..base_limits
+        };
 
-        let desktop = if job.req.hz_desktop && job.kind != JobKind::Bench { Desktop::Allowed } else { Desktop::Denied };
-        let mut display_env: BTreeMap<String, String> = job.req.display_env.clone().into_iter().collect();
+        let desktop = if job.req.hz_desktop && job.kind != JobKind::Bench {
+            Desktop::Allowed
+        } else {
+            Desktop::Denied
+        };
+        let mut display_env: BTreeMap<String, String> =
+            job.req.display_env.clone().into_iter().collect();
         let env_unset = display::sanitize(&mut display_env, desktop);
         let id = clean_id(&job.req.id);
         let scope_name = format!("crew-{}-{id}", job.kind.name());
@@ -354,7 +421,10 @@ impl Daemon {
             job.expected_cores,
             command_of(&job.req),
         ));
-        job.conn.send(envelope::Body::Reply(Reply { decision: Decision::Granted as i32, outcome: Some(reply::Outcome::Grant(grant)) }));
+        job.conn.send(envelope::Body::Reply(Reply {
+            decision: Decision::Granted as i32,
+            outcome: Some(reply::Outcome::Grant(grant)),
+        }));
         self.running.push(RunningJob {
             req: job.req,
             kind: job.kind,
@@ -369,12 +439,15 @@ impl Daemon {
     }
 
     fn finish(&mut self, done: &JobDone) {
-        let Some(at) = self.running.iter().position(|r| r.req.id == done.job_id) else { return };
+        let Some(at) = self.running.iter().position(|r| r.req.id == done.job_id) else {
+            return;
+        };
         let job = self.running.remove(at);
         self.finished_cpu_usec += done.cpu_usec;
         if done.peak_mem_bytes > 0 && done.wall_ms > 0 {
             let cores_milli = u32::try_from(done.cpu_usec / done.wall_ms).unwrap_or(u32::MAX);
-            self.sizes.record(&sizes::key(&job.req), done.peak_mem_bytes, cores_milli);
+            self.sizes
+                .record(&sizes::key(&job.req), done.peak_mem_bytes, cores_milli);
             if let Err(e) = self.sizes.save(&self.sizes_path) {
                 self.log.line(&format!("WARN could not save sizes: {e}"));
             }
@@ -390,7 +463,10 @@ impl Daemon {
             done.io_read_bytes >> 20,
             done.io_write_bytes >> 20,
         ));
-        job.conn.send(envelope::Body::Ack(Ack { ok: true, message: String::new() }));
+        job.conn.send(envelope::Body::Ack(Ack {
+            ok: true,
+            message: String::new(),
+        }));
     }
 
     fn lose(&mut self, job_id: &str) {
@@ -400,7 +476,8 @@ impl Daemon {
         } else if let Some(at) = self.running.iter().position(|r| r.req.id == job_id) {
             let job = self.running.remove(at);
             scope::kill(&job.scope_name, KillSignal::Kill);
-            self.log.line(&format!("GONE id={job_id} while running; scope killed"));
+            self.log
+                .line(&format!("GONE id={job_id} while running; scope killed"));
         }
     }
 
@@ -415,9 +492,12 @@ impl Daemon {
     }
 
     fn update_load(&mut self) {
-        let Ok(snap) = machine::snapshot(&[]) else { return };
+        let Ok(snap) = machine::snapshot(&[]) else {
+            return;
+        };
         let now_ms = self.now_ms();
-        let scopes = self.finished_cpu_usec + self.running.iter().map(|r| r.stats.cpu_usec).sum::<u64>();
+        let scopes =
+            self.finished_cpu_usec + self.running.iter().map(|r| r.stats.cpu_usec).sum::<u64>();
         if let Some((at, busy, scoped)) = self.load.last {
             let dt_usec = now_ms.saturating_sub(at) * 1000;
             if dt_usec > 0 {
@@ -432,7 +512,13 @@ impl Daemon {
     fn top(&self) -> TopReply {
         let now = self.now_ms();
         let snap = machine::snapshot(&[]).unwrap_or_default();
-        let view = |req: &JobRequest, kind: JobKind, mem: u64, cores: f64, age_ms: u64, waiting: WaitingOn, s: scope::Stats| JobView {
+        let view = |req: &JobRequest,
+                    kind: JobKind,
+                    mem: u64,
+                    cores: f64,
+                    age_ms: u64,
+                    waiting: WaitingOn,
+                    s: scope::Stats| JobView {
             id: req.id.clone(),
             kind: kind as i32,
             agent: req.agent.clone(),
@@ -449,12 +535,32 @@ impl Daemon {
         let running = self
             .running
             .iter()
-            .map(|r| view(&r.req, r.kind, r.expected_mem, r.expected_cores, now.saturating_sub(r.started_ms), WaitingOn::Unspecified, r.stats))
+            .map(|r| {
+                view(
+                    &r.req,
+                    r.kind,
+                    r.expected_mem,
+                    r.expected_cores,
+                    now.saturating_sub(r.started_ms),
+                    WaitingOn::Unspecified,
+                    r.stats,
+                )
+            })
             .collect();
         let queued = self
             .queue
             .iter()
-            .map(|q| view(&q.req, q.kind, q.expected_mem, q.expected_cores, now.saturating_sub(q.queued_at_ms), q.waiting, scope::Stats::default()))
+            .map(|q| {
+                view(
+                    &q.req,
+                    q.kind,
+                    q.expected_mem,
+                    q.expected_cores,
+                    now.saturating_sub(q.queued_at_ms),
+                    q.waiting,
+                    scope::Stats::default(),
+                )
+            })
             .collect();
         let disk = self
             .cfg
@@ -462,7 +568,11 @@ impl Daemon {
             .iter()
             .filter_map(|p| {
                 let free = machine::disk_free(p).ok()?;
-                Some(DiskView { path: p.clone(), free_bytes: free, min_free_bytes: self.cfg.min_free_disk(p).unwrap_or(0) })
+                Some(DiskView {
+                    path: p.clone(),
+                    free_bytes: free,
+                    min_free_bytes: self.cfg.min_free_disk(p).unwrap_or(0),
+                })
             })
             .collect();
         TopReply {
@@ -479,7 +589,8 @@ impl Daemon {
                 disk,
                 owner_present: self.owner.present(),
                 owner_source: self.owner.source() as i32,
-                unmanaged_cpu_pct: self.load.unmanaged_cores / f64::from(snap.cpu_count.max(1)) * 100.0,
+                unmanaged_cpu_pct: self.load.unmanaged_cores / f64::from(snap.cpu_count.max(1))
+                    * 100.0,
             }),
         }
     }

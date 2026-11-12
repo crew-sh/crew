@@ -146,7 +146,12 @@ mod tests {
             cwd: "/x".into(),
             project: "p".into(),
             agent: "a".into(),
-            declared: Some(Limits { mem_bytes: Some(8 << 30), cpu_weight: 0, io_weight: 5, cpus: None }),
+            declared: Some(Limits {
+                mem_bytes: Some(8 << 30),
+                cpu_weight: 0,
+                io_weight: 5,
+                cpus: None,
+            }),
             needs_display: true,
             hz_desktop: false,
             display_env: [("DISPLAY".to_string(), ":0".to_string())].into(),
@@ -176,7 +181,10 @@ mod tests {
     #[test]
     fn oversized_frame_is_rejected() {
         let wire = ((MAX_FRAME as u32) + 1).to_le_bytes();
-        assert!(matches!(read_frame(&mut wire.as_slice()), Err(FrameError::TooLarge(_))));
+        assert!(matches!(
+            read_frame(&mut wire.as_slice()),
+            Err(FrameError::TooLarge(_))
+        ));
     }
 
     #[test]

@@ -35,7 +35,9 @@ fn cargo_detail(args: &[String]) -> String {
             "--profile" => profile = it.next().cloned().unwrap_or(profile),
             "--release" => profile = "release".into(),
             "--" => break,
-            s if s.starts_with("-p") && !s.starts_with("--") && s.len() > 2 => packages.push(s[2..].to_string()),
+            s if s.starts_with("-p") && !s.starts_with("--") && s.len() > 2 => {
+                packages.push(s[2..].to_string())
+            }
             s if s.starts_with("--package=") => packages.push(s["--package=".len()..].to_string()),
             s if s.starts_with("--profile=") => profile = s["--profile=".len()..].to_string(),
             s if sub.is_empty() && !s.starts_with('-') => sub = s,
@@ -59,7 +61,10 @@ pub fn key(req: &JobRequest) -> String {
     let detail = if program == "cargo" {
         cargo_detail(&rest)
     } else {
-        std::iter::once(program).chain(rest.first().map(String::as_str)).collect::<Vec<_>>().join(" ")
+        std::iter::once(program)
+            .chain(rest.first().map(String::as_str))
+            .collect::<Vec<_>>()
+            .join(" ")
     };
     format!("{}|{}|{detail}", req.project, kind.name())
 }
@@ -71,15 +76,32 @@ fn median<T: Ord + Copy>(mut v: Vec<T>) -> Option<T> {
 
 impl Sizes {
     pub fn load(path: &Path) -> Self {
-        let Ok(bytes) = fs::read(path) else { return Self::default() };
-        let Ok(file) = SizesFile::decode(bytes.as_slice()) else { return Self::default() };
-        Self { samples: file.entries.into_iter().map(|e| (e.key, e.samples)).collect() }
+        let Ok(bytes) = fs::read(path) else {
+            return Self::default();
+        };
+        let Ok(file) = SizesFile::decode(bytes.as_slice()) else {
+            return Self::default();
+        };
+        Self {
+            samples: file
+                .entries
+                .into_iter()
+                .map(|e| (e.key, e.samples))
+                .collect(),
+        }
     }
 
     pub fn save(&self, path: &Path) -> io::Result<()> {
         let file = SizesFile {
             version: FORMAT_VERSION,
-            entries: self.samples.iter().map(|(k, s)| SizeEntry { key: k.clone(), samples: s.clone() }).collect(),
+            entries: self
+                .samples
+                .iter()
+                .map(|(k, s)| SizeEntry {
+                    key: k.clone(),
+                    samples: s.clone(),
+                })
+                .collect(),
         };
         if let Some(dir) = path.parent() {
             fs::create_dir_all(dir)?;
@@ -91,7 +113,10 @@ impl Sizes {
 
     pub fn record(&mut self, key: &str, peak_mem_bytes: u64, cores_milli: u32) {
         let list = self.samples.entry(key.to_string()).or_default();
-        list.push(SizeSample { peak_mem_bytes, cores_milli });
+        list.push(SizeSample {
+            peak_mem_bytes,
+            cores_milli,
+        });
         if list.len() > KEEP_SAMPLES {
             list.remove(0);
         }
@@ -121,17 +146,48 @@ mod tests {
 
     #[test]
     fn cargo_keys_ignore_flags_that_do_not_change_size() {
-        let a = key(&req(&["cargo", "clippy", "-p", "b", "-p", "a", "--all-targets", "--", "-D", "warnings"]));
-        let b = key(&req(&["/home/x/.cargo/bin/cargo", "+nightly", "clippy", "--package=a", "-pb"]));
+        let a = key(&req(&[
+            "cargo",
+            "clippy",
+            "-p",
+            "b",
+            "-p",
+            "a",
+            "--all-targets",
+            "--",
+            "-D",
+            "warnings",
+        ]));
+        let b = key(&req(&[
+            "/home/x/.cargo/bin/cargo",
+            "+nightly",
+            "clippy",
+            "--package=a",
+            "-pb",
+        ]));
         assert_eq!(a, "horizon|build|cargo clippy -p a,b dev");
         assert_eq!(a, b);
-        assert_eq!(key(&req(&["hz", "cargo", "build", "--release"])), "horizon|build|cargo build -p  release");
-        assert_eq!(key(&req(&["cargo", "build", "--profile", "fast"])), "horizon|build|cargo build -p  fast");
+        assert_eq!(
+            key(&req(&["hz", "cargo", "build", "--release"])),
+            "horizon|build|cargo build -p  release"
+        );
+        assert_eq!(
+            key(&req(&["cargo", "build", "--profile", "fast"])),
+            "horizon|build|cargo build -p  fast"
+        );
     }
 
     #[test]
     fn other_commands_use_first_two_words() {
-        assert_eq!(key(&req(&["/usr/bin/python3", "tools/parity.py", "mob_ai", "sculk"])), "horizon|build|python3 tools/parity.py");
+        assert_eq!(
+            key(&req(&[
+                "/usr/bin/python3",
+                "tools/parity.py",
+                "mob_ai",
+                "sculk"
+            ])),
+            "horizon|build|python3 tools/parity.py"
+        );
         assert_eq!(key(&req(&["true"])), "horizon|build|true");
     }
 
@@ -146,7 +202,13 @@ mod tests {
         let path = dir.path().join("sizes.pb");
         s.save(&path).unwrap();
         let loaded = Sizes::load(&path);
-        assert_eq!(loaded.expected("k"), Some(Learned { peak_mem_bytes: 7, cores_milli: 1007 }));
+        assert_eq!(
+            loaded.expected("k"),
+            Some(Learned {
+                peak_mem_bytes: 7,
+                cores_milli: 1007
+            })
+        );
         assert_eq!(Sizes::load(&dir.path().join("missing")).expected("k"), None);
     }
 

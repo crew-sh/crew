@@ -3,8 +3,8 @@ use std::io;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Sender};
 use std::sync::Arc;
+use std::sync::mpsc::{self, Sender};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -33,7 +33,11 @@ pub struct Paths {
 impl Paths {
     pub fn from_env() -> Self {
         let state = crew_sys::paths::state_dir();
-        Self { socket: crew_sys::paths::socket_path(), sizes: state.join("usher-sizes.pb"), log: state.join("usher.log") }
+        Self {
+            socket: crew_sys::paths::socket_path(),
+            sizes: state.join("usher-sizes.pb"),
+            log: state.join("usher.log"),
+        }
     }
 }
 
@@ -50,7 +54,10 @@ pub struct Server {
 }
 
 fn bind(path: &Path) -> Result<UnixListener, ServerError> {
-    let err = |source| ServerError::Socket { path: path.display().to_string(), source };
+    let err = |source| ServerError::Socket {
+        path: path.display().to_string(),
+        source,
+    };
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir).map_err(err)?;
         fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).map_err(err)?;
@@ -67,7 +74,9 @@ fn bind(path: &Path) -> Result<UnixListener, ServerError> {
 }
 
 fn serve_connection(stream: UnixStream, tx: &Sender<Msg>) {
-    let Ok(conn) = stream.try_clone().and_then(Conn::new) else { return };
+    let Ok(conn) = stream.try_clone().and_then(Conn::new) else {
+        return;
+    };
     let mut reader = stream;
     let mut job_id: Option<String> = None;
     loop {
@@ -75,11 +84,17 @@ fn serve_connection(stream: UnixStream, tx: &Sender<Msg>) {
             Ok(Some(env)) => match env.body {
                 Some(Body::JobRequest(req)) => {
                     job_id = Some(req.id.clone());
-                    Msg::Job { req, conn: conn.clone() }
+                    Msg::Job {
+                        req,
+                        conn: conn.clone(),
+                    }
                 }
                 Some(Body::JobDone(done)) => Msg::Done { done },
                 Some(Body::TopRequest(_)) => Msg::Top { conn: conn.clone() },
-                Some(Body::OwnerSet(set)) => Msg::Owner { set, conn: conn.clone() },
+                Some(Body::OwnerSet(set)) => Msg::Owner {
+                    set,
+                    conn: conn.clone(),
+                },
                 _ => continue,
             },
             Ok(None) | Err(_) => {
@@ -97,7 +112,12 @@ fn serve_connection(stream: UnixStream, tx: &Sender<Msg>) {
 
 impl Server {
     /// Binds the socket and starts the admission actor; returns once clients can connect.
-    pub fn start(cfg: Config, paths: &Paths, idle_source: IdleSource, echo_log: bool) -> Result<Self, ServerError> {
+    pub fn start(
+        cfg: Config,
+        paths: &Paths,
+        idle_source: IdleSource,
+        echo_log: bool,
+    ) -> Result<Self, ServerError> {
         let listener = bind(&paths.socket)?;
         let log = Arc::new(Log::open(&paths.log, echo_log));
         let (tx, rx) = mpsc::channel();
@@ -116,12 +136,17 @@ impl Server {
                         }
                     });
                 }
-                Err(e) => log.line(&format!("IDLE unavailable ({e}); use `crew owner here|away`")),
+                Err(e) => log.line(&format!(
+                    "IDLE unavailable ({e}); use `crew owner here|away`"
+                )),
             }
         }
 
         let daemon = Daemon::new(cfg, paths.sizes.clone(), log.clone());
-        let actor = thread::Builder::new().name("usher".into()).spawn(move || daemon.run(&rx)).expect("spawn actor");
+        let actor = thread::Builder::new()
+            .name("usher".into())
+            .spawn(move || daemon.run(&rx))
+            .expect("spawn actor");
 
         let accept_tx = tx.clone();
         thread::Builder::new()
@@ -135,7 +160,11 @@ impl Server {
             .expect("spawn acceptor");
 
         log.line(&format!("START socket={}", paths.socket.display()));
-        Ok(Self { socket: paths.socket.clone(), tx, actor: Some(actor) })
+        Ok(Self {
+            socket: paths.socket.clone(),
+            tx,
+            actor: Some(actor),
+        })
     }
 
     pub fn stop(mut self) {

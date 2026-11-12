@@ -7,7 +7,10 @@ pub enum ClientError {
     #[error("usher is not running at {socket} ({source})")]
     DaemonDown { socket: String, source: io::Error },
     #[error("usher refused the job ({}): {detail}", reason.name())]
-    Refused { reason: RefusalReason, detail: String },
+    Refused {
+        reason: RefusalReason,
+        detail: String,
+    },
     #[error("usher closed the connection")]
     Closed,
     #[error("unexpected reply from usher")]

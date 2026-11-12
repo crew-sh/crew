@@ -21,7 +21,10 @@ pub fn socket_path() -> PathBuf {
     if let Some(p) = env::var_os("CREW_SOCKET") {
         return PathBuf::from(p);
     }
-    xdg("XDG_RUNTIME_DIR", || PathBuf::from(format!("/run/user/{}", uid()))).join("crew/usher.sock")
+    xdg("XDG_RUNTIME_DIR", || {
+        PathBuf::from(format!("/run/user/{}", uid()))
+    })
+    .join("crew/usher.sock")
 }
 
 pub fn state_dir() -> PathBuf {

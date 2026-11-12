@@ -1,0 +1,12 @@
+# Not installed by crew: copy to ~/.config/systemd/user/ and enable it yourself.
+[Unit]
+Description=crew usher: admission control for agent jobs
+After=graphical-session.target
+
+[Service]
+# Owner idle detection needs WAYLAND_DISPLAY in the user manager's environment.
+ExecStart=%h/hz-dev/tools/crew/bin/crew-usher
+Restart=on-failure
+
+[Install]
+WantedBy=graphical-session.target

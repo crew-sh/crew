@@ -33,7 +33,9 @@ fn uid() -> u32 {
 
 pub fn cgroup_dir(name: &str) -> PathBuf {
     let uid = uid();
-    PathBuf::from(format!("/sys/fs/cgroup/user.slice/user-{uid}.slice/user@{uid}.service/app.slice/{name}.scope"))
+    PathBuf::from(format!(
+        "/sys/fs/cgroup/user.slice/user-{uid}.slice/user@{uid}.service/app.slice/{name}.scope"
+    ))
 }
 
 fn property_args(limits: &ScopeLimits) -> Vec<String> {
@@ -58,7 +60,13 @@ fn property_args(limits: &ScopeLimits) -> Vec<String> {
 }
 
 /// Runs `argv` in a transient user scope; systemd-run execs the command itself, so the child is the command.
-pub fn spawn(argv: &[String], cwd: &Path, env: &BTreeMap<String, String>, limits: &ScopeLimits, name: &str) -> io::Result<Child> {
+pub fn spawn(
+    argv: &[String],
+    cwd: &Path,
+    env: &BTreeMap<String, String>,
+    limits: &ScopeLimits,
+    name: &str,
+) -> io::Result<Child> {
     let mut cmd = Command::new("systemd-run");
     cmd.args(["--user", "--scope", "--quiet"])
         .arg(format!("--unit={name}"))
@@ -79,12 +87,19 @@ pub fn kill(name: &str, signal: KillSignal) {
         KillSignal::Term => "SIGTERM",
         KillSignal::Kill => "SIGKILL",
     };
-    let _ = Command::new("systemctl").args(["--user", "kill", "--signal", sig, &format!("{name}.scope")]).output();
+    let _ = Command::new("systemctl")
+        .args(["--user", "kill", "--signal", sig, &format!("{name}.scope")])
+        .output();
 }
 
 pub fn set_weights(name: &str, cpu_weight: u32, io_weight: u32) {
     let _ = Command::new("systemctl")
-        .args(["--user", "set-property", "--runtime", &format!("{name}.scope")])
+        .args([
+            "--user",
+            "set-property",
+            "--runtime",
+            &format!("{name}.scope"),
+        ])
         .arg(format!("CPUWeight={cpu_weight}"))
         .arg(format!("IOWeight={io_weight}"))
         .output();
@@ -112,14 +127,18 @@ pub fn parse_io_stat(text: &str) -> (u64, u64) {
 }
 
 fn read_u64(path: &Path) -> u64 {
-    fs::read_to_string(path).ok().and_then(|t| t.trim().parse().ok()).unwrap_or(0)
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|t| t.trim().parse().ok())
+        .unwrap_or(0)
 }
 
 /// `None` once the scope's cgroup is gone.
 pub fn stats(name: &str) -> Option<Stats> {
     let dir = cgroup_dir(name);
     let cpu = fs::read_to_string(dir.join("cpu.stat")).ok()?;
-    let (io_read, io_write) = fs::read_to_string(dir.join("io.stat")).map_or((0, 0), |t| parse_io_stat(&t));
+    let (io_read, io_write) =
+        fs::read_to_string(dir.join("io.stat")).map_or((0, 0), |t| parse_io_stat(&t));
     Some(Stats {
         mem_peak: read_u64(&dir.join("memory.peak")),
         mem_current: read_u64(&dir.join("memory.current")),
@@ -135,10 +154,22 @@ mod tests {
 
     #[test]
     fn properties_follow_the_limits() {
-        let l = ScopeLimits { mem_bytes: Some(1 << 30), cpu_weight: 100, io_weight: 0, cpus: Some(4) };
+        let l = ScopeLimits {
+            mem_bytes: Some(1 << 30),
+            cpu_weight: 100,
+            io_weight: 0,
+            cpus: Some(4),
+        };
         assert_eq!(
             property_args(&l),
-            ["-p", "MemoryMax=1073741824", "-p", "CPUWeight=100", "-p", "CPUQuota=400%"]
+            [
+                "-p",
+                "MemoryMax=1073741824",
+                "-p",
+                "CPUWeight=100",
+                "-p",
+                "CPUQuota=400%"
+            ]
         );
         assert!(property_args(&ScopeLimits::default()).is_empty());
     }
@@ -154,6 +185,8 @@ mod tests {
     #[test]
     fn cgroup_path_is_under_the_user_manager() {
         let p = cgroup_dir("crew-x");
-        assert!(p.ends_with("user@".to_string() + &uid().to_string() + ".service/app.slice/crew-x.scope"));
+        assert!(p.ends_with(
+            "user@".to_string() + &uid().to_string() + ".service/app.slice/crew-x.scope"
+        ));
     }
 }

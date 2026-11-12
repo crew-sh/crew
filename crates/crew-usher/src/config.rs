@@ -13,7 +13,10 @@ pub enum ConfigError {
     #[error("reading {path}: {source}")]
     Read { path: String, source: io::Error },
     #[error("parsing {path}: {source}")]
-    Parse { path: String, source: toml::de::Error },
+    Parse {
+        path: String,
+        source: toml::de::Error,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize)]
@@ -85,7 +88,10 @@ impl Default for Config {
             max_games: 4,
             cpu_oversub: 1.5,
             watched_paths: vec!["/projects".into(), "/".into()],
-            min_free_disk_gib: BTreeMap::from([("/projects".to_string(), 50), ("/".to_string(), 20)]),
+            min_free_disk_gib: BTreeMap::from([
+                ("/projects".to_string(), 50),
+                ("/".to_string(), 20),
+            ]),
             owner_present_weights: OwnerWeights::default(),
             tmp_root: "/projects/.hz-tmp/crew".into(),
             idle_timeout_secs: 120,
@@ -96,12 +102,32 @@ impl Default for Config {
 }
 
 fn builtin(kind: JobKind) -> KindSpec {
-    let base = KindSpec { mem_cap: None, expected_mem: 2 * GIB, expected_cores: 1.0, cpu_weight: 100, io_weight: 100, exclusive: false };
+    let base = KindSpec {
+        mem_cap: None,
+        expected_mem: 2 * GIB,
+        expected_cores: 1.0,
+        cpu_weight: 100,
+        io_weight: 100,
+        exclusive: false,
+    };
     match kind {
-        JobKind::Build => KindSpec { expected_cores: 4.0, ..base },
-        JobKind::Game => KindSpec { mem_cap: Some(6 * GIB), expected_mem: 6 * GIB, ..base },
-        JobKind::Bench => KindSpec { exclusive: true, ..base },
-        JobKind::Lsp => KindSpec { cpu_weight: 20, ..base },
+        JobKind::Build => KindSpec {
+            expected_cores: 4.0,
+            ..base
+        },
+        JobKind::Game => KindSpec {
+            mem_cap: Some(6 * GIB),
+            expected_mem: 6 * GIB,
+            ..base
+        },
+        JobKind::Bench => KindSpec {
+            exclusive: true,
+            ..base
+        },
+        JobKind::Lsp => KindSpec {
+            cpu_weight: 20,
+            ..base
+        },
         JobKind::Test | JobKind::Harness | JobKind::Other | JobKind::Unspecified => base,
     }
 }
@@ -110,9 +136,15 @@ impl Config {
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
         let shown = path.display().to_string();
         match fs::read_to_string(path) {
-            Ok(text) => toml::from_str(&text).map_err(|source| ConfigError::Parse { path: shown, source }),
+            Ok(text) => toml::from_str(&text).map_err(|source| ConfigError::Parse {
+                path: shown,
+                source,
+            }),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(source) => Err(ConfigError::Read { path: shown, source }),
+            Err(source) => Err(ConfigError::Read {
+                path: shown,
+                source,
+            }),
         }
     }
 
