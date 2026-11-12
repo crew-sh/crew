@@ -77,6 +77,19 @@ fn layers() -> BTreeMap<&'static str, Crate> {
             },
         ),
         (
+            "crew-depot",
+            Crate {
+                layer: 2,
+                only: Some(&[
+                    "crew-proto",
+                    "crew-sys",
+                    "crew-usher-client",
+                    "crew-depot-config",
+                    "crew-usher",
+                ]),
+            },
+        ),
+        (
             "crew-queue",
             Crate {
                 layer: 2,

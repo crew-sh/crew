@@ -253,3 +253,61 @@ fn learned_sizes_reach_the_state_file() {
         f.log()
     );
 }
+
+/// A stand-in mbx that records its arguments and runs the command after `--`.
+fn fake_mbx(dir: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let p = dir.join("fake-mbx");
+    std::fs::write(
+        &p,
+        format!(
+            "#!/bin/sh\necho \"$@\" >> {rec}\nwhile [ \"$1\" != -- ]; do shift; done\nshift\nexec \"$@\"\n",
+            rec = dir.join("mbx.args").display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    p
+}
+
+#[test]
+fn with_mbx_reserve_on_games_and_harnesses_run_inside_an_mbx_reserve() {
+    let dir = tempdir("crew-it-mbx-");
+    let mbx = fake_mbx(dir.path());
+    let Some(f) = Fixture::start(|c| {
+        c.depot.mbx_reserve = true;
+        c.depot.mbx_path = Some(mbx.clone());
+        c.depot.reserve_cpus = 1;
+        c.kinds.harness.expected_mem_gib = Some(3);
+    }) else {
+        return;
+    };
+    assert_eq!(
+        f.client
+            .run(&opts(JobKind::Harness, &["sh", "-c", "exit 4"]))
+            .unwrap(),
+        4
+    );
+    assert_eq!(f.client.run(&opts(JobKind::Other, &["true"])).unwrap(), 0);
+    let args = std::fs::read_to_string(dir.path().join("mbx.args")).unwrap();
+    let lines: Vec<&str> = args.lines().collect();
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.starts_with("reserve --cpus 1 --memory 3072MiB -- sh -c exit 4")),
+        "{args}"
+    );
+    // Only games and harnesses reserve, and the standing hold of the pool is the usher's own `reserve ... -- cat`.
+    assert!(lines.iter().all(|l| !l.ends_with("-- true")), "{args}");
+}
+
+#[test]
+fn the_flag_off_leaves_a_harness_unwrapped() {
+    let dir = tempdir("crew-it-mbx-");
+    let mbx = fake_mbx(dir.path());
+    let Some(f) = Fixture::start(|c| c.depot.mbx_path = Some(mbx.clone())) else {
+        return;
+    };
+    assert_eq!(f.client.run(&opts(JobKind::Harness, &["true"])).unwrap(), 0);
+    assert!(!dir.path().join("mbx.args").exists());
+}

@@ -154,6 +154,13 @@ pub fn parse(argv: &[String]) -> Result<Sub, String> {
             Sub::Owner { arg, json }
         }
         Some("wait") => parse_wait(&argv[1..])?,
+        // crew-depot serves both, as `crew-depot cargo ...` and `crew-depot build ...`.
+        Some(name @ ("cargo" | "build")) => Sub::Plugin {
+            name: "depot".to_string(),
+            rest: std::iter::once(name.to_string())
+                .chain(argv[1..].iter().cloned())
+                .collect(),
+        },
         Some(name) => Sub::Plugin {
             name: name.to_string(),
             rest: argv[1..].to_vec(),
@@ -306,6 +313,20 @@ mod tests {
             Sub::Plugin {
                 name: "queue".into(),
                 rest: vec!["merge".into(), "--now".into()]
+            }
+        );
+        assert_eq!(
+            parse("cargo build -p x").unwrap(),
+            Sub::Plugin {
+                name: "depot".into(),
+                rest: vec!["cargo".into(), "build".into(), "-p".into(), "x".into()]
+            }
+        );
+        assert_eq!(
+            parse("build stats --json").unwrap(),
+            Sub::Plugin {
+                name: "depot".into(),
+                rest: vec!["build".into(), "stats".into(), "--json".into()]
             }
         );
         assert_eq!(

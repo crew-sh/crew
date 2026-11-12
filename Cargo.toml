@@ -33,6 +33,7 @@ crew-usher-client = { path = "crates/crew-usher-client" }
 crew-git = { path = "crates/crew-git" }
 crew-ledger = { path = "crates/crew-ledger" }
 crew-depot-config = { path = "crates/crew-depot-config" }
+crew-depot = { path = "crates/crew-depot" }
 
 [profile.release]
 lto = "thin"

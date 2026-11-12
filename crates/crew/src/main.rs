@@ -23,6 +23,9 @@ usage: crew <command> [args]
   owner here|away|auto tell the usher whether the owner is at the machine
   wait queue-empty|owner-away|job <id> [--timeout 30s|5m]
                        block until the usher reports the condition (exit 0), 124 on timeout, 2 if the job never ran
+  cargo <args>         run cargo through the mbx dependency cache under a usher build grant (`crew-depot`)
+  build stats|why <crate>|report --shared <dir>
+                       build-cache numbers, why a crate missed, what another project shares (`crew-depot`)
   usher                run the admission daemon in the foreground
   <name>               any other name runs the `crew-<name>` program found beside crew or on PATH
 

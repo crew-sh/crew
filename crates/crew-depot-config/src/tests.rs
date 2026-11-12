@@ -169,3 +169,32 @@ fn a_configured_path_wins_and_off_hides_mbx() {
         None
     );
 }
+
+/// The first ```toml fence after `<!-- test:NAME -->` in the README.
+fn readme_block(name: &str) -> String {
+    let readme = include_str!("../../../README.md");
+    let after = readme
+        .split(&format!("<!-- test:{name} -->"))
+        .nth(1)
+        .unwrap();
+    let body = after.split("```toml\n").nth(1).unwrap();
+    body.split("```").next().unwrap().to_string()
+}
+
+#[test]
+fn the_readme_example_loads_and_means_what_it_says() {
+    let d = parse(&readme_block("depot-example")).unwrap().resolve();
+    assert_eq!(d.toolchain.as_deref(), Some("1.99.1"));
+    assert!(d.mbx_reserve);
+    assert_eq!((d.reserve_cpus, d.reserve_memory_gib), (4, 8));
+    assert_eq!(
+        d.profile_env(),
+        [
+            ("CARGO_PROFILE_FAST_LTO".to_string(), "off".to_string()),
+            (
+                "CARGO_PROFILE_FAST_CODEGEN_UNITS".to_string(),
+                "256".to_string()
+            )
+        ]
+    );
+}

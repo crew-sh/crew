@@ -5,6 +5,7 @@ Tools for running many AI coding agents on one Linux machine.
 - **usher** is a small daemon that decides when each heavy job may start. `crew run`, `crew top`, `crew owner` and `crew wait` talk to it.
 - **crew queue** is a merge queue. Agents submit branches. It lands them in batches and bisects a red batch.
 - **crew plan** is a typed plan ledger. It records what was asked, what was added on top, who approved it, and how much each step used.
+- **crew cargo** runs cargo through the [mbx](https://github.com/jdx/mr-boxington) build cache under an usher grant, and `crew build` shows what the cache did.
 
 ## Why
 
@@ -38,10 +39,10 @@ sudo pacman -S protobuf                     # Arch
 If `protoc` is not on `PATH`, set `PROTOC=/path/to/protoc`.
 
 ```sh
-cargo install --locked --git https://github.com/crew-sh/crew crew crew-usher crew-queue crew-ledger
+cargo install --locked --git https://github.com/crew-sh/crew crew crew-usher crew-queue crew-ledger crew-depot
 ```
 
-This installs four programs into `~/.cargo/bin`:
+This installs five programs into `~/.cargo/bin`:
 
 | Program | From crate | What it is |
 |---|---|---|
@@ -49,11 +50,12 @@ This installs four programs into `~/.cargo/bin`:
 | `crew-usher` | `crew-usher` | The admission daemon. |
 | `crew-queue` | `crew-queue` | `crew queue ...` |
 | `crew-plan` | `crew-ledger` | `crew plan ...` |
+| `crew-depot` | `crew-depot` | `crew cargo ...` and `crew build ...` |
 
 From a clone, install each crate (`cargo install` takes one `--path`):
 
 ```sh
-for c in crew crew-usher crew-queue crew-ledger; do cargo install --locked --path crates/$c; done
+for c in crew crew-usher crew-queue crew-ledger crew-depot; do cargo install --locked --path crates/$c; done
 ```
 
 Make sure `~/.cargo/bin` is on `PATH`. `crew` looks for plugins next to itself, then on `PATH`.
@@ -192,6 +194,22 @@ The queue lands branches in batches onto `integration_branch`. It runs your `che
 
 `crew queue gc` saves the work of a worktree whose owner process died and removes it. `crew queue final` runs the `final` commands on the integration tip.
 
+### 6. Build through the cache
+
+`crew cargo` is `cargo` for a machine with many agents. It asks the usher for a build grant, then runs `mbx <cargo arguments>` when [mbx](https://github.com/jdx/mr-boxington) is installed and plain `cargo` when it is not:
+
+```sh
+crew cargo build --workspace
+crew cargo nextest run
+crew build stats                      # what this project's builds got from the cache
+crew build why serde_derive           # why a crate missed in the last build
+crew build report --shared ../other   # which dependency units ../other would share, or why not
+```
+
+What the grant changes: the build runs with at most the granted cores (`CARGO_BUILD_JOBS`, unless you pass `-j`), and with mbx's `low` scheduler priority while you are at the machine (`MBX_SCHEDULER_PRIORITY`). Nothing you set yourself is overridden. A leftover `RUSTC_WRAPPER` is dropped for mbx, with a note, because mbx caches nothing when another wrapper holds that slot.
+
+`crew build report` runs `cargo build --unit-graph` in both projects (with `RUSTC_BOOTSTRAP=1` on that one planning command, since the flag is unstable; no compiler runs). For every registry or git unit of this project it prints `shared`, or the first reason it is not: the compiler, the lock file's version, features, a profile field, or a dependency. It reports and edits nothing.
+
 ## Tell your agents
 
 Paste this into `AGENTS.md`, `CLAUDE.md` or your agent's system prompt:
@@ -201,7 +219,7 @@ Paste this into `AGENTS.md`, `CLAUDE.md` or your agent's system prompt:
 
 Other agents run on this machine. Use crew so we do not starve each other.
 
-- Run heavy commands as `crew run -- <command>`: builds, test suites, benchmarks, anything that uses many cores or much memory.
+- Run heavy commands as `crew run -- <command>`: builds, test suites, benchmarks, anything that uses many cores or much memory. Build Rust with `crew cargo <args>`; it goes through the same admission.
 - Run `crew top` to see what is running and what you are waiting on. Do not start a second copy of a job that is already queued.
 - `crew run` exits 75 when it refuses a job (low disk, no display while the owner is here). Do not retry in a loop. Report it.
 - Do not open windows. crew removes DISPLAY and WAYLAND_DISPLAY from your jobs on purpose.
@@ -282,6 +300,37 @@ Built-in values: every kind expects 2 GiB, 1 core and weight 100. Exceptions: `b
 
 Once the usher has seen a command run, it reserves the median of its last 20 runs instead of these numbers. It keeps them in `$XDG_STATE_HOME/crew/usher-sizes.pb`. The log is `usher.log` in the same directory.
 
+### `depot.toml` and `[depot]`
+
+Path: `$XDG_CONFIG_HOME/crew/depot.toml`, normally `~/.config/crew/depot.toml`. It holds one `[depot]` table. The same table in a project's `crew.toml` overrides it key by key, and profiles merge field by field. Every key is optional. Unknown keys inside `[depot]` are an error. `crew cargo` reads both files on each run. The usher reads only `depot.toml`, at start.
+
+<!-- test:depot-example -->
+```toml
+[depot]
+toolchain = "1.99.1"
+mbx_reserve = true
+reserve_cpus = 4
+reserve_memory_gib = 8
+
+[depot.profiles.fast]
+lto = "off"
+codegen-units = 256
+```
+
+| Key | Default | Meaning |
+|---|---|---|
+| `toolchain` | none | A rustup toolchain every `crew cargo` build uses (`RUSTUP_TOOLCHAIN`). A `+toolchain` argument or an existing `RUSTUP_TOOLCHAIN` wins. One toolchain per machine is what lets projects share compiled dependencies. |
+| `mbx` | `"auto"` | `"auto"` uses mbx when it is installed and says so when it is not. `"off"` never does. `"required"` fails when mbx is missing. |
+| `mbx_path` | none | The mbx program. Default: `PATH`, then `$CARGO_HOME/bin`. |
+| `mbx_reserve` | `false` | While the owner is present the usher holds `reserve_cpus` cores and `reserve_memory_gib` GiB of mbx's compile pool (`mbx reserve`), and `crew run` wraps games and harnesses in `mbx reserve` for what the usher expects them to use. Compilers then leave room. |
+| `reserve_cpus` | `4` | Cores the usher holds while the owner is present. |
+| `reserve_memory_gib` | `8` | Memory the usher holds while the owner is present. |
+| `store` | `$XDG_CACHE_HOME/crew` | Where `crew build` keeps its per-project statistics. |
+| `store_budget_gib` | `60` | Reserved for the snapshot store of a later milestone. Not enforced yet. |
+| `profiles.<name>` | none | `lto` (`"off"`, `"thin"`, `"fat"`) and `codegen-units` for one cargo profile, set as `CARGO_PROFILE_<NAME>_LTO` and `_CODEGEN_UNITS` for agent builds. Off unless you write it: it changes the generated code, so measure the binary first. With `lto = "off"` and many codegen units, mbx can keep incremental state for an optimized profile. |
+
+The compile budget in a grant is the kind's `expected_cores` (see `[kinds.build]` above), never lower, and the priority is `low` while the owner is present.
+
 ### `crew.toml`
 
 One file at the repo root. Each tool reads its own table and ignores the others.
@@ -291,6 +340,7 @@ One file at the repo root. Each tool reads its own table and ignores the others.
 | `[plan]` | `crew plan` | ignored |
 | `[queue]` | `crew queue` | error |
 | `[usher]` | `crew run` | error |
+| `[depot]` | `crew cargo`, `crew build` | error |
 
 `[plan]`
 
@@ -351,7 +401,7 @@ A broken `[usher]` table, a `crew.toml` that is not valid TOML, or an unreadable
 |---|---|---|
 | `CREW_AGENT` | all | Your agent name. `crew plan` falls back to `$USER`. |
 | `CREW_SOCKET` | `crew`, `crew-usher` | The usher socket. Default `$XDG_RUNTIME_DIR/crew/usher.sock`. |
-| `CREW_STRICT` | `crew run` | `1`: fail when the usher is down instead of running unmanaged. |
+| `CREW_STRICT` | `crew run`, `crew cargo` | `1`: fail when the usher is down instead of running unmanaged. |
 | `CREW_JOB` | set by `crew run` | Set inside a granted job. A nested `crew run` runs in that job instead of queueing behind it. |
 | `CREW_DESKTOP` | `crew run` | `1`: keep the owner's display variables in the job (never for `bench`). |
 | `CREW_ROOT` | `crew plan` | The project root, instead of searching upward. |
@@ -369,7 +419,9 @@ Each crate depends only on crates in its own layer or below. `crates/crew/tests/
 | 1 | `crew-usher-client` | Job requests, kind guessing, the scope runner, `crew top` text and JSON. |
 | 1 | `crew-usher` | The daemon: admission, queue, owner presence, agent accounting. |
 | 1 | `crew-ledger` | `plan.toml`, the ledger, the rules. Program: `crew-plan`. |
+| 1 | `crew-depot-config` | The `[depot]` table: toolchain pin, mbx use, profile overrides, pool reserve. |
 | 2 | `crew-queue` | The merge queue. Program: `crew-queue`. |
+| 2 | `crew-depot` | `crew cargo` and `crew build`: cargo through mbx under a build grant, statistics, miss explanations, the sharing report. Program: `crew-depot`. |
 | 4 | `crew` | The command line. |
 
 Why separate programs:

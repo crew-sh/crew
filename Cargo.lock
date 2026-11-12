@@ -58,6 +58,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "crew-depot"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "crew-depot-config",
+ "crew-proto",
+ "crew-sys",
+ "crew-usher",
+ "crew-usher-client",
+ "libc",
+ "prost",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "crew-depot-config"
 version = "0.1.0"
 dependencies = [

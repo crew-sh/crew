@@ -624,3 +624,37 @@ fn a_bad_usher_table_stops_crew_run_but_an_explicit_kind_skips_the_file() {
             .success()
     );
 }
+
+#[test]
+fn cargo_and_build_reach_crew_depot_and_the_other_subcommands_still_work() {
+    let Some(depot) = Path::new(CREW)
+        .parent()
+        .map(|d| d.join("crew-depot"))
+        .filter(|p| p.exists())
+    else {
+        return skip("crew-depot is not built (run `cargo build --workspace` first)");
+    };
+    let dir = tempdir("crew-cli-depot-");
+    let run = |args: &[&str]| {
+        Command::new(CREW)
+            .args(args)
+            .current_dir(dir.path())
+            .env("XDG_CACHE_HOME", dir.path().join("cache"))
+            .env("XDG_CONFIG_HOME", dir.path().join("config"))
+            .output()
+            .unwrap()
+    };
+    let stats = run(&["build", "stats"]);
+    assert!(
+        stats.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stats.stderr)
+    );
+    assert!(String::from_utf8_lossy(&stats.stdout).contains("no build of this project"));
+    let bare = run(&["cargo"]);
+    assert_eq!(bare.status.code(), Some(125));
+    assert!(String::from_utf8_lossy(&bare.stderr).contains("cargo needs arguments"));
+    assert!(depot.exists());
+    let top = run(&["help"]);
+    assert!(String::from_utf8_lossy(&top.stdout).contains("cargo <args>"));
+}
