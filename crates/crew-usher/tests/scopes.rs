@@ -666,3 +666,45 @@ fn a_stale_connection_closing_does_not_drop_the_job_its_client_queued_again() {
     );
     drop(new);
 }
+
+/// Cancels a detached job when a failing test unwinds, so no scope outlives the run.
+struct StopJob(Client, String);
+
+impl Drop for StopJob {
+    fn drop(&mut self) {
+        let _ = self.0.cancel(&self.1);
+    }
+}
+
+#[test]
+fn the_tick_runs_while_messages_keep_arriving() {
+    let Some(f) = Fixture::start(|_| {}) else {
+        return;
+    };
+    let busy = f
+        .client
+        .detach(&detach_opts(JobKind::Other, &["sleep", "300"], None))
+        .unwrap();
+    let _stop_it = StopJob(Client::new(f.client.socket()), busy.job_id.clone());
+    until("the busy job to run", || {
+        (phase_of(&f.client.jobs().unwrap(), &busy.job_id) == Some(JobPhase::Running)).then_some(())
+    });
+    // A message every 100 ms never lets a 2 s receive timeout expire; only the tick reads a job's usage.
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flood = {
+        let (stop, client) = (stop.clone(), Client::new(f.client.socket()));
+        thread::spawn(move || {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = client.top();
+                thread::sleep(Duration::from_millis(100));
+            }
+        })
+    };
+    let mem = until("the tick to read the job's memory", || {
+        let top = f.client.top().unwrap();
+        top.running.first().map(|j| j.mem_bytes).filter(|m| *m > 0)
+    });
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    flood.join().unwrap();
+    assert!(mem > 0);
+}

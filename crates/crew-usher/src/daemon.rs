@@ -372,15 +372,21 @@ impl Daemon {
 
     pub fn run(mut self, rx: &Receiver<Msg>) {
         self.sync_pool();
+        let mut next_tick = Instant::now() + TICK;
         loop {
-            match rx.recv_timeout(self.next_wake()) {
+            match rx.recv_timeout(self.next_wake(next_tick)) {
                 Ok(Msg::Stop) | Err(RecvTimeoutError::Disconnected) => return,
                 Ok(msg) => {
                     self.handle(msg);
                     self.reschedule();
                     self.settle_waits();
                 }
-                Err(RecvTimeoutError::Timeout) => self.tick(),
+                Err(RecvTimeoutError::Timeout) => self.settle_waits(),
+            }
+            // The tick has its own deadline: a steady stream of messages must not postpone it.
+            if Instant::now() >= next_tick {
+                self.tick();
+                next_tick = Instant::now() + TICK;
             }
         }
     }
@@ -946,13 +952,16 @@ impl Daemon {
         self.settle_waits();
     }
 
-    fn next_wake(&self) -> Duration {
+    fn next_wake(&self, next_tick: Instant) -> Duration {
         let now = self.now_ms();
         self.waits
             .iter()
             .filter_map(|w| w.deadline_ms)
             .map(|d| Duration::from_millis(d.saturating_sub(now)))
-            .fold(TICK, Duration::min)
+            .fold(
+                next_tick.saturating_duration_since(Instant::now()),
+                Duration::min,
+            )
             .max(Duration::from_millis(1))
     }
 
