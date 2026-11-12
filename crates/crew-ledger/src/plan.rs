@@ -7,6 +7,18 @@ use crate::Error;
 
 pub const RESERVED_SCOPE_ID: &str = "scope";
 
+/// Step ids become branch names, directory names and git arguments: letters, digits, `.`, `_` and `-`,
+/// not starting with `.` or `-`.
+pub fn valid_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 64
+        && !id.starts_with(['.', '-'])
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        && !id.contains("..")
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Kind {

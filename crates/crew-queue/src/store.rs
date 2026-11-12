@@ -77,8 +77,16 @@ impl Store {
         let mut state = self.read()?;
         let out = f(&mut state);
         let tmp = self.file.with_extension("pb.tmp");
-        std::fs::write(&tmp, state.encode_to_vec())?;
+        {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(&state.encode_to_vec())?;
+            f.sync_all()?;
+        }
         std::fs::rename(&tmp, &self.file)?;
+        if let Some(dir) = self.file.parent() {
+            std::fs::File::open(dir)?.sync_all()?;
+        }
         Ok(out)
     }
 }

@@ -554,3 +554,208 @@ fn the_readme_quickstart_files_are_valid() {
         crew_proto::JobKind::Game
     );
 }
+
+#[test]
+fn a_submission_for_a_step_the_plan_lost_is_dropped_and_never_merged() {
+    let fx = Fx::new(&[("s1", &[]), ("s2", &[])], "");
+    fx.built("s1", &[("n1.txt", "one\n")]);
+    fx.built("s2", &[("n2.txt", "two\n")]);
+    // The step disappears from the plan after it was submitted.
+    let plan = fs::read_to_string(fx.root.join("plan.toml")).unwrap();
+    let kept: String = plan
+        .split("[[step]]")
+        .filter(|b| !b.contains("\"s1\""))
+        .collect::<Vec<_>>()
+        .join("[[step]]");
+    fs::write(fx.root.join("plan.toml"), kept).unwrap();
+    let tip_before = crew_git::branch_tip(&fx.root, "integration").unwrap();
+    let s = fx.run();
+    assert_eq!(
+        s.landed
+            .iter()
+            .map(|(id, _)| id.as_str())
+            .collect::<Vec<_>>(),
+        ["s2"]
+    );
+    assert!(
+        !fx.integration_has("n1.txt"),
+        "the orphaned branch was merged"
+    );
+    assert!(fx.integration_has("n2.txt"));
+    assert_ne!(
+        tip_before,
+        crew_git::branch_tip(&fx.root, "integration").unwrap()
+    );
+    // And the queue is not stuck: the next pass works.
+    assert_eq!(fx.run().batches, 0);
+}
+
+#[test]
+fn a_branch_with_nothing_beyond_the_base_fails_instead_of_landing() {
+    let fx = Fx::new(&[("s1", &[]), ("child", &["s1"])], "");
+    git(&fx.root, &["branch", "crew/s1", "main"]);
+    submit::submit(&fx.ctx, "crew/s1", "s1").unwrap();
+    fx.built("child", &[("b.txt", "child\n")]);
+    let s = fx.run();
+    assert_eq!(fx.status("s1"), Status::Failed, "{:?}", s);
+    assert!(
+        fx.detail("s1").contains("no commits beyond"),
+        "{}",
+        fx.detail("s1")
+    );
+    assert_ne!(
+        fx.status("child"),
+        Status::Landed,
+        "its dependency never landed"
+    );
+}
+
+#[test]
+fn a_stacked_branch_in_a_red_batch_is_not_recorded_landed_before_the_check() {
+    let fx = Fx::new(
+        &[("a", &[]), ("b", &["a"])],
+        "check = [\"test ! -e BROKEN\"]",
+    );
+    // b is stacked on a, and a's commit is the broken one.
+    let wt = fx._tmp.path().join("wt-stack");
+    crew_git::worktree_add(&fx.root, &wt, "crew/a", "main").unwrap();
+    fs::write(wt.join("BROKEN"), "x").unwrap();
+    git(&wt, &["add", "."]);
+    git(&wt, &["commit", "-qm", "a"]);
+    git(&wt, &["checkout", "-q", "-b", "crew/b"]);
+    fs::write(wt.join("n3.txt"), "b\n").unwrap();
+    git(&wt, &["add", "."]);
+    git(&wt, &["commit", "-qm", "b"]);
+    crew_git::worktree_remove(&fx.root, &wt, true).unwrap();
+    submit::submit(&fx.ctx, "crew/a", "a").unwrap();
+    submit::submit(&fx.ctx, "crew/b", "b").unwrap();
+    let s = fx.run();
+    assert_eq!(s.landed.len(), 0, "{s:?}");
+    assert!(!fx.integration_has("BROKEN") && !fx.integration_has("n3.txt"));
+    assert_ne!(fx.status("b"), Status::Landed);
+    assert_eq!(fx.status("a"), Status::Failed);
+}
+
+fn killed_check_runner(dir: &Path, tries: &Path) -> CheckRunner {
+    // First run is killed by SIGKILL, as the OOM killer would; later runs pass.
+    let fake = script(
+        dir,
+        "kill-once",
+        &format!(
+            "echo x >> {t}\nif [ \"$(wc -l < {t})\" -le 1 ]; then kill -9 $$; fi\nshift 4\nexec \"$@\"",
+            t = tries.display()
+        ),
+    );
+    CheckRunner {
+        crew_bin: Some(fake),
+    }
+}
+
+#[test]
+fn a_check_killed_by_a_signal_is_retried_and_blames_no_step() {
+    let fx = Fx::new(&[("s1", &[])], "check = [\"true\"]");
+    let tries = fx._tmp.path().join("tries");
+    fx.built("s1", &[("a.txt", "x\n")]);
+    let runner = Runner::new(&fx.ctx, killed_check_runner(fx._tmp.path(), &tries));
+    let s = runner.run(true).unwrap();
+    assert_eq!((s.landed.len(), s.failed.len()), (1, 0), "{s:?}");
+    assert_eq!(fs::read_to_string(&tries).unwrap().lines().count(), 2);
+}
+
+#[test]
+fn a_check_that_is_killed_every_time_stops_the_runner_without_failing_the_step() {
+    let fx = Fx::new(&[("s1", &[])], "check = [\"true\"]");
+    let always = script(fx._tmp.path(), "always-killed", "kill -9 $$");
+    fx.built("s1", &[("a.txt", "x\n")]);
+    let runner = Runner::new(
+        &fx.ctx,
+        CheckRunner {
+            crew_bin: Some(always),
+        },
+    );
+    let err = runner.run(true).unwrap_err();
+    assert!(err.to_string().contains("did not run to a result"), "{err}");
+    assert_eq!(fx.status("s1"), Status::Built);
+    assert!(!fx.integration_has("n4.txt"));
+}
+
+#[test]
+fn the_default_owner_is_the_agent_session_not_the_callers_throwaway_parent() {
+    let chain = [
+        (900, "sh".to_string()),
+        (800, "bash".to_string()),
+        (700, "claude".to_string()),
+        (600, "tmux".to_string()),
+    ];
+    assert_eq!(worktrees::default_owner(&chain, 321), 700);
+    assert_eq!(
+        worktrees::default_owner(&chain[..2], 321),
+        321,
+        "no agent above: the session leader"
+    );
+}
+
+#[test]
+fn worktree_new_refuses_ids_that_are_paths_or_not_in_the_plan() {
+    let fx = Fx::new(&[("s1", &[])], "");
+    let me = Some(u64::from(std::process::id()));
+    for bad in [
+        "..",
+        "../escape",
+        "/abs",
+        ".integration",
+        "-x",
+        "not-in-plan",
+    ] {
+        assert!(worktrees::new(&fx.ctx, bad, me).is_err(), "{bad}");
+    }
+    assert!(
+        !fx.ctx.integration_worktree().exists()
+            || fx.ctx.integration_worktree().join("a.txt").exists()
+    );
+    worktrees::new(&fx.ctx, "s1", me).unwrap();
+}
+
+#[test]
+fn two_agents_starting_the_same_step_at_once_cannot_both_own_it() {
+    let fx = Fx::new(&[("s1", &[])], "");
+    let mut sleepers: Vec<_> = (0..2)
+        .map(|_| Command::new("sleep").arg("30").spawn().unwrap())
+        .collect();
+    let owners: Vec<u64> = sleepers.iter().map(|c| u64::from(c.id())).collect();
+    let results: Vec<_> = std::thread::scope(|s| {
+        let handles: Vec<_> = owners
+            .iter()
+            .map(|o| {
+                let ctx = &fx.ctx;
+                s.spawn(move || worktrees::new(ctx, "s1", Some(*o)))
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    for c in &mut sleepers {
+        let _ = c.kill();
+        let _ = c.wait();
+    }
+    assert_eq!(
+        results.iter().filter(|r| r.is_ok()).count(),
+        1,
+        "{results:?}"
+    );
+}
+
+#[test]
+fn gc_keeps_a_dead_owners_worktree_while_a_process_works_in_it() {
+    let fx = Fx::new(&[("s1", &[])], "");
+    let wt = worktrees::new(&fx.ctx, "s1", Some(dead_pid())).unwrap();
+    let mut editor = Command::new("sleep")
+        .arg("30")
+        .current_dir(&wt)
+        .spawn()
+        .unwrap();
+    let rows = worktrees::gc(&fx.ctx).unwrap();
+    let _ = editor.kill();
+    let _ = editor.wait();
+    assert!(!rows[0].removed && wt.exists());
+    assert!(worktrees::gc(&fx.ctx).unwrap()[0].removed);
+}

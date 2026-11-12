@@ -22,12 +22,21 @@ impl Salvaged {
 }
 
 /// Save a worktree's unsaved work into `dest`: tracked diff, untracked tarball, unlanded commits as patches.
+/// Files that .gitignore hides (local config, generated data) are not saved. Any git failure is an error.
 pub fn salvage(worktree: &Path, dest: &Path, keep_refs: &[String]) -> Result<Salvaged> {
     std::fs::create_dir_all(dest)?;
     let mut out = Salvaged::default();
 
     let diff = git_out(worktree, &["diff", "--binary", "HEAD"])?;
-    if diff.status.success() && !diff.stdout.is_empty() {
+    // A failed diff saved nothing; reporting success would let the caller delete the work.
+    if !diff.status.success() {
+        return Err(Error::failed(
+            worktree,
+            &["diff", "--binary", "HEAD"],
+            &diff,
+        ));
+    }
+    if !diff.stdout.is_empty() {
         let p = dest.join("tracked.diff");
         std::fs::write(&p, &diff.stdout)?;
         out.diff = Some(p);
@@ -37,6 +46,13 @@ pub fn salvage(worktree: &Path, dest: &Path, keep_refs: &[String]) -> Result<Sal
         worktree,
         &["ls-files", "--others", "--exclude-standard", "-z"],
     )?;
+    if !untracked.status.success() {
+        return Err(Error::failed(
+            worktree,
+            &["ls-files", "--others", "--exclude-standard", "-z"],
+            &untracked,
+        ));
+    }
     if !untracked.stdout.is_empty() {
         let p = dest.join("untracked.tar.gz");
         let mut tar = Command::new("tar")

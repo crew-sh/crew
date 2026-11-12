@@ -200,6 +200,24 @@ fn salvage_keeps_diff_untracked_files_and_unlanded_commits_only() {
 }
 
 #[test]
+fn salvage_fails_when_git_cannot_read_the_worktree_instead_of_reporting_nothing_to_save() {
+    let (t, r) = repo();
+    let w = t.path().join("wt");
+    worktree_add(&r, &w, "feat", "main").unwrap();
+    fs::write(w.join("a.txt"), "precious uncommitted work\n").unwrap();
+    let index = sh(
+        &w,
+        &["rev-parse", "--path-format=absolute", "--git-path", "index"],
+    );
+    fs::write(index, b"not an index").unwrap();
+    let dest = t.path().join("out");
+    assert!(
+        salvage(&w, &dest, &["main".to_owned()]).is_err(),
+        "a worktree git cannot read must not look empty"
+    );
+}
+
+#[test]
 fn salvage_of_a_clean_worktree_is_empty() {
     let (t, r) = repo();
     let w = t.path().join("wt");

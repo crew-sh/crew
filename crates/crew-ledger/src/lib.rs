@@ -15,7 +15,7 @@ pub use crew_proto::ledger::{
 };
 pub use error::Error;
 pub use ledger::{Ledger, Refusal, Snapshot, StepState, Use, events, now_ms};
-pub use plan::{Budget, Kind, Model, Plan, RESERVED_SCOPE_ID, Review, RunKind, Step};
+pub use plan::{Budget, Kind, Model, Plan, RESERVED_SCOPE_ID, Review, RunKind, Step, valid_id};
 pub use report::{
     KindCount, Show, StepRow, Summary, render_markdown, render_show, show, summarize,
 };

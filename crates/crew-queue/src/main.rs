@@ -15,7 +15,8 @@ usage: crew queue [--repo DIR] <command>
   worktree new <step> [--owner-pid N]   create the step's worktree (a dead owner's is taken over)
   worktree done <step>          mark finished and drop its target dir
   salvage [<step>] [--all-dead] --to DIR   save diff, untracked files and unlanded commits
-  gc                            salvage then remove worktrees whose owner is dead
+  gc                            salvage then remove worktrees whose owner is dead and that no process works in
+                                (files .gitignore hides are not saved)
   final                         run the [queue] final commands on the integration tip";
 
 struct Args(Vec<String>);
@@ -155,7 +156,7 @@ fn run() -> Result<u8> {
                         println!("{}: removed, salvaged to {}", row.step_id, d.display())
                     }
                     (None, true) => println!("{}: removed", row.step_id),
-                    (_, false) => println!("{}: kept (salvage failed)", row.step_id),
+                    (_, false) => println!("{}: kept (see the message above)", row.step_id),
                 }
             }
         }

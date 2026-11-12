@@ -127,12 +127,22 @@ impl<'a> Runner<'a> {
             let state = match state_of(ledger, &sub.step_id) {
                 Ok(s) => s,
                 Err(e) => {
-                    eprintln!("queue: skipping {}: {e}", sub.step_id);
-                    keep.push(sub);
+                    // The ledger could not land it later either, so it must not be merged now.
+                    eprintln!("queue: dropping the submission for {}: {e}", sub.step_id);
+                    gone.push(sub.step_id.clone());
                     continue;
                 }
             };
             if matches!(state, Status::Landed | Status::Failed | Status::Dropped) {
+                gone.push(sub.step_id.clone());
+                continue;
+            }
+            if !matches!(state, Status::Built | Status::Running | Status::Approved) {
+                eprintln!(
+                    "queue: dropping the submission for {}: the step is {}, not built",
+                    sub.step_id,
+                    crew_ledger::status_name(state)
+                );
                 gone.push(sub.step_id.clone());
                 continue;
             }
@@ -149,7 +159,24 @@ impl<'a> Runner<'a> {
                 continue;
             };
             if crew_git::is_ancestor(&self.ctx.root, &branch_tip, &tip)? {
-                self.land_one(ledger, &sub.step_id, &branch_tip, "already-merged", summary)?;
+                // Contained in the base as well means the branch never added anything.
+                let in_base = crew_git::branch_tip(&self.ctx.root, &self.ctx.config.base)?
+                    .is_some_and(|b| {
+                        crew_git::is_ancestor(&self.ctx.root, &branch_tip, &b).unwrap_or(false)
+                    });
+                if in_base {
+                    self.fail(
+                        ledger,
+                        &sub.step_id,
+                        &format!(
+                            "branch {} has no commits beyond {}; there is nothing to land",
+                            sub.branch, self.ctx.config.base
+                        ),
+                        summary,
+                    )?;
+                } else {
+                    self.land_one(ledger, &sub.step_id, &branch_tip, "already-merged", summary)?;
+                }
                 gone.push(sub.step_id.clone());
                 continue;
             }
@@ -255,9 +282,10 @@ impl<'a> Runner<'a> {
             match crew_git::merge_no_ff(wt, &format!("refs/heads/{}", sub.branch), &message)? {
                 MergeOutcome::Merged { sha } => merged.push((sub, sha)),
                 MergeOutcome::AlreadyMerged => {
+                    // Carried in by a branch merged earlier in this batch (a stack): it lands, or not, with the check.
                     let sha = crew_git::branch_tip(repo, &format!("refs/heads/{}", sub.branch))?
                         .unwrap_or_default();
-                    self.apply(ledger, &sub.step_id, Fate::Landed(sha), batch, summary)?;
+                    merged.push((sub, sha));
                 }
                 MergeOutcome::Conflict { files } => {
                     let detail = format!(

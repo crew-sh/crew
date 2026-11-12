@@ -7,6 +7,9 @@ const TAIL_LINES: usize = 60;
 /// `crew run` exit codes for "refused" and "error": the check never ran, so nobody is to blame.
 const CREW_REFUSED: i32 = 75;
 const CREW_ERROR: i32 = 125;
+/// A job reports 128 + the signal that ended it: the OOM killer's SIGKILL, `crew cancel`'s SIGTERM.
+const KILLED: i32 = 137;
+const TERMINATED: i32 = 143;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CheckOutcome {
@@ -44,6 +47,29 @@ impl CheckRunner {
 
     pub fn run_all(&self, dir: &Path, commands: &[String]) -> Result<CheckOutcome> {
         for command in commands {
+            // A check that was killed or never started says nothing about the code: once more, then give up.
+            let mut attempt = self.run_one(dir, command)?;
+            if matches!(attempt, Attempt::DidNotRun(_)) {
+                attempt = self.run_one(dir, command)?;
+            }
+            match attempt {
+                Attempt::Passed => {}
+                Attempt::Failed(tail) => {
+                    return Ok(CheckOutcome::Red {
+                        command: command.clone(),
+                        tail,
+                    });
+                }
+                Attempt::DidNotRun(why) => {
+                    anyhow::bail!("the check `{command}` did not run to a result, twice: {why}");
+                }
+            }
+        }
+        Ok(CheckOutcome::Green)
+    }
+
+    fn run_one(&self, dir: &Path, command: &str) -> Result<Attempt> {
+        {
             let wrapped = format!("exec 2>&1; {command}");
             let mut cmd = match &self.crew_bin {
                 Some(crew) => {
@@ -65,25 +91,31 @@ impl CheckRunner {
                 .output()
                 .with_context(|| format!("spawn check `{command}`"))?;
             if out.status.success() {
-                continue;
+                return Ok(Attempt::Passed);
             }
             let text = String::from_utf8_lossy(&out.stdout);
-            if self.crew_bin.is_some()
-                && matches!(out.status.code(), Some(CREW_REFUSED | CREW_ERROR))
-            {
-                anyhow::bail!(
-                    "crew run did not run `{command}` (exit {:?}): {}",
-                    out.status.code(),
+            let code = out.status.code();
+            let through_crew = self.crew_bin.is_some();
+            let infrastructure = code.is_none()
+                || (through_crew
+                    && matches!(code, Some(CREW_REFUSED | CREW_ERROR | KILLED | TERMINATED)));
+            if infrastructure {
+                return Ok(Attempt::DidNotRun(format!(
+                    "exit {code:?}: {}",
                     tail(&format!("{text}{}", String::from_utf8_lossy(&out.stderr)))
-                );
+                )));
             }
-            return Ok(CheckOutcome::Red {
-                command: command.clone(),
-                tail: tail(&text),
-            });
+            Ok(Attempt::Failed(tail(&text)))
         }
-        Ok(CheckOutcome::Green)
     }
+}
+
+/// One run of a check command.
+enum Attempt {
+    Passed,
+    Failed(String),
+    /// Killed by a signal, or `crew run` refused or failed: the code was never judged.
+    DidNotRun(String),
 }
 
 pub fn tail(text: &str) -> String {

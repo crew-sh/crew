@@ -688,3 +688,37 @@ fn cutting_off_a_partial_tail_keeps_a_copy_of_the_file_first() {
     assert_eq!(copies.len(), 1);
     assert_eq!(std::fs::read(copies[0].path()).unwrap(), cut);
 }
+
+#[test]
+fn check_rejects_step_ids_that_git_or_the_filesystem_would_misread() {
+    for bad in [
+        "..",
+        "../x",
+        "/abs",
+        ".integration",
+        "-rf",
+        "a b",
+        "a/b",
+        "x..y",
+    ] {
+        let plan =
+            format!("[[step]]\nid = {bad:?}\ntitle = \"t\"\nkind = \"asked\"\nowns = [\"a/**\"]\n");
+        let (_d, l) = project(&plan);
+        let found = check(&l).unwrap();
+        assert!(
+            found
+                .iter()
+                .any(|v| matches!(v, Violation::BadId(id) if id == bad)),
+            "{bad}: {found:?}"
+        );
+    }
+    let (_d, l) = project(
+        "[[step]]\nid = \"s1.fix_2-b\"\ntitle = \"t\"\nkind = \"asked\"\nowns = [\"a/**\"]\n",
+    );
+    assert!(
+        !check(&l)
+            .unwrap()
+            .iter()
+            .any(|v| matches!(v, Violation::BadId(_)))
+    );
+}

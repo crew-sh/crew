@@ -10,6 +10,8 @@ use crate::{Error, Status};
 pub enum Violation {
     NoRequest,
     EmptyId,
+    /// An id with characters git or the filesystem would read as something else.
+    BadId(String),
     ReservedId(String),
     DuplicateId(String),
     UnknownDep {
@@ -44,6 +46,10 @@ impl fmt::Display for Violation {
                 "the plan does not state the request it serves ([plan] request)"
             ),
             Self::EmptyId => write!(f, "a step has an empty id"),
+            Self::BadId(id) => write!(
+                f,
+                "step id `{id}` is not usable: use letters, digits, `.`, `_` and `-`, not starting with `.` or `-`"
+            ),
             Self::ReservedId(id) => write!(f, "step id `{id}` is reserved"),
             Self::DuplicateId(id) => write!(f, "step id `{id}` is used twice"),
             Self::UnknownDep { step, dep } => {
@@ -93,6 +99,8 @@ pub fn check_plan(plan: &Plan) -> Vec<Violation> {
             out.push(Violation::EmptyId);
         } else if s.id == RESERVED_SCOPE_ID {
             out.push(Violation::ReservedId(s.id.clone()));
+        } else if !crate::plan::valid_id(&s.id) {
+            out.push(Violation::BadId(s.id.clone()));
         }
         if index.insert(&s.id, i).is_some() && seen_dup.insert(s.id.as_str()) {
             out.push(Violation::DuplicateId(s.id.clone()));
