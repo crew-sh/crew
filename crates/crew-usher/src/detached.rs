@@ -1,13 +1,15 @@
 //! Detached jobs: records the usher keeps across restarts, and how they are stored and shown.
 use std::fs;
-use std::io::{self, Write};
-use std::os::unix::fs::OpenOptionsExt;
+use std::io;
 use std::path::{Path, PathBuf};
 
 use crew_proto::prost::Message;
 use crew_proto::{DetachedJob, JobPhase, JobSummary, JobsFile};
 
-const FORMAT_VERSION: u32 = 1;
+use crate::state_file::{self, Read};
+
+/// 2: the file also lists attached jobs (running ones, and queued ones that may resubmit). A version-1 file has detached jobs only.
+pub const FORMAT_VERSION: u32 = 2;
 const KEEP_FINISHED: usize = 100;
 const KEEP_FINISHED_MS: u64 = 7 * 24 * 3600 * 1000;
 
@@ -39,11 +41,42 @@ impl Dirs {
     }
 }
 
-pub fn load(path: &Path) -> Vec<DetachedJob> {
-    let Ok(bytes) = fs::read(path) else {
-        return Vec::new();
+/// A state file's content with the version of the usher that wrote it.
+#[derive(Debug, PartialEq)]
+pub struct Stored {
+    pub version: u32,
+    pub jobs: Vec<DetachedJob>,
+}
+
+/// Reads the state file; one that is cut off, damaged or from a newer usher is set aside, never overwritten.
+pub fn load(path: &Path) -> Read<Stored> {
+    let bytes = match fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Read::Missing,
+        Err(e) => {
+            return Read::Unusable {
+                why: format!("cannot read it: {e}"),
+                to: None,
+            };
+        }
     };
-    JobsFile::decode(bytes.as_slice()).map_or_else(|_| Vec::new(), |f| f.jobs)
+    let why = match JobsFile::decode(bytes.as_slice()) {
+        Ok(f) if f.version <= FORMAT_VERSION => {
+            return Read::Loaded(Stored {
+                version: f.version,
+                jobs: f.jobs,
+            });
+        }
+        Ok(f) => format!(
+            "written by a newer usher (format {}, this one reads up to {FORMAT_VERSION})",
+            f.version
+        ),
+        Err(e) => format!("not a valid job state file: {e}"),
+    };
+    Read::Unusable {
+        why,
+        to: state_file::quarantine(path).ok(),
+    }
 }
 
 pub fn save(path: &Path, jobs: Vec<DetachedJob>) -> io::Result<()> {
@@ -51,19 +84,8 @@ pub fn save(path: &Path, jobs: Vec<DetachedJob>) -> io::Result<()> {
         version: FORMAT_VERSION,
         jobs,
     };
-    if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir)?;
-    }
     // The records hold the clients' environments, so only their owner may read the file.
-    let tmp = path.with_extension("pb.tmp");
-    let mut out = fs::OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .mode(0o600)
-        .open(&tmp)?;
-    out.write_all(&file.encode_to_vec())?;
-    fs::rename(tmp, path)
+    state_file::write_atomic(path, &file.encode_to_vec())
 }
 
 pub fn is_finished(phase: JobPhase) -> bool {
@@ -140,19 +162,61 @@ mod tests {
     fn the_state_file_round_trips_through_an_atomic_rename() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("jobs.pb");
-        assert!(load(&path).is_empty());
+        assert_eq!(load(&path), Read::Missing);
         let jobs = vec![
             record("a", JobPhase::Queued, 0),
             record("b", JobPhase::Exited, 5),
         ];
         save(&path, jobs.clone()).unwrap();
-        assert_eq!(load(&path), jobs);
+        assert_eq!(
+            load(&path),
+            Read::Loaded(Stored {
+                version: FORMAT_VERSION,
+                jobs
+            })
+        );
         assert!(!dir.path().join("jobs.pb.tmp").exists());
         let mode =
             std::os::unix::fs::PermissionsExt::mode(&fs::metadata(&path).unwrap().permissions());
         assert_eq!(mode & 0o777, 0o600);
-        fs::write(&path, b"not a protobuf \xff\xff").unwrap();
-        assert!(load(&path).is_empty());
+    }
+
+    #[test]
+    fn a_damaged_or_newer_state_file_is_set_aside_not_treated_as_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("jobs.pb");
+        let queued = vec![record("a", JobPhase::Queued, 0)];
+        save(&path, queued).unwrap();
+        // A power cut leaves a prefix of the real file.
+        let whole = fs::read(&path).unwrap();
+        fs::write(&path, &whole[..whole.len() - 3]).unwrap();
+        let Read::Unusable { to: Some(kept), .. } = load(&path) else {
+            panic!("a cut-off file must not load");
+        };
+        assert_eq!(fs::read(&kept).unwrap(), whole[..whole.len() - 3]);
+        assert!(!path.exists(), "the next save must not find it in the way");
+
+        let future = JobsFile {
+            version: FORMAT_VERSION + 1,
+            jobs: vec![],
+        };
+        fs::write(&path, future.encode_to_vec()).unwrap();
+        assert!(matches!(load(&path), Read::Unusable { to: Some(_), .. }));
+    }
+
+    #[test]
+    fn a_version_one_file_from_the_previous_usher_still_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("jobs.pb");
+        let old = JobsFile {
+            version: 1,
+            jobs: vec![record("a", JobPhase::Queued, 0)],
+        };
+        fs::write(&path, old.encode_to_vec()).unwrap();
+        let Read::Loaded(stored) = load(&path) else {
+            panic!("the previous format must load");
+        };
+        assert_eq!((stored.version, stored.jobs.len()), (1, 1));
     }
 
     #[test]

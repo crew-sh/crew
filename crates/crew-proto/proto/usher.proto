@@ -382,6 +382,11 @@ message DetachedJob {
   string tmpdir = 12;
   optional int32 exit_code = 13;
   string reason = 14;
+  // A `crew run` job, not a detached one: a running one is kept so a restarted usher still counts its scope, a queued one so its client keeps its place.
+  bool attached = 15;
+  // The `crew run` process that holds an attached job, and its start time (clock ticks), so a restarted usher can tell when it died.
+  uint32 client_pid = 16;
+  uint64 client_start_ticks = 17;
 }
 
 message JobsFile {
@@ -397,6 +402,8 @@ message SizeSample {
 message SizeEntry {
   string key = 1;
   repeated SizeSample samples = 2;
+  // When a run of this command last taught the usher something; zero in files from before keys expired.
+  uint64 last_seen_unix_ms = 3;
 }
 
 message SizesFile {

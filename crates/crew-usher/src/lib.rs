@@ -8,4 +8,5 @@ pub mod log;
 pub mod pool;
 pub mod server;
 pub mod sizes;
+pub mod state_file;
 pub mod waits;

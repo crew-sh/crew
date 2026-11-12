@@ -146,6 +146,13 @@ pub fn kill(name: &str, signal: KillSignal) {
         .output();
 }
 
+/// Asks systemd to stop the scope and everything in it (SIGTERM, then SIGKILL after its stop timeout); does not wait.
+pub fn stop(name: &str) {
+    let _ = Command::new("systemctl")
+        .args(["--user", "stop", "--no-block", &format!("{name}.scope")])
+        .output();
+}
+
 pub fn set_weights(name: &str, cpu_weight: u32, io_weight: u32) {
     let _ = Command::new("systemctl")
         .args([

@@ -708,3 +708,333 @@ fn the_tick_runs_while_messages_keep_arriving() {
     flood.join().unwrap();
     assert!(mem > 0);
 }
+
+/// Sends one raw frame on a new connection, the way a client that is not `crew` would.
+fn raw(f: &Fixture, body: crew_proto::envelope::Body) -> std::os::unix::net::UnixStream {
+    let mut s = std::os::unix::net::UnixStream::connect(f.client.socket()).unwrap();
+    crew_proto::write_frame(&mut s, &crew_proto::Envelope::of(body)).unwrap();
+    s
+}
+
+fn raw_ack(s: &mut std::os::unix::net::UnixStream) -> crew_proto::Ack {
+    match crew_proto::read_frame(s).unwrap().unwrap().body {
+        Some(crew_proto::envelope::Body::Ack(a)) => a,
+        other => panic!("{other:?}"),
+    }
+}
+
+fn job_request(id: &str, kind: JobKind, argv: &[&str]) -> crew_proto::JobRequest {
+    crew_proto::JobRequest {
+        id: id.into(),
+        kind: kind as i32,
+        argv: argv.iter().map(|s| (*s).to_string()).collect(),
+        cwd: "/".into(),
+        ..crew_proto::JobRequest::default()
+    }
+}
+
+/// Stops a scope when a failing test unwinds.
+struct StopScope(String);
+
+impl Drop for StopScope {
+    fn drop(&mut self) {
+        crew_sys::scope::stop(&self.0);
+    }
+}
+
+#[test]
+fn a_restarted_usher_still_counts_the_crew_run_jobs_that_are_running() {
+    let Some(mut f) = Fixture::start(|_| {}) else {
+        return;
+    };
+    f.client.set_owner(OwnerArg::Away).unwrap();
+    let client = Client::new(f.client.socket());
+    let run = thread::spawn(move || client.run(&opts(JobKind::Other, &["sleep", "4"])));
+    let id = until("the job to run", || {
+        f.client
+            .top()
+            .unwrap()
+            .running
+            .first()
+            .map(|j| j.id.clone())
+    });
+    let _stop = StopScope(format!("crew-other-{id}"));
+
+    f.restart();
+
+    let top = f.client.top().unwrap();
+    assert_eq!(
+        top.running.len(),
+        1,
+        "the usher forgot a running job: {}",
+        f.log()
+    );
+    assert_eq!(top.running[0].id, id);
+    assert!(
+        f.log().contains("RESTORE") && f.log().contains("adopted=1"),
+        "{}",
+        f.log()
+    );
+    // A bench needs the machine to itself, so it must wait for the job the old usher granted.
+    f.client.set_owner(OwnerArg::Away).unwrap();
+    let bench = f
+        .client
+        .detach(&detach_opts(JobKind::Bench, &["true"], None))
+        .unwrap();
+    thread::sleep(Duration::from_millis(1500));
+    assert_eq!(
+        phase_of(&f.client.jobs().unwrap(), &bench.job_id),
+        Some(JobPhase::Queued),
+        "{}",
+        f.log()
+    );
+    assert_eq!(run.join().unwrap().unwrap(), 0);
+    let w = wait_for(&f.client, &bench.job_id, WaitCondition::JobExit);
+    assert_eq!(w.exit_code, Some(0), "{w:?}\n{}", f.log());
+}
+
+#[test]
+fn an_adopted_job_whose_client_died_while_no_usher_watched_is_stopped() {
+    let Some(mut f) = Fixture::start(|_| {}) else {
+        return;
+    };
+    // The state a dead usher left: a running `crew run` job whose client is a process we control.
+    let mut client_proc = Command::new("sleep").arg("60").spawn().unwrap();
+    let ticks = crew_sys::procs::read_start_ticks(Path::new("/proc"), client_proc.id()).unwrap();
+    let scope = "crew-other-orphan-1";
+    let _stop = StopScope(scope.to_string());
+    let mut job = Command::new("systemd-run")
+        .args([
+            "--user",
+            "--scope",
+            "--quiet",
+            &format!("--unit={scope}"),
+            "--",
+            "sleep",
+            "60",
+        ])
+        .spawn()
+        .unwrap();
+    until("the scope", || crew_sys::scope::alive(scope).then_some(()));
+    f.server.take().unwrap().stop();
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let rec = crew_proto::DetachedJob {
+        request: Some(job_request("orphan-1", JobKind::Other, &["sleep", "60"])),
+        phase: JobPhase::Running as i32,
+        queued_at_unix_ms: now_ms,
+        started_at_unix_ms: now_ms,
+        scope_name: scope.to_string(),
+        attached: true,
+        client_pid: client_proc.id(),
+        client_start_ticks: ticks,
+        ..Default::default()
+    };
+    crew_usher::detached::save(&f.paths.jobs, vec![rec]).unwrap();
+    f.server = Some(Server::start(f.cfg.clone(), &f.paths, IdleSource::Off, false).unwrap());
+    assert_eq!(f.client.top().unwrap().running.len(), 1, "{}", f.log());
+    thread::sleep(Duration::from_millis(2500));
+    assert!(
+        crew_sys::scope::alive(scope),
+        "the client is alive, so the job stays: {}",
+        f.log()
+    );
+
+    client_proc.kill().unwrap();
+    client_proc.wait().unwrap();
+    until("the orphaned scope to be stopped", || {
+        (!crew_sys::scope::alive(scope)).then_some(())
+    });
+    until("the reservation to be released", || {
+        f.client.top().unwrap().running.is_empty().then_some(())
+    });
+    let _ = job.wait();
+}
+
+#[test]
+fn a_command_that_leaves_a_process_behind_does_not_keep_its_scope() {
+    let Some(f) = Fixture::start(|_| {}) else {
+        return;
+    };
+    let job = f
+        .client
+        .detach(&detach_opts(
+            JobKind::Other,
+            &["sh", "-c", "sleep 60 & exit 0"],
+            None,
+        ))
+        .unwrap();
+    let scope = format!("crew-other-{}", job.job_id);
+    let _stop = StopScope(scope.clone());
+    assert_eq!(
+        wait_for(&f.client, &job.job_id, WaitCondition::JobExit).exit_code,
+        Some(0)
+    );
+    until("the leftover process to be stopped", || {
+        (!crew_sys::scope::alive(&scope)).then_some(())
+    });
+}
+
+#[test]
+fn a_failed_systemd_run_is_not_recorded_as_the_commands_exit_code() {
+    let Some(f) = Fixture::start(|_| {}) else {
+        return;
+    };
+    // A scope already holding the unit name makes systemd-run fail before it runs anything.
+    let id = "collide-1";
+    let name = format!("crew-other-{id}");
+    let mut squatter = Command::new("systemd-run")
+        .args([
+            "--user",
+            "--scope",
+            "--quiet",
+            &format!("--unit={name}"),
+            "--",
+            "sleep",
+            "30",
+        ])
+        .spawn()
+        .unwrap();
+    let _stop = StopScope(name.clone());
+    until("the squatter", || {
+        crew_sys::scope::alive(&name).then_some(())
+    });
+    let mut req = job_request(id, JobKind::Other, &["true"]);
+    req.detach = true;
+    let mut s = raw(&f, crew_proto::envelope::Body::JobRequest(req));
+    let _ = crew_proto::read_frame(&mut s);
+    let w = wait_for(&f.client, id, WaitCondition::JobExit);
+    let _ = squatter.kill();
+    assert_ne!(
+        w.exit_code,
+        Some(1),
+        "the usher blamed the command: {}",
+        f.log()
+    );
+    assert_eq!(w.exit_code, None, "{}", f.log());
+    let jobs = f.client.jobs().unwrap();
+    let j = jobs.jobs.iter().find(|j| j.id == id).unwrap();
+    assert_eq!(JobPhase::try_from(j.phase).unwrap(), JobPhase::Failed);
+    assert!(j.reason.contains("systemd-run"), "{}", j.reason);
+}
+
+#[test]
+fn only_the_jobs_own_connection_can_end_it() {
+    let Some(f) = Fixture::start(|_| {}) else {
+        return;
+    };
+    let client = Client::new(f.client.socket());
+    let run = thread::spawn(move || client.run(&opts(JobKind::Other, &["sleep", "3"])));
+    let id = until("the job to run", || {
+        f.client
+            .top()
+            .unwrap()
+            .running
+            .first()
+            .map(|j| j.id.clone())
+    });
+    let done = crew_proto::JobDone {
+        job_id: id.clone(),
+        exit_code: 0,
+        wall_ms: 3_600_000,
+        peak_mem_bytes: 1 << 20,
+        ..Default::default()
+    };
+    let _forged = raw(&f, crew_proto::envelope::Body::JobDone(done));
+    thread::sleep(Duration::from_millis(500));
+    assert_eq!(
+        f.client.top().unwrap().running.len(),
+        1,
+        "a stranger's JobDone released the reservation"
+    );
+    assert!(f.log().contains("IGNORE JobDone"), "{}", f.log());
+    assert_eq!(run.join().unwrap().unwrap(), 0);
+}
+
+#[test]
+fn a_connection_that_queued_two_jobs_loses_both_when_it_closes() {
+    let Some(f) = Fixture::start(|_| {}) else {
+        return;
+    };
+    f.client.set_owner(OwnerArg::Here).unwrap();
+    let mut s = std::os::unix::net::UnixStream::connect(f.client.socket()).unwrap();
+    for id in ["multi-1", "multi-2"] {
+        let env = crew_proto::Envelope::of(crew_proto::envelope::Body::JobRequest(job_request(
+            id,
+            JobKind::Bench,
+            &["true"],
+        )));
+        crew_proto::write_frame(&mut s, &env).unwrap();
+    }
+    until("both to queue", || {
+        (f.client.top().unwrap().queued.len() == 2).then_some(())
+    });
+    drop(s);
+    until("both to be dropped", || {
+        f.client.top().unwrap().queued.is_empty().then_some(())
+    });
+}
+
+#[test]
+fn a_request_cannot_take_over_a_queued_detached_job_or_claim_queue_time() {
+    let Some(f) = Fixture::start(|_| {}) else {
+        return;
+    };
+    f.client.set_owner(OwnerArg::Here).unwrap();
+    let queued = f
+        .client
+        .detach(&detach_opts(JobKind::Bench, &["true"], None))
+        .unwrap();
+    let mut s = raw(
+        &f,
+        crew_proto::envelope::Body::JobRequest(job_request(
+            &queued.job_id,
+            JobKind::Bench,
+            &["true"],
+        )),
+    );
+    assert!(!raw_ack(&mut s).ok);
+    let jobs = f.client.jobs().unwrap();
+    assert!(
+        jobs.jobs
+            .iter()
+            .find(|j| j.id == queued.job_id)
+            .unwrap()
+            .detached
+    );
+
+    let mut claim = job_request("claims-an-hour", JobKind::Bench, &["true"]);
+    claim.queued_at_unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+        - 3_600_000;
+    let _held = raw(&f, crew_proto::envelope::Body::JobRequest(claim));
+    let age = until("the claimant to queue", || {
+        f.client
+            .top()
+            .unwrap()
+            .queued
+            .iter()
+            .find(|j| j.id == "claims-an-hour")
+            .map(|j| j.age_ms)
+    });
+    assert!(age < 60_000, "the claimed queue time was believed: {age}ms");
+}
+
+#[test]
+fn ids_that_could_escape_their_directory_or_collide_are_rejected() {
+    let Some(f) = Fixture::start(|_| {}) else {
+        return;
+    };
+    for id in ["", "../escape", "a/b", &"x".repeat(65)] {
+        let mut s = raw(
+            &f,
+            crew_proto::envelope::Body::JobRequest(job_request(id, JobKind::Other, &["true"])),
+        );
+        assert!(!raw_ack(&mut s).ok, "{id:?}");
+    }
+    assert!(f.client.top().unwrap().running.is_empty());
+}

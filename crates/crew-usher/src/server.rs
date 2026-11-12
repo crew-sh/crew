@@ -150,21 +150,24 @@ fn serve_connection(stream: UnixStream, tx: &Sender<Msg>) {
         return;
     };
     let mut reader = stream;
-    let mut job_id: Option<String> = None;
+    let mut job_ids: Vec<String> = Vec::new();
     loop {
         let msg = match crew_proto::read_frame(&mut reader) {
             Ok(Some(env)) => match env.body {
                 Some(Body::JobRequest(req)) => {
                     // A detached job belongs to the usher, so its connection closing says nothing about it.
                     if !req.detach {
-                        job_id = Some(req.id.clone());
+                        job_ids.push(req.id.clone());
                     }
                     Msg::Job {
                         req: Box::new(req),
                         conn: conn.clone(),
                     }
                 }
-                Some(Body::JobDone(done)) => Msg::Done { done },
+                Some(Body::JobDone(done)) => Msg::Done {
+                    done,
+                    conn: conn.clone(),
+                },
                 Some(Body::TopRequest(_)) => Msg::Top { conn: conn.clone() },
                 Some(Body::JobsRequest(_)) => Msg::Jobs { conn: conn.clone() },
                 Some(Body::CancelRequest(c)) => Msg::Cancel {
@@ -182,7 +185,8 @@ fn serve_connection(stream: UnixStream, tx: &Sender<Msg>) {
                 _ => continue,
             },
             Ok(None) | Err(_) => {
-                if let Some(job_id) = job_id {
+                conn.mark_closed();
+                for job_id in job_ids {
                     let _ = tx.send(Msg::Gone {
                         job_id,
                         conn: conn.clone(),

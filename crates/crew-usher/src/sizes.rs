@@ -3,11 +3,15 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
+use crate::state_file::{self, Read};
+
 use crew_proto::prost::Message;
 use crew_proto::{JobKind, JobRequest, SizeEntry, SizeSample, SizesFile};
 
 const KEEP_SAMPLES: usize = 20;
 const FORMAT_VERSION: u32 = 1;
+/// A command nobody ran for this long is forgotten, so the file does not grow with every command line ever used.
+const KEEP_KEY_MS: u64 = 28 * 24 * 3600 * 1000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Learned {
@@ -15,9 +19,10 @@ pub struct Learned {
     pub cores_milli: u32,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, PartialEq)]
 pub struct Sizes {
     samples: BTreeMap<String, Vec<SizeSample>>,
+    last_seen_ms: BTreeMap<String, u64>,
 }
 
 fn base(arg: &str) -> &str {
@@ -71,19 +76,39 @@ fn median<T: Ord + Copy>(mut v: Vec<T>) -> Option<T> {
 }
 
 impl Sizes {
-    pub fn load(path: &Path) -> Self {
-        let Ok(bytes) = fs::read(path) else {
-            return Self::default();
+    /// Reads the sizes file; a damaged one is set aside and the usher starts without learned sizes.
+    pub fn load(path: &Path, now_ms: u64) -> Read<Self> {
+        let bytes = match fs::read(path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Read::Missing,
+            Err(e) => {
+                return Read::Unusable {
+                    why: format!("cannot read it: {e}"),
+                    to: None,
+                };
+            }
         };
-        let Ok(file) = SizesFile::decode(bytes.as_slice()) else {
-            return Self::default();
+        let why = match SizesFile::decode(bytes.as_slice()) {
+            Ok(f) if f.version <= FORMAT_VERSION => {
+                let mut sizes = Self::default();
+                for e in f.entries {
+                    // Files from before keys expired get a fresh lease.
+                    let seen = if e.last_seen_unix_ms == 0 {
+                        now_ms
+                    } else {
+                        e.last_seen_unix_ms
+                    };
+                    sizes.last_seen_ms.insert(e.key.clone(), seen);
+                    sizes.samples.insert(e.key, e.samples);
+                }
+                return Read::Loaded(sizes);
+            }
+            Ok(f) => format!("written by a newer usher (format {})", f.version),
+            Err(e) => format!("not a valid sizes file: {e}"),
         };
-        Self {
-            samples: file
-                .entries
-                .into_iter()
-                .map(|e| (e.key, e.samples))
-                .collect(),
+        Read::Unusable {
+            why,
+            to: state_file::quarantine(path).ok(),
         }
     }
 
@@ -96,18 +121,14 @@ impl Sizes {
                 .map(|(k, s)| SizeEntry {
                     key: k.clone(),
                     samples: s.clone(),
+                    last_seen_unix_ms: self.last_seen_ms.get(k).copied().unwrap_or(0),
                 })
                 .collect(),
         };
-        if let Some(dir) = path.parent() {
-            fs::create_dir_all(dir)?;
-        }
-        let tmp = path.with_extension("pb.tmp");
-        fs::write(&tmp, file.encode_to_vec())?;
-        fs::rename(tmp, path)
+        state_file::write_atomic(path, &file.encode_to_vec())
     }
 
-    pub fn record(&mut self, key: &str, peak_mem_bytes: u64, cores_milli: u32) {
+    pub fn record(&mut self, key: &str, peak_mem_bytes: u64, cores_milli: u32, now_ms: u64) {
         let list = self.samples.entry(key.to_string()).or_default();
         list.push(SizeSample {
             peak_mem_bytes,
@@ -116,6 +137,29 @@ impl Sizes {
         if list.len() > KEEP_SAMPLES {
             list.remove(0);
         }
+        self.last_seen_ms.insert(key.to_string(), now_ms);
+        self.forget_stale(now_ms);
+    }
+
+    fn forget_stale(&mut self, now_ms: u64) {
+        let stale: Vec<String> = self
+            .last_seen_ms
+            .iter()
+            .filter(|(_, seen)| now_ms.saturating_sub(**seen) >= KEEP_KEY_MS)
+            .map(|(k, _)| k.clone())
+            .collect();
+        for k in stale {
+            self.samples.remove(&k);
+            self.last_seen_ms.remove(&k);
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.samples.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.samples.is_empty()
     }
 
     pub fn expected(&self, key: &str) -> Option<Learned> {
@@ -192,12 +236,14 @@ mod tests {
         let mut s = Sizes::default();
         assert_eq!(s.expected("k"), None);
         for peak in [3, 100, 5, 7, 9] {
-            s.record("k", peak, 1000 + peak as u32);
+            s.record("k", peak, 1000 + peak as u32, 1);
         }
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("sizes.pb");
         s.save(&path).unwrap();
-        let loaded = Sizes::load(&path);
+        let Read::Loaded(loaded) = Sizes::load(&path, 1) else {
+            panic!("a saved file loads");
+        };
         assert_eq!(
             loaded.expected("k"),
             Some(Learned {
@@ -205,18 +251,61 @@ mod tests {
                 cores_milli: 1007
             })
         );
-        assert_eq!(Sizes::load(&dir.path().join("missing")).expected("k"), None);
+        assert_eq!(Sizes::load(&dir.path().join("missing"), 1), Read::Missing);
     }
 
     #[test]
     fn only_recent_samples_count() {
         let mut s = Sizes::default();
         for _ in 0..KEEP_SAMPLES {
-            s.record("k", 1, 1);
+            s.record("k", 1, 1, 1);
         }
         for _ in 0..KEEP_SAMPLES {
-            s.record("k", 50, 1);
+            s.record("k", 50, 1, 1);
         }
         assert_eq!(s.expected("k").unwrap().peak_mem_bytes, 50);
+    }
+
+    #[test]
+    fn a_command_not_run_for_weeks_is_forgotten() {
+        let mut s = Sizes::default();
+        s.record("old", 5, 5, 1_000);
+        s.record("fresh", 5, 5, KEEP_KEY_MS);
+        s.record("fresh", 6, 6, KEEP_KEY_MS + 1_000);
+        assert_eq!(s.expected("old"), None);
+        assert!(s.expected("fresh").is_some());
+        assert_eq!(s.len(), 1);
+    }
+
+    #[test]
+    fn a_damaged_sizes_file_is_set_aside_and_a_file_without_dates_gets_a_lease() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sizes.pb");
+        fs::write(&path, b"\x0a\xff\xff").unwrap();
+        assert!(matches!(
+            Sizes::load(&path, 1),
+            Read::Unusable { to: Some(_), .. }
+        ));
+        assert!(!path.exists());
+        let undated = SizesFile {
+            version: 1,
+            entries: vec![SizeEntry {
+                key: "k".into(),
+                samples: vec![SizeSample {
+                    peak_mem_bytes: 9,
+                    cores_milli: 1,
+                }],
+                last_seen_unix_ms: 0,
+            }],
+        };
+        fs::write(&path, undated.encode_to_vec()).unwrap();
+        let Read::Loaded(mut s) = Sizes::load(&path, KEEP_KEY_MS * 2) else {
+            panic!("an old-format file loads");
+        };
+        s.record("other", 1, 1, KEEP_KEY_MS * 2 + 5);
+        assert!(
+            s.expected("k").is_some(),
+            "an undated key is not expired at once"
+        );
     }
 }

@@ -5,6 +5,7 @@ use std::os::unix::net::UnixStream;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -29,6 +30,7 @@ use crate::detached::{self, Dirs};
 use crate::log::Log;
 use crate::pool::{self, PoolHold};
 use crate::sizes::{self, Sizes};
+use crate::state_file::Read;
 use crate::waits::{self, Fate, JobState};
 
 const TICK: Duration = Duration::from_secs(2);
@@ -37,6 +39,8 @@ const MIN_LEARNED_CORES_MILLI: u32 = 100;
 const FATE_HISTORY: usize = 1024;
 /// A client that lost the usher may claim its old queue time from a daemon that started this recently.
 const RESUBMIT_GRACE: Duration = Duration::from_secs(10 * 60);
+/// The longest queue time a client of a pre-record usher may claim.
+const LEGACY_CLAIM_MAX_MS: u64 = 24 * 3600 * 1000;
 /// A job started this recently may not have its scope yet, so a missing scope proves nothing.
 const SCOPE_START_GRACE_MS: u64 = 10_000;
 /// A cancelled job gets SIGTERM, then SIGKILL after this long.
@@ -47,6 +51,8 @@ pub struct Conn {
     stream: Arc<Mutex<UnixStream>>,
     /// The client process, as the kernel saw it connect.
     pid: Option<u32>,
+    /// Set by the connection's reader when the peer is gone.
+    closed: Arc<AtomicBool>,
 }
 
 impl Conn {
@@ -56,7 +62,16 @@ impl Conn {
         Ok(Self {
             stream: Arc::new(Mutex::new(stream)),
             pid,
+            closed: Arc::new(AtomicBool::new(false)),
         })
+    }
+
+    pub fn mark_closed(&self) {
+        self.closed.store(true, Ordering::Relaxed);
+    }
+
+    fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Relaxed)
     }
 
     pub fn same(&self, other: &Self) -> bool {
@@ -90,16 +105,17 @@ pub enum Msg {
     },
     Done {
         done: JobDone,
+        conn: Conn,
     },
     /// The connection that carried `job_id` closed.
     Gone {
         job_id: String,
         conn: Conn,
     },
-    /// A detached job's process ended; `code` is `None` when it could not be waited for.
+    /// A detached job's process ended.
     Exited {
         job_id: String,
-        code: Option<i32>,
+        exit: Exit,
     },
     Jobs {
         conn: Conn,
@@ -128,6 +144,25 @@ pub enum Msg {
     Stop,
 }
 
+/// How a detached job's `systemd-run` process ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Exit {
+    Code(i32),
+    Signal(i32),
+    /// It could not be waited for, or only its scope was watched.
+    Unknown,
+}
+
+impl Exit {
+    fn of(status: ExitStatus) -> Self {
+        match (status.code(), status.signal()) {
+            (Some(code), _) => Self::Code(code),
+            (None, Some(sig)) => Self::Signal(sig),
+            (None, None) => Self::Unknown,
+        }
+    }
+}
+
 /// What the idle watcher supervisor tells the actor.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WatcherEvent {
@@ -142,7 +177,18 @@ pub enum WatcherEvent {
 #[derive(Clone)]
 enum Origin {
     Attached(Conn),
+    /// An attached job whose client talked to an earlier usher; only its scope is known.
+    Adopted,
     Detached(Files),
+}
+
+impl Origin {
+    fn files(&self) -> Option<&Files> {
+        match self {
+            Self::Detached(f) => Some(f),
+            Self::Attached(_) | Self::Adopted => None,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -195,6 +241,10 @@ struct RunningJob {
     watch: Watch,
     cancel: Cancel,
     tmpdir: Option<PathBuf>,
+    /// The `crew run` process that holds an attached job: pid and start time.
+    client: Option<(u32, u64)>,
+    /// The scope has been seen to exist, so its absence now means the job is over.
+    scope_seen: bool,
 }
 
 struct PendingWait {
@@ -319,13 +369,15 @@ pub struct Daemon {
     agents: Option<AgentWatch>,
     planner: Planner,
     pool: PoolHold,
+    /// Queued `crew run` clients of an earlier usher that may come back: id to first queue time.
+    resubmits: BTreeMap<String, u64>,
+    /// The state file came from a usher that did not record queued clients, so their claimed queue time is believed.
+    legacy_claims: bool,
 }
 
-fn clean_id(id: &str) -> String {
-    id.chars()
-        .filter(char::is_ascii_alphanumeric)
-        .take(12)
-        .collect()
+/// Ids become unit names, file names and directory names, so they stay plain.
+fn id_is_valid(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 64 && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
 }
 
 fn command_of(req: &JobRequest) -> String {
@@ -342,10 +394,21 @@ fn label_of(req: &JobRequest, kind: JobKind) -> String {
     format!("{} {id} ({}: {cmd})", kind.name(), req.project)
 }
 
-fn exit_code_of(status: ExitStatus) -> i32 {
-    status
-        .code()
-        .unwrap_or_else(|| 128 + status.signal().unwrap_or(0))
+/// The scope is gone and either was seen before or had time to appear.
+fn scope_over(r: &RunningJob, now_ms: u64) -> bool {
+    !scope::alive(&r.scope_name)
+        && (r.scope_seen || now_ms.saturating_sub(r.started_ms) >= SCOPE_START_GRACE_MS)
+}
+
+/// Why a job with no exit status failed; a failed `systemd-run` and a killed wrapper look alike from outside.
+fn no_status_reason(exit: Exit) -> String {
+    match exit {
+        Exit::Code(c) => format!(
+            "the job left no exit status; systemd-run exited {c} (it could not start the scope, or the job's wrapper was killed)"
+        ),
+        Exit::Signal(sig) => format!("the job left no exit status; systemd-run was killed by signal {sig}"),
+        Exit::Unknown => "the job's scope ended without an exit status (killed outside crew, or lost with the machine)".to_string(),
+    }
 }
 
 fn unix_ms() -> u64 {
@@ -368,7 +431,19 @@ impl Daemon {
     }
 
     pub fn new(cfg: Config, paths: StatePaths, log: Arc<Log>, events: Sender<Msg>) -> Self {
-        let sizes = Sizes::load(&paths.sizes);
+        let boot_ms = unix_ms();
+        let sizes = match Sizes::load(&paths.sizes, boot_ms) {
+            Read::Loaded(s) => s,
+            Read::Missing => Sizes::default(),
+            Read::Unusable { why, to } => {
+                log.line(&format!(
+                    "ERROR {} is unusable ({why}); starting without learned sizes; kept as {}",
+                    paths.sizes.display(),
+                    to.map_or("(could not be moved)".into(), |t| t.display().to_string())
+                ));
+                Sizes::default()
+            }
+        };
         let sizes_path = paths.sizes;
         if cfg.adopt.move_ || cfg.adopt.freeze {
             log.line(
@@ -410,6 +485,8 @@ impl Daemon {
             agents,
             planner: Planner::default(),
             pool: PoolHold::default(),
+            resubmits: BTreeMap::new(),
+            legacy_claims: false,
         };
         daemon.restore();
         daemon
@@ -451,9 +528,9 @@ impl Daemon {
     fn handle(&mut self, msg: Msg) {
         match msg {
             Msg::Job { req, conn } => self.enqueue(*req, conn),
-            Msg::Done { done } => self.finish(&done),
+            Msg::Done { done, conn } => self.finish(&done, &conn),
             Msg::Gone { job_id, conn } => self.lose(&job_id, &conn),
-            Msg::Exited { job_id, code } => self.end_detached(&job_id, code),
+            Msg::Exited { job_id, exit } => self.end_detached(&job_id, exit),
             Msg::Jobs { conn } => {
                 let reply = self.jobs();
                 conn.send(envelope::Body::JobsReply(reply));
@@ -651,6 +728,12 @@ impl Daemon {
         if req.detach {
             return self.enqueue_detached(req, &conn);
         }
+        if !id_is_valid(&req.id) {
+            return Self::reject(
+                &conn,
+                "a job id is 1 to 64 letters, digits and dashes".into(),
+            );
+        }
         if self.running.iter().any(|r| r.req.id == req.id) {
             conn.send(envelope::Body::Ack(Ack {
                 ok: false,
@@ -658,19 +741,23 @@ impl Daemon {
             }));
             return;
         }
-        // The same client coming back after losing its connection keeps its place; the stale entry just gets the new connection.
+        // The same client coming back after losing its connection keeps its place; nobody else can take the entry over.
         if let Some(q) = self.queue.iter_mut().find(|q| q.req.id == req.id) {
+            let owner_left = match &q.origin {
+                Origin::Attached(old) => {
+                    old.is_closed() || (old.pid.is_some() && old.pid == conn.pid)
+                }
+                Origin::Adopted | Origin::Detached(_) => false,
+            };
+            if !owner_left {
+                return Self::reject(&conn, format!("job {} is queued by another client", req.id));
+            }
             q.origin = Origin::Attached(conn);
             q.last_notice_ms = None;
             return;
         }
         let now = self.now_ms();
-        let claimed = req.queued_at_unix_ms;
-        let at = if claimed > 0 && self.started.elapsed() < RESUBMIT_GRACE {
-            claimed.min(now)
-        } else {
-            now
-        };
+        let at = self.resubmit_time(&req, now);
         if at < now {
             self.log.line(&format!(
                 "RESUBMIT id={} queued {}s ago",
@@ -680,6 +767,24 @@ impl Daemon {
         }
         let job = self.queued_job(req, Origin::Attached(conn), at);
         self.insert_queued(job);
+        self.persist();
+    }
+
+    /// When a resubmitting client first queued: what an earlier usher recorded, never a client's own say-so.
+    fn resubmit_time(&mut self, req: &JobRequest, now: u64) -> u64 {
+        if let Some(recorded) = self.resubmits.remove(&req.id) {
+            return recorded.min(now);
+        }
+        // A usher that predates the record keeps believing its clients, within bounds, for a short while.
+        if self.legacy_claims
+            && self.started.elapsed() < RESUBMIT_GRACE
+            && req.queued_at_unix_ms > 0
+        {
+            return req
+                .queued_at_unix_ms
+                .clamp(now.saturating_sub(LEGACY_CLAIM_MAX_MS), now);
+        }
+        now
     }
 
     fn reject(conn: &Conn, message: String) {
@@ -687,12 +792,7 @@ impl Daemon {
     }
 
     fn enqueue_detached(&mut self, mut req: JobRequest, conn: &Conn) {
-        let id_ok = !req.id.is_empty()
-            && req
-                .id
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '-');
-        if !id_ok || req.argv.is_empty() {
+        if !id_is_valid(&req.id) || req.argv.is_empty() {
             return Self::reject(conn, "a detached job needs an id and a command".into());
         }
         let log = if req.log_path.is_empty() {
@@ -810,9 +910,9 @@ impl Daemon {
                                 detail,
                             })),
                         })),
-                        Origin::Detached(files) => self.conclude_unstarted(
+                        Origin::Adopted => {}
+                        Origin::Detached(_) => self.conclude_unstarted(
                             &job,
-                            files,
                             JobPhase::Failed,
                             format!("refused ({}): {detail}", reason.name()),
                         ),
@@ -903,7 +1003,7 @@ impl Daemon {
             },
             || self.cfg.depot.find_mbx(),
         );
-        let id = clean_id(&job.req.id);
+        let id = &job.req.id;
         let scope_name = format!("crew-{}-{id}", job.kind.name());
         let tmpdir = format!("{}/{id}", self.cfg.tmp_root.trim_end_matches('/'));
         let grant = Grant {
@@ -944,13 +1044,24 @@ impl Daemon {
             watch: Watch::Child,
             cancel: Cancel::No,
             tmpdir: None,
+            scope_seen: false,
+            client: match &origin {
+                Origin::Attached(c) => c.pid.and_then(|pid| {
+                    procs::read_start_ticks(Path::new("/proc"), pid).map(|t| (pid, t))
+                }),
+                Origin::Adopted | Origin::Detached(_) => None,
+            },
         });
         let at = self.running.len() - 1;
         match origin {
-            Origin::Attached(conn) => conn.send(envelope::Body::Reply(Reply {
-                decision: Decision::Granted as i32,
-                outcome: Some(reply::Outcome::Grant(grant)),
-            })),
+            Origin::Attached(conn) => {
+                self.persist();
+                conn.send(envelope::Body::Reply(Reply {
+                    decision: Decision::Granted as i32,
+                    outcome: Some(reply::Outcome::Grant(grant)),
+                }));
+            }
+            Origin::Adopted => {}
             Origin::Detached(files) => match self.launch(&self.running[at], &grant, &files) {
                 Ok(tmpdir) => {
                     self.running[at].tmpdir = tmpdir;
@@ -960,7 +1071,10 @@ impl Daemon {
                     let job = self.running.remove(at);
                     self.log
                         .line(&format!("FAIL id={} could not start: {e}", job.req.id));
-                    let rec = self.running_record(&job, &files);
+                    let rec = DetachedJob {
+                        started_at_unix_ms: 0,
+                        ..self.running_record(&job)
+                    };
                     self.conclude(rec, JobPhase::Failed, None, format!("could not start: {e}"));
                 }
             },
@@ -1006,8 +1120,8 @@ impl Daemon {
             .name("job-wait".into())
             .spawn(move || {
                 let mut child = child;
-                let code = child.wait().ok().map(exit_code_of);
-                let _ = tx.send(Msg::Exited { job_id: id, code });
+                let exit = child.wait().map_or(Exit::Unknown, Exit::of);
+                let _ = tx.send(Msg::Exited { job_id: id, exit });
             })?;
         Ok(tmpdir)
     }
@@ -1017,8 +1131,12 @@ impl Daemon {
         self.finished_cpu_usec += done.cpu_usec;
         if done.peak_mem_bytes > 0 && done.wall_ms > 0 {
             let cores_milli = u32::try_from(done.cpu_usec / done.wall_ms).unwrap_or(u32::MAX);
-            self.sizes
-                .record(&sizes::key(&job.req), done.peak_mem_bytes, cores_milli);
+            self.sizes.record(
+                &sizes::key(&job.req),
+                done.peak_mem_bytes,
+                cores_milli,
+                self.boot_unix_ms + self.started.elapsed().as_millis() as u64,
+            );
             if let Err(e) = self.sizes.save(&self.sizes_path) {
                 self.log.line(&format!("WARN could not save sizes: {e}"));
             }
@@ -1036,21 +1154,37 @@ impl Daemon {
         ));
     }
 
-    fn finish(&mut self, done: &JobDone) {
-        let Some(at) = self
-            .running
-            .iter()
-            .position(|r| r.req.id == done.job_id && matches!(r.origin, Origin::Attached(_)))
-        else {
+    /// Only the connection that was granted the job may end it.
+    fn finish(&mut self, done: &JobDone, from: &Conn) {
+        let Some(at) = self.running.iter().position(|r| {
+            r.req.id == done.job_id && matches!(&r.origin, Origin::Attached(c) if c.same(from))
+        }) else {
+            self.log.line(&format!(
+                "IGNORE JobDone for {} from {}: not the job's client",
+                done.job_id,
+                from.who()
+            ));
             return;
         };
         let job = self.running.remove(at);
         self.note_done(&job, done);
+        self.stop_leftovers(&job.scope_name);
+        self.persist();
         if let Origin::Attached(conn) = &job.origin {
             conn.send(envelope::Body::Ack(Ack {
                 ok: true,
                 message: String::new(),
             }));
+        }
+    }
+
+    /// A job's processes do not outlive the job: whatever its command left in the scope goes with it.
+    fn stop_leftovers(&self, scope_name: &str) {
+        if scope::alive(scope_name) {
+            scope::stop(scope_name);
+            self.log.line(&format!(
+                "STOP scope={scope_name} still had processes after the job ended"
+            ));
         }
     }
 
@@ -1064,6 +1198,7 @@ impl Daemon {
             self.queue.remove(at);
             self.remember(job_id, Fate::Gone);
             self.log.line(&format!("GONE id={job_id} while queued"));
+            self.persist();
         } else if let Some(at) = self
             .running
             .iter()
@@ -1073,6 +1208,7 @@ impl Daemon {
             scope::kill(&job.scope_name, KillSignal::Kill);
             self.log
                 .line(&format!("GONE id={job_id} while running; scope killed"));
+            self.persist();
         }
     }
 
@@ -1080,6 +1216,7 @@ impl Daemon {
         for r in &mut self.running {
             if let Some(s) = scope::stats(&r.scope_name) {
                 r.stats = s;
+                r.scope_seen = true;
             }
         }
         for line in self.pool.poll() {
@@ -1087,10 +1224,40 @@ impl Daemon {
         }
         self.update_load();
         self.expire_manual_away();
+        self.expire_resubmits();
+        self.reap_orphans();
         self.watch_detached();
         self.reschedule();
         self.adopt_dry_run();
         self.settle_waits();
+    }
+
+    /// An adopted `crew run` job whose client died while no usher watched has nobody to stop it: stop its scope.
+    fn reap_orphans(&mut self) {
+        for r in &self.running {
+            let (Origin::Adopted, Some((pid, ticks))) = (&r.origin, r.client) else {
+                continue;
+            };
+            if procs::read_start_ticks(Path::new("/proc"), pid) != Some(ticks) {
+                scope::kill(&r.scope_name, KillSignal::Kill);
+                self.log.line(&format!(
+                    "ORPHAN id={} its client (pid {pid}) is gone; scope killed",
+                    r.req.id
+                ));
+            }
+        }
+    }
+
+    /// Forgets queued clients of the earlier usher that never came back.
+    fn expire_resubmits(&mut self) {
+        if !self.resubmits.is_empty() && self.started.elapsed() >= RESUBMIT_GRACE {
+            self.log.line(&format!(
+                "RESUBMIT window closed; {} never came back",
+                self.resubmits.len()
+            ));
+            self.resubmits.clear();
+            self.persist();
+        }
     }
 
     fn next_wake(&self, next_tick: Instant) -> Duration {
@@ -1116,7 +1283,7 @@ impl Daemon {
     fn job_state(&self, id: &str) -> JobState {
         if let Some(q) = self.queue.iter().find(|q| q.req.id == id) {
             return match q.origin {
-                Origin::Attached(_) => JobState::Queued,
+                Origin::Attached(_) | Origin::Adopted => JobState::Queued,
                 Origin::Detached(_) => JobState::DetachedQueued,
             };
         }
@@ -1126,6 +1293,9 @@ impl Daemon {
             .any(|r| r.req.id == id && matches!(r.origin, Origin::Detached(_)))
         {
             return JobState::DetachedRunning;
+        }
+        if self.running.iter().any(|r| r.req.id == id) {
+            return JobState::Granted;
         }
         if let Some(f) = self
             .finished
@@ -1352,7 +1522,7 @@ impl Daemon {
     fn base_record(
         &self,
         req: &JobRequest,
-        files: &Files,
+        files: Option<&Files>,
         queued_at_ms: u64,
         phase: JobPhase,
     ) -> DetachedJob {
@@ -1360,21 +1530,22 @@ impl Daemon {
             request: Some(req.clone()),
             phase: phase as i32,
             queued_at_unix_ms: queued_at_ms,
-            log_path: files.log.display().to_string(),
-            status_path: files.status.display().to_string(),
+            log_path: files.map_or_else(String::new, |f| f.log.display().to_string()),
+            status_path: files.map_or_else(String::new, |f| f.status.display().to_string()),
+            attached: files.is_none(),
             ..DetachedJob::default()
         }
     }
 
-    fn queued_record(&self, q: &QueuedJob, files: &Files) -> DetachedJob {
+    fn queued_record(&self, q: &QueuedJob) -> DetachedJob {
         DetachedJob {
             expected_mem_bytes: q.expected_mem,
             expected_cores_milli: (q.expected_cores * 1000.0) as u32,
-            ..self.base_record(&q.req, files, q.queued_at_ms, JobPhase::Queued)
+            ..self.base_record(&q.req, q.origin.files(), q.queued_at_ms, JobPhase::Queued)
         }
     }
 
-    fn running_record(&self, r: &RunningJob, files: &Files) -> DetachedJob {
+    fn running_record(&self, r: &RunningJob) -> DetachedJob {
         DetachedJob {
             started_at_unix_ms: r.started_ms,
             scope_name: r.scope_name.clone(),
@@ -1386,22 +1557,29 @@ impl Daemon {
                 .as_ref()
                 .map(|d| d.display().to_string())
                 .unwrap_or_default(),
-            ..self.base_record(&r.req, files, r.queued_at_ms, JobPhase::Running)
+            client_pid: r.client.map_or(0, |c| c.0),
+            client_start_ticks: r.client.map_or(0, |c| c.1),
+            ..self.base_record(&r.req, r.origin.files(), r.queued_at_ms, JobPhase::Running)
         }
     }
 
-    /// Writes the queued and running detached jobs and the recently finished ones to the state file.
+    /// Writes what must outlive the usher: detached jobs (queued, running, recently finished), running `crew run`
+    /// jobs (their scopes keep their reservations) and queued `crew run` clients (their place in line).
     fn persist(&self) {
         let mut jobs = self.finished.clone();
-        for r in &self.running {
-            if let Origin::Detached(f) = &r.origin {
-                jobs.push(self.running_record(r, f));
-            }
-        }
-        for q in &self.queue {
-            if let Origin::Detached(f) = &q.origin {
-                jobs.push(self.queued_record(q, f));
-            }
+        jobs.extend(self.running.iter().map(|r| self.running_record(r)));
+        jobs.extend(self.queue.iter().map(|q| self.queued_record(q)));
+        for (id, queued_at) in &self.resubmits {
+            jobs.push(DetachedJob {
+                request: Some(JobRequest {
+                    id: id.clone(),
+                    ..JobRequest::default()
+                }),
+                phase: JobPhase::Queued as i32,
+                queued_at_unix_ms: *queued_at,
+                attached: true,
+                ..DetachedJob::default()
+            });
         }
         if let Err(e) = detached::save(&self.jobs_path, jobs) {
             self.log
@@ -1439,60 +1617,66 @@ impl Daemon {
     }
 
     /// A queued detached job that was removed from the queue without ever running.
-    fn conclude_unstarted(
-        &mut self,
-        job: &QueuedJob,
-        files: &Files,
-        phase: JobPhase,
-        reason: String,
-    ) {
-        let rec = self.queued_record(job, files);
+    fn conclude_unstarted(&mut self, job: &QueuedJob, phase: JobPhase, reason: String) {
+        let rec = self.queued_record(job);
         self.conclude(rec, phase, None, reason);
     }
 
-    /// Takes back the jobs an earlier usher left: queued ones keep their time, running ones are watched again.
+    /// Takes back what an earlier usher left: queued jobs keep their time, running ones are watched again,
+    /// and running `crew run` jobs keep holding their reservations until their scopes end.
     fn restore(&mut self) {
-        let records = detached::load(&self.jobs_path);
-        if records.is_empty() {
-            return;
-        }
-        let (mut queued, mut adopted, mut ended) = (0, 0, 0);
-        for rec in records {
+        let stored = match detached::load(&self.jobs_path) {
+            Read::Loaded(stored) => stored,
+            Read::Missing => return,
+            Read::Unusable { why, to } => {
+                self.log.line(&format!(
+                    "ERROR {} is unusable ({why}); starting with an empty queue; the file is kept as {}",
+                    self.jobs_path.display(),
+                    to.map_or("(it could not be moved)".into(), |t| t.display().to_string())
+                ));
+                return;
+            }
+        };
+        self.legacy_claims = stored.version < 2;
+        let (mut queued, mut adopted, mut ended, mut waiting) = (0, 0, 0, 0);
+        for rec in stored.jobs {
             let Some(req) = rec.request.clone() else {
                 continue;
             };
+            let phase = detached::phase(&rec);
+            if rec.attached {
+                match phase {
+                    JobPhase::Queued => {
+                        self.resubmits.insert(req.id.clone(), rec.queued_at_unix_ms);
+                        waiting += 1;
+                    }
+                    JobPhase::Running if self.scope_still_there(&rec, None) => {
+                        self.running
+                            .push(self.adopted_job(req, &rec, Origin::Adopted));
+                        adopted += 1;
+                    }
+                    _ => {
+                        // Its client is gone with the scope; only the job's private temp dir can be left.
+                        if !rec.tmpdir.is_empty() {
+                            let _ = fs::remove_dir_all(&rec.tmpdir);
+                        }
+                    }
+                }
+                continue;
+            }
             let files = Files {
                 log: PathBuf::from(&rec.log_path),
                 status: PathBuf::from(&rec.status_path),
             };
-            match detached::phase(&rec) {
+            match phase {
                 JobPhase::Queued => {
                     let job = self.queued_job(req, Origin::Detached(files), rec.queued_at_unix_ms);
                     self.queue.push(job);
                     queued += 1;
                 }
-                JobPhase::Running
-                    if scope::alive(&rec.scope_name)
-                        || (self.now_ms().saturating_sub(rec.started_at_unix_ms)
-                            < SCOPE_START_GRACE_MS
-                            && scope::read_status(&files.status).is_none()) =>
-                {
-                    self.running.push(RunningJob {
-                        req,
-                        kind: JobKind::try_from(rec.request.as_ref().map_or(0, |r| r.kind))
-                            .unwrap_or(JobKind::Unspecified),
-                        origin: Origin::Detached(files),
-                        scope_name: rec.scope_name.clone(),
-                        queued_at_ms: rec.queued_at_unix_ms,
-                        started_ms: rec.started_at_unix_ms,
-                        expected_mem: rec.expected_mem_bytes,
-                        expected_cores: f64::from(rec.expected_cores_milli) / 1000.0,
-                        base_limits: rec.base_limits.unwrap_or_default(),
-                        stats: scope::Stats::default(),
-                        watch: Watch::Scope,
-                        cancel: Cancel::No,
-                        tmpdir: (!rec.tmpdir.is_empty()).then(|| PathBuf::from(&rec.tmpdir)),
-                    });
+                JobPhase::Running if self.scope_still_there(&rec, Some(&files)) => {
+                    self.running
+                        .push(self.adopted_job(req, &rec, Origin::Detached(files)));
                     adopted += 1;
                 }
                 JobPhase::Running => {
@@ -1518,14 +1702,41 @@ impl Daemon {
         self.queue.sort_by_key(|q| q.queued_at_ms);
         self.finished.sort_by_key(|f| f.finished_at_unix_ms);
         self.log.line(&format!(
-            "RESTORE queued={queued} adopted={adopted} ended_while_down={ended} finished={}",
+            "RESTORE queued={queued} adopted={adopted} ended_while_down={ended} finished={} clients_expected={waiting}",
             self.finished.len()
         ));
         self.persist();
     }
 
+    /// Whether a record's job may still be running: its scope exists, or it started too recently to have one.
+    fn scope_still_there(&self, rec: &DetachedJob, files: Option<&Files>) -> bool {
+        scope::alive(&rec.scope_name)
+            || (self.now_ms().saturating_sub(rec.started_at_unix_ms) < SCOPE_START_GRACE_MS
+                && files.is_none_or(|f| scope::read_status(&f.status).is_none()))
+    }
+
+    fn adopted_job(&self, req: JobRequest, rec: &DetachedJob, origin: Origin) -> RunningJob {
+        RunningJob {
+            kind: JobKind::try_from(req.kind).unwrap_or(JobKind::Unspecified),
+            req,
+            origin,
+            scope_name: rec.scope_name.clone(),
+            queued_at_ms: rec.queued_at_unix_ms,
+            started_ms: rec.started_at_unix_ms,
+            expected_mem: rec.expected_mem_bytes,
+            expected_cores: f64::from(rec.expected_cores_milli) / 1000.0,
+            base_limits: rec.base_limits.unwrap_or_default(),
+            stats: scope::Stats::default(),
+            watch: Watch::Scope,
+            cancel: Cancel::No,
+            tmpdir: (!rec.tmpdir.is_empty()).then(|| PathBuf::from(&rec.tmpdir)),
+            client: (rec.client_pid > 0).then_some((rec.client_pid, rec.client_start_ticks)),
+            scope_seen: scope::alive(&rec.scope_name),
+        }
+    }
+
     /// A detached job's process ended: record how, free its slot, and learn its size.
-    fn end_detached(&mut self, id: &str, code: Option<i32>) {
+    fn end_detached(&mut self, id: &str, exit: Exit) {
         let Some(at) = self
             .running
             .iter()
@@ -1537,7 +1748,9 @@ impl Daemon {
         let Origin::Detached(files) = &job.origin else {
             return;
         };
-        let reported = code.or_else(|| scope::read_status(&files.status));
+        self.stop_leftovers(&job.scope_name);
+        // The wrapper's status file is the job's own word; the process exit alone cannot tell the job from a failed systemd-run.
+        let reported = scope::read_status(&files.status);
         if let Some(exit_code) = reported {
             let done = JobDone {
                 job_id: id.to_string(),
@@ -1547,20 +1760,37 @@ impl Daemon {
                 peak_mem_bytes: job.stats.mem_peak,
                 io_read_bytes: job.stats.io_read,
                 io_write_bytes: job.stats.io_write,
+                ..JobDone::default()
             };
             self.note_done(&job, &done);
         }
         let (phase, reason) = match (job.cancel, reported) {
             (Cancel::No, Some(_)) => (JobPhase::Exited, String::new()),
-            (Cancel::No, None) => (
-                JobPhase::Failed,
-                "the job's scope ended without an exit status (killed outside crew, or lost with the machine)"
-                    .to_string(),
+            (Cancel::No, None) => (JobPhase::Failed, no_status_reason(exit)),
+            (_, _) => (
+                JobPhase::Cancelled,
+                "cancelled by `crew cancel`".to_string(),
             ),
-            (_, _) => (JobPhase::Cancelled, "cancelled by `crew cancel`".to_string()),
         };
-        let rec = self.running_record(&job, files);
+        let rec = self.running_record(&job);
         self.conclude(rec, phase, reported, reason);
+    }
+
+    /// An adopted `crew run` job whose scope is gone: free its reservation.
+    fn end_adopted(&mut self, id: &str) {
+        if let Some(at) = self
+            .running
+            .iter()
+            .position(|r| r.req.id == id && matches!(r.origin, Origin::Adopted))
+        {
+            let job = self.running.remove(at);
+            if let Some(dir) = &job.tmpdir {
+                let _ = fs::remove_dir_all(dir);
+            }
+            self.log
+                .line(&format!("END id={id} adopted job's scope is gone"));
+            self.persist();
+        }
     }
 
     /// Polls adopted jobs' scopes and escalates cancellations that SIGTERM did not end.
@@ -1579,22 +1809,26 @@ impl Daemon {
                 _ => {}
             }
         }
-        let gone: Vec<String> = self
+        let gone: Vec<(String, bool)> = self
             .running
             .iter()
-            .filter(|r| {
-                let Origin::Detached(files) = &r.origin else {
-                    return false;
-                };
-                r.watch == Watch::Scope
-                    && !scope::alive(&r.scope_name)
-                    && (now.saturating_sub(r.started_ms) >= SCOPE_START_GRACE_MS
-                        || scope::read_status(&files.status).is_some())
+            .filter(|r| r.watch == Watch::Scope)
+            .filter(|r| match &r.origin {
+                // The status file is the end of the job even if a child it left behind keeps the scope alive.
+                Origin::Detached(files) => {
+                    scope::read_status(&files.status).is_some() || scope_over(r, now)
+                }
+                Origin::Adopted => scope_over(r, now),
+                Origin::Attached(_) => false,
             })
-            .map(|r| r.req.id.clone())
+            .map(|r| (r.req.id.clone(), matches!(r.origin, Origin::Adopted)))
             .collect();
-        for id in gone {
-            self.end_detached(&id, None);
+        for (id, adopted) in gone {
+            if adopted {
+                self.end_adopted(&id);
+            } else {
+                self.end_detached(&id, Exit::Unknown);
+            }
         }
     }
 
@@ -1614,9 +1848,9 @@ impl Daemon {
                         })),
                     }));
                 }
-                Origin::Detached(files) => self.conclude_unstarted(
+                Origin::Adopted => {}
+                Origin::Detached(_) => self.conclude_unstarted(
                     &job,
-                    files,
                     JobPhase::Cancelled,
                     "cancelled by `crew cancel` while queued".into(),
                 ),
@@ -1642,7 +1876,7 @@ impl Daemon {
     fn jobs(&self) -> JobsReply {
         let queued = self.queue.iter().map(|q| {
             let (detached, log_path) = match &q.origin {
-                Origin::Attached(_) => (false, String::new()),
+                Origin::Attached(_) | Origin::Adopted => (false, String::new()),
                 Origin::Detached(f) => (true, f.log.display().to_string()),
             };
             JobSummary {
@@ -1665,7 +1899,7 @@ impl Daemon {
         });
         let running = self.running.iter().map(|r| {
             let (detached, log_path) = match &r.origin {
-                Origin::Attached(_) => (false, String::new()),
+                Origin::Attached(_) | Origin::Adopted => (false, String::new()),
                 Origin::Detached(f) => (true, f.log.display().to_string()),
             };
             JobSummary {

@@ -139,6 +139,11 @@ pub fn peer_pid(stream: &std::os::unix::net::UnixStream) -> Option<u32> {
     (rc == 0 && cred.pid > 0).then_some(cred.pid.cast_unsigned())
 }
 
+/// When the process started, in clock ticks after boot; a pid whose start time differs is a different process.
+pub fn read_start_ticks(root: &Path, pid: u32) -> Option<u64> {
+    Some(parse_stat(&fs::read_to_string(proc_file(root, pid, "stat")).ok()?)?.start_ticks)
+}
+
 /// The command name of a process (`/proc/<pid>/comm`).
 pub fn read_comm(root: &Path, pid: u32) -> Option<String> {
     Some(
