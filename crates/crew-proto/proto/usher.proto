@@ -59,12 +59,35 @@ enum RefusalReason {
   REFUSAL_REASON_UNKNOWN_KIND = 4;
 }
 
+enum BuildPriority {
+  BUILD_PRIORITY_UNSPECIFIED = 0;
+  BUILD_PRIORITY_NORMAL = 1;
+  // Yields to waiting normal-priority builds (mbx `scheduler.priority = "low"`).
+  BUILD_PRIORITY_LOW = 2;
+}
+
+// What a granted build or test may spend in the compiler cache's shared pool.
+message BuildGrant {
+  BuildPriority priority = 1;
+  // Most cores this build's compilers hold together; zero means no cap.
+  uint32 compile_cpus = 2;
+}
+
+// Pool capacity a job that is no compiler holds while it runs (`mbx reserve`), so compilers make room.
+message PoolReserve {
+  string mbx_path = 1;
+  uint32 cpus = 2;
+  uint64 mem_bytes = 3;
+}
+
 message Grant {
   string job_id = 1;
   Limits limits = 2;
   string scope_name = 3;
   map<string, string> env_set = 4;
   repeated string env_unset = 5;
+  BuildGrant build = 6;
+  PoolReserve reserve = 7;
 }
 
 message Refusal {

@@ -4,6 +4,7 @@ use std::io;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
+use crew_depot_config::Depot;
 use crew_proto::JobKind;
 use serde::Deserialize;
 
@@ -139,6 +140,9 @@ pub struct Config {
     pub starve_after_secs: u64,
     pub kinds: Kinds,
     pub adopt: Adopt,
+    /// From depot.toml, not usher.toml: the main program loads it beside this file.
+    #[serde(skip)]
+    pub depot: Depot,
 }
 
 impl Default for Config {
@@ -155,6 +159,7 @@ impl Default for Config {
             starve_after_secs: 600,
             kinds: Kinds::default(),
             adopt: Adopt::default(),
+            depot: Depot::default(),
         }
     }
 }

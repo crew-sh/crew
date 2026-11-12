@@ -1,0 +1,26 @@
+syntax = "proto3";
+package crew.depot;
+
+// What the last `crew cargo` build of one project did in the compiler cache, from its build report.
+message BuildCounts {
+  uint64 hits = 1;
+  uint64 misses = 2;
+  // Compilations that made no cache lookup (no recorded input list).
+  uint64 unconsulted = 3;
+  uint64 incremental = 4;
+  uint64 bypasses = 5;
+  uint64 compiler_ns_avoided = 6;
+  uint64 wall_ns = 7;
+}
+
+// One project's record: the newest build and the sums over every build `crew cargo` has seen.
+message ProjectStats {
+  uint32 version = 1;
+  string project = 2;
+  string root = 3;
+  uint64 builds = 4;
+  BuildCounts last = 5;
+  uint64 last_at_secs = 6;
+  string last_command = 7;
+  BuildCounts total = 8;
+}

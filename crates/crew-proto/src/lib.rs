@@ -13,6 +13,10 @@ pub use gen_::*;
 pub mod ledger {
     include!(concat!(env!("OUT_DIR"), "/crew.ledger.rs"));
 }
+/// Build-cache statistics kept by `crew build`.
+pub mod depot {
+    include!(concat!(env!("OUT_DIR"), "/crew.depot.rs"));
+}
 pub use prost;
 
 pub const MAX_FRAME: usize = 1 << 20;

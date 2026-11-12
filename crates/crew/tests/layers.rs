@@ -70,6 +70,13 @@ fn layers() -> BTreeMap<&'static str, Crate> {
             },
         ),
         (
+            "crew-depot-config",
+            Crate {
+                layer: 1,
+                only: Some(&["crew-sys"]),
+            },
+        ),
+        (
             "crew-queue",
             Crate {
                 layer: 2,

@@ -41,6 +41,25 @@ pub struct RunOptions {
     pub inside_job: bool,
 }
 
+/// What a caller changes about the command once it knows whether it holds a grant.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Launch {
+    /// Runs instead of `RunOptions::argv`; the usher still sees `argv`, so it sizes the job by what the caller asked for.
+    pub argv: Option<Vec<String>>,
+    pub env_set: BTreeMap<String, String>,
+    pub env_unset: Vec<String>,
+}
+
+impl Launch {
+    fn apply(self, argv: &[String], env: &mut BTreeMap<String, String>) -> Vec<String> {
+        for k in &self.env_unset {
+            env.remove(k);
+        }
+        env.extend(self.env_set);
+        self.argv.unwrap_or_else(|| argv.to_vec())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WaitSpec {
     pub condition: WaitCondition,
@@ -165,10 +184,19 @@ impl Client {
 
     /// Runs the command under an admission grant and returns its exit code.
     pub fn run(&self, opts: &RunOptions) -> Result<i32, ClientError> {
+        self.run_with(opts, |_| Launch::default())
+    }
+
+    /// Like `run`, but `launch` sees the grant (none when the job runs unmanaged or inside a granted job) before the command starts.
+    pub fn run_with(
+        &self,
+        opts: &RunOptions,
+        launch: impl FnOnce(Option<&Grant>) -> Launch,
+    ) -> Result<i32, ClientError> {
         if opts.argv.is_empty() {
             return Err(ClientError::EmptyCommand);
         }
-        let env: BTreeMap<String, String> = std::env::vars().collect();
+        let mut env: BTreeMap<String, String> = std::env::vars().collect();
         let cwd = std::env::current_dir()?;
         let kind = match opts.kind {
             Some(k) => k,
@@ -192,7 +220,8 @@ impl Client {
                     reason: UnmanagedReason::InsideGrantedJob,
                 },
             );
-            return run_nested(&opts.argv, &cwd, env);
+            let argv = launch(None).apply(&opts.argv, &mut env);
+            return run_nested(&argv, &cwd, env);
         }
         let mut stream = match self.connect() {
             Ok(s) => s,
@@ -208,7 +237,8 @@ impl Client {
                 } else {
                     eprintln!("crew: {e}; running unmanaged");
                 }
-                return run_unmanaged(&opts.argv, &cwd, env);
+                let argv = launch(None).apply(&opts.argv, &mut env);
+                return run_unmanaged(&argv, &cwd, env);
             }
         };
         let job_id = req.id.clone();
@@ -258,7 +288,8 @@ impl Client {
             },
         );
         signals::install_termination_handler();
-        let outcome = run_granted(&opts.argv, &cwd, env, &grant);
+        let argv = launch(Some(&grant)).apply(&opts.argv, &mut env);
+        let outcome = run_granted(&argv, &cwd, env, &grant);
         let (code, done) = match outcome {
             Ok(v) => v,
             Err(e) => {
@@ -342,6 +373,7 @@ fn run_granted(
     for key in &grant.env_unset {
         env.remove(key);
     }
+    let argv = &with_reserve(argv, grant);
     let tmpdir = grant.env_set.get("TMPDIR").map(PathBuf::from);
     let mut env_set = grant.env_set.clone();
     if tmpdir
@@ -376,6 +408,28 @@ fn run_granted(
         io_write_bytes: stats.io_write,
     };
     Ok((code, done))
+}
+
+/// Wraps the command in `mbx reserve` when the usher asks for pool capacity and mbx is where it said.
+pub fn with_reserve(argv: &[String], grant: &Grant) -> Vec<String> {
+    let Some(r) = grant
+        .reserve
+        .as_ref()
+        .filter(|r| Path::new(&r.mbx_path).is_file())
+    else {
+        return argv.to_vec();
+    };
+    let mut out = vec![
+        r.mbx_path.clone(),
+        "reserve".into(),
+        "--cpus".into(),
+        r.cpus.max(1).to_string(),
+        "--memory".into(),
+        format!("{}MiB", r.mem_bytes.div_ceil(1 << 20).max(1)),
+        "--".into(),
+    ];
+    out.extend_from_slice(argv);
+    out
 }
 
 /// Waits for the command, keeps the scope's last readable stats, and turns SIGINT/SIGTERM into scope kills.
@@ -420,5 +474,73 @@ fn supervise(mut child: Child, scope_name: &str) -> (std::io::Result<ExitStatus>
                 };
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crew_proto::PoolReserve;
+
+    use super::*;
+
+    fn words(cmd: &str) -> Vec<String> {
+        cmd.split_whitespace().map(str::to_string).collect()
+    }
+
+    fn grant_with(r: Option<PoolReserve>) -> Grant {
+        Grant {
+            reserve: r,
+            ..Grant::default()
+        }
+    }
+
+    #[test]
+    fn a_reserve_wraps_the_command_in_mbx_reserve() {
+        let dir = tempfile::tempdir().unwrap();
+        let mbx = dir.path().join("mbx");
+        std::fs::write(&mbx, "").unwrap();
+        let g = grant_with(Some(PoolReserve {
+            mbx_path: mbx.display().to_string(),
+            cpus: 2,
+            mem_bytes: (6 << 30) + 1,
+        }));
+        let got = with_reserve(&words("./game --world W"), &g);
+        assert_eq!(
+            got[1..],
+            words("reserve --cpus 2 --memory 6145MiB -- ./game --world W")
+        );
+        assert_eq!(got[0], mbx.display().to_string());
+    }
+
+    #[test]
+    fn no_reserve_or_no_mbx_leaves_the_command_alone() {
+        let argv = words("./game");
+        assert_eq!(with_reserve(&argv, &grant_with(None)), argv);
+        let gone = grant_with(Some(PoolReserve {
+            mbx_path: "/nonexistent/mbx".into(),
+            cpus: 1,
+            mem_bytes: 1 << 30,
+        }));
+        assert_eq!(with_reserve(&argv, &gone), argv);
+    }
+
+    #[test]
+    fn a_launch_changes_the_command_and_environment_only_as_asked() {
+        let mut env: BTreeMap<String, String> = [("A", "1"), ("B", "2")]
+            .map(|(k, v)| (k.into(), v.into()))
+            .into();
+        let same = Launch::default().apply(&words("cargo build"), &mut env);
+        assert_eq!((same, env.len()), (words("cargo build"), 2));
+        let l = Launch {
+            argv: Some(words("mbx build")),
+            env_set: [("C".to_string(), "3".to_string())].into(),
+            env_unset: vec!["A".into()],
+        };
+        let argv = l.apply(&words("cargo build"), &mut env);
+        assert_eq!(argv, words("mbx build"));
+        assert_eq!(
+            env.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["B", "C"]
+        );
     }
 }

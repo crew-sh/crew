@@ -58,6 +58,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "crew-depot-config"
+version = "0.1.0"
+dependencies = [
+ "crew-sys",
+ "serde",
+ "tempfile",
+ "thiserror",
+ "toml",
+]
+
+[[package]]
 name = "crew-git"
 version = "0.1.0"
 dependencies = [
@@ -119,6 +130,7 @@ name = "crew-usher"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "crew-depot-config",
  "crew-proto",
  "crew-sys",
  "crew-usher-client",

@@ -35,6 +35,15 @@ pub fn config_dir() -> PathBuf {
     xdg("XDG_CONFIG_HOME", || home().join(".config")).join("crew")
 }
 
+pub fn cache_dir() -> PathBuf {
+    xdg("XDG_CACHE_HOME", || home().join(".cache")).join("crew")
+}
+
+/// Where `cargo install` puts programs: `$CARGO_HOME/bin`, else `~/.cargo/bin`.
+pub fn cargo_bin_dir() -> PathBuf {
+    xdg("CARGO_HOME", || home().join(".cargo")).join("bin")
+}
+
 /// The nearest enclosing directory holding `.git` (a checkout or a worktree).
 fn checkout_dir(cwd: &Path) -> Option<PathBuf> {
     cwd.ancestors()

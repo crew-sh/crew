@@ -21,6 +21,7 @@ use crate::admission::{self, Facts, Running, Verdict, Waiting};
 use crate::agents::{self, Agent, Collector, Planner};
 use crate::config::Config;
 use crate::log::Log;
+use crate::pool::{self, PoolHold};
 use crate::sizes::{self, Sizes};
 use crate::waits::{self, Fate, JobState};
 
@@ -175,6 +176,7 @@ pub struct Daemon {
     fates: VecDeque<(String, Fate)>,
     agents: Option<AgentWatch>,
     planner: Planner,
+    pool: PoolHold,
 }
 
 fn clean_id(id: &str) -> String {
@@ -222,6 +224,14 @@ impl Daemon {
             fates: VecDeque::new(),
             agents,
             planner: Planner::default(),
+            pool: PoolHold::default(),
+        }
+    }
+
+    fn sync_pool(&mut self) {
+        let mbx = self.cfg.depot.find_mbx();
+        for line in self.pool.sync(&self.cfg.depot, self.owner.present(), mbx) {
+            self.log.line(&line);
         }
     }
 
@@ -230,6 +240,7 @@ impl Daemon {
     }
 
     pub fn run(mut self, rx: &Receiver<Msg>) {
+        self.sync_pool();
         loop {
             match rx.recv_timeout(self.next_wake()) {
                 Ok(Msg::Stop) | Err(RecvTimeoutError::Disconnected) => return,
@@ -288,6 +299,7 @@ impl Daemon {
         ));
         if before != now {
             self.apply_weights(now);
+            self.sync_pool();
         }
     }
 
@@ -484,6 +496,16 @@ impl Daemon {
         let mut display_env: BTreeMap<String, String> =
             job.req.display_env.clone().into_iter().collect();
         let env_unset = display::sanitize(&mut display_env, desktop);
+        let (build, reserve) = pool::terms(
+            &self.cfg,
+            &pool::Job {
+                kind: job.kind,
+                expected_cores: job.expected_cores,
+                expected_mem: job.expected_mem,
+                owner_present,
+            },
+            || self.cfg.depot.find_mbx(),
+        );
         let id = clean_id(&job.req.id);
         let scope_name = format!("crew-{}-{id}", job.kind.name());
         let tmpdir = format!("{}/{id}", self.cfg.tmp_root.trim_end_matches('/'));
@@ -497,6 +519,8 @@ impl Daemon {
             ]
             .into(),
             env_unset,
+            build,
+            reserve,
         };
         self.log.line(&format!(
             "GRANT id={} kind={} project={} agent={} scope={scope_name} mem={}MiB cores={:.1} owner_present={owner_present} cmd={:?}",
@@ -574,6 +598,9 @@ impl Daemon {
             if let Some(s) = scope::stats(&r.scope_name) {
                 r.stats = s;
             }
+        }
+        for line in self.pool.poll() {
+            self.log.line(&line);
         }
         self.update_load();
         self.reschedule();

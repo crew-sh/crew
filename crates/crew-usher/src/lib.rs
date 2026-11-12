@@ -3,6 +3,7 @@ pub mod agents;
 pub mod config;
 pub mod daemon;
 pub mod log;
+pub mod pool;
 pub mod server;
 pub mod sizes;
 pub mod waits;
