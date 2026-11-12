@@ -8,8 +8,10 @@ publish.workspace = true
 [dependencies]
 crew-proto.workspace = true
 crew-sys.workspace = true
-libc.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true

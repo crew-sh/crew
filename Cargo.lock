@@ -99,6 +99,7 @@ dependencies = [
  "crew-proto",
  "crew-sys",
  "libc",
+ "tempfile",
  "thiserror",
 ]
 
