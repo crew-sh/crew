@@ -7,8 +7,7 @@ use crate::Error;
 
 pub const RESERVED_SCOPE_ID: &str = "scope";
 
-/// Step ids become branch names, directory names and git arguments: letters, digits, `.`, `_` and `-`,
-/// not starting with `.` or `-`.
+/// Step ids become branch names and git arguments: letters, digits, `.`, `_`, `-`, not starting with `.` or `-`.
 pub fn valid_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 64

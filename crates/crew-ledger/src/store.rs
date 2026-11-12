@@ -56,9 +56,7 @@ fn is_record_chain(mut bytes: &[u8]) -> bool {
     records > 0
 }
 
-/// A cut-off last record is dropped (reported in `truncated_tail`). A length that cannot be a record, or one that
-/// hides whole records behind it, is damage in the middle of the file: an error, so nothing after it is lost.
-
+/// A cut-off last record is dropped; a length that cannot be a record, or hides whole ones, is `Corrupt`.
 pub fn parse(path: &Path, bytes: &[u8]) -> Result<Parsed, Error> {
     let mut events = Vec::new();
     let mut pos = 0;

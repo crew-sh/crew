@@ -323,8 +323,7 @@ message Envelope {
   }
 }
 
-// Asks whether the calling process runs inside the named running job's scope; the usher answers with an Ack
-// from the caller's pid as the kernel reports it, never from what the caller says about itself.
+// Asks whether the caller runs inside the named running job; the answer comes from the pid the kernel reports.
 message InsideJobRequest {
   string job_id = 1;
 }

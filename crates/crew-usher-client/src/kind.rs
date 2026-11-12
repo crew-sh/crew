@@ -214,8 +214,7 @@ impl ProjectRules {
         })
     }
 
-    /// Rules of the nearest crew.toml at or above `dir`; none when there is no such file. Inside a linked git
-    /// worktree the main checkout's file is read instead, so a branch cannot reclassify its own jobs.
+    /// Rules of the nearest crew.toml above `dir`; in a linked git worktree, the main checkout's file instead.
     pub fn discover(dir: &Path) -> Result<Self, ProjectRulesError> {
         let Some(found) = dir.ancestors().find(|d| d.join("crew.toml").is_file()) else {
             return Ok(Self::default());
@@ -415,8 +414,7 @@ fn infer_depth(argv: &[String], project: &ProjectRules, depth: u8) -> JobKind {
         .map_or(JobKind::Other, |r| r.kind)
 }
 
-/// The repo's rules first, then the built-in table (looking through `env`, `timeout`, `nice`, `mbx` and `sh -c`);
-/// anything unmatched is `Other`.
+/// The repo's rules first, then the built-in table, looking through `env`, `timeout`, `nice`, `mbx` and `sh -c`.
 pub fn infer_with(argv: &[String], project: &ProjectRules) -> JobKind {
     infer_depth(argv, project, 0)
 }

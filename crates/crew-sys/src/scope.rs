@@ -16,8 +16,7 @@ pub struct ScopeLimits {
 pub struct Stats {
     pub mem_peak: u64,
     pub mem_current: u64,
-    /// Anonymous, shared and kernel memory: what the job holds, without the page cache it only read or wrote.
-    /// One sample from `stats`; `observe` keeps the highest.
+    /// One sample of anonymous, shared and kernel memory (no page cache); `observe` keeps the highest.
     pub mem_work: u64,
     pub cpu_usec: u64,
     pub io_read: u64,

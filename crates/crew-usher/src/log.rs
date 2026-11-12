@@ -1,5 +1,6 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -15,7 +16,13 @@ impl Log {
         if let Some(dir) = path.parent() {
             let _ = fs::create_dir_all(dir);
         }
-        let file = OpenOptions::new().create(true).append(true).open(path).ok();
+        // Command lines are logged in full, so only the owner reads the file.
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(path)
+            .ok();
         Self {
             file: Mutex::new(file),
             echo,

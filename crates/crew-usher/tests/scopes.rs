@@ -1002,6 +1002,7 @@ fn a_failed_systemd_run_is_not_recorded_as_the_commands_exit_code() {
     let _ = crew_proto::read_frame(&mut s);
     let w = wait_for(&f.client, id, WaitCondition::JobExit);
     let _ = squatter.kill();
+    let _ = squatter.wait();
     assert_ne!(
         w.exit_code,
         Some(1),

@@ -382,6 +382,11 @@ pub struct Daemon {
     legacy_claims: bool,
 }
 
+/// A queued job's entry goes to a new connection only when its client is gone, or the new connection is the same process.
+fn may_reattach(old_closed: bool, old_pid: Option<u32>, new_pid: Option<u32>) -> bool {
+    old_closed || (old_pid.is_some() && old_pid == new_pid)
+}
+
 /// The shape `crew` gives its ids (a v4 UUID); the temp sweep touches nothing else under a shared `tmp_root`.
 fn looks_like_job_id(name: &str) -> bool {
     name.len() == 36
@@ -793,9 +798,7 @@ impl Daemon {
         // The same client coming back after losing its connection keeps its place; nobody else can take the entry over.
         if let Some(q) = self.queue.iter_mut().find(|q| q.req.id == req.id) {
             let owner_left = match &q.origin {
-                Origin::Attached(old) => {
-                    old.is_closed() || (old.pid.is_some() && old.pid == conn.pid)
-                }
+                Origin::Attached(old) => may_reattach(old.is_closed(), old.pid, conn.pid),
                 Origin::Adopted | Origin::Detached(_) => false,
             };
             if !owner_left {
@@ -1659,8 +1662,7 @@ impl Daemon {
         }
     }
 
-    /// Writes what must outlive the usher: detached jobs (queued, running, recently finished), running `crew run`
-    /// jobs (their scopes keep their reservations) and queued `crew run` clients (their place in line).
+    /// Writes what must outlive the usher: detached jobs, running and queued `crew run` jobs.
     fn persist(&self) {
         let mut jobs = self.finished.clone();
         jobs.extend(self.running.iter().map(|r| self.running_record(r)));
@@ -1718,8 +1720,7 @@ impl Daemon {
         self.conclude(rec, phase, None, reason);
     }
 
-    /// Takes back what an earlier usher left: queued jobs keep their time, running ones are watched again,
-    /// and running `crew run` jobs keep holding their reservations until their scopes end.
+    /// Takes back what an earlier usher left; running jobs keep their reservations until their scopes end.
     fn restore(&mut self) {
         let stored = match detached::load(&self.jobs_path) {
             Read::Loaded(stored) => stored,
@@ -1857,7 +1858,6 @@ impl Daemon {
                 working_set: true,
                 io_read_bytes: job.stats.io_read,
                 io_write_bytes: job.stats.io_write,
-                ..JobDone::default()
             };
             self.note_done(&job, &done);
         }
@@ -2059,6 +2059,23 @@ mod tests {
     use super::*;
 
     const GIB: u64 = 1 << 30;
+
+    #[test]
+    fn only_the_owning_process_or_a_gone_one_may_be_replaced() {
+        assert!(
+            may_reattach(true, Some(10), Some(20)),
+            "the old client is gone"
+        );
+        assert!(
+            may_reattach(false, Some(10), Some(10)),
+            "the same process came back"
+        );
+        assert!(
+            !may_reattach(false, Some(10), Some(20)),
+            "another live process"
+        );
+        assert!(!may_reattach(false, None, None), "nobody can be identified");
+    }
 
     #[test]
     fn only_uuid_shaped_names_are_job_dirs() {

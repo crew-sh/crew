@@ -27,8 +27,7 @@ impl Backoff {
     }
 }
 
-/// Runs `start` until the actor goes away. `start` subscribes and feeds the given sender; when its watcher ends
-/// it must send `IdleEvent::Lost` there, which is what sends this loop round again.
+/// Runs `start` until the actor goes away; a watcher that ends sends `IdleEvent::Lost` as its last message.
 pub fn supervise(
     mut start: impl FnMut(Sender<IdleEvent>) -> Result<(), IdleError> + Send + 'static,
     actor: Sender<Msg>,

@@ -84,6 +84,10 @@ systemctl --user restart crew-usher
 
 Without it the usher still works. It assumes you are present until you say otherwise with `crew owner here|away`.
 
+The usher never trusts a silent watcher. If the compositor connection ends, or never worked, the owner counts as present until an idle event arrives again, and the usher resubscribes with a growing delay (1 s up to 60 s). `crew top` shows `idle watcher lost, retrying` or `idle watcher unavailable, retrying` next to the owner line. A manual `crew owner away` ends after `manual_away_max_secs` (8 hours), or at the first input after an idle spell, so a forgotten one cannot admit benches forever. The usher logs which process set it.
+
+One state directory has one usher: the usher takes an exclusive lock on `usher.lock` there and a second one refuses to start.
+
 For a quick try, run `crew usher` in a terminal instead. It stays in the foreground.
 
 ### 2. Run a heavy command through it
@@ -101,6 +105,8 @@ crew run --kind bench --mem 8G -- ./run-benchmarks.sh
 ```
 
 If the usher is not running when `crew run` starts, it prints a note and runs the command unmanaged. Set `CREW_STRICT=1` to make that an error.
+
+A job whose memory can never fit is refused at once (exit 75) with the numbers: its expected size plus `min_free_mem_gib` must not exceed the machine's total memory. Lower `--mem` or `min_free_mem_gib`.
 
 A job that is already queued never does that. If the usher restarts while `crew run` waits in its queue, `crew run` keeps the job id and its original queue time, retries the connection with a growing delay for up to five minutes, and queues the job again. It never runs the command on its own, so a bench that waits for you to be away still waits. Only when the usher stays gone for the whole five minutes does it fail (exit 125).
 
@@ -126,11 +132,15 @@ crew cancel <id>           # remove a queued job, or SIGTERM a running one (SIGK
 
 `crew jobs` shows detached jobs and the jobs that `crew run` clients hold; it keeps the last 100 detached jobs that finished in the past 7 days. Their records, and the default logs the usher made for them, go after that. A log you chose with `--log` is never removed.
 
-The usher writes its queued and running detached jobs, and the finished ones it keeps, to `$XDG_STATE_HOME/crew/usher-jobs.pb`, replacing the file in one step. A restarted usher reads it back:
+The usher writes its queued and running jobs, and the finished detached ones it keeps, to `$XDG_STATE_HOME/crew/usher-jobs.pb`, replacing the file in one step (synced to disk). A file that is cut off, damaged or from a newer usher is never read as an empty queue: it is moved to `usher-jobs.pb.corrupt-<time>` and the log says so. The same holds for `usher-sizes.pb`. A restarted usher reads the state back:
+
+- A `crew run` job that was running keeps its place: its live scope is counted as a running job (reservations, bench exclusivity) until the scope ends, and the usher stops that scope if its `crew run` process has died meanwhile. A `crew run` client that was queued keeps its queue time when it comes back; a client's own claim of a queue time is not believed.
 
 - Queued jobs return with their original queue time, so the order, and the 10-minute starvation rule, carry on as if nothing happened.
 - A running job whose scope is still alive is watched again, and its exit status comes from a file the job's wrapper writes (`<state dir>/jobs/<id>.status`).
 - A running job whose scope is gone is marked finished if the status file is there, and failed otherwise. `crew jobs` shows the reason.
+
+A job ends when its command ends. Anything the command left running in the job's scope (a server, a daemonised helper) is stopped with it, so nothing outlives a job unaccounted. If `systemd-run` itself fails (the unit name is taken, the user manager is down), the job is recorded as failed and never run, with the reason; it is not recorded as the command's exit 1.
 
 The job's environment is the client's, minus `CREW_JOB`, and the usher applies the same rules as for any granted job: it removes your display variables, sets `TMPDIR` to a private directory and sets `CREW_JOB`. The usher keeps the environment in `usher-jobs.pb` (mode 0600, since environments hold secrets) until the job finishes, and drops it then.
 
@@ -174,6 +184,8 @@ crew wait job <id>
 
 Set the owner by hand with `crew owner here`, `crew owner away` or `crew owner auto`.
 
+`crew run` guesses the kind of a command through `env`, `timeout`, `nice`, `time`, `mbx` and `sh -c "..."`, and past options before a cargo subcommand: `cargo --locked build`, `timeout 600 cargo test` and `env X=1 cargo bench` are what they say. `cargo bench` and `make bench` are benches. In a linked git worktree the `[usher]` rules come from the main checkout's `crew.toml`, so a branch cannot reclassify its own jobs.
+
 ### 5. Plan work and merge it
 
 `crew plan` and `crew queue` read `crew.toml` at the root of your repo (they search upward from the current directory). Here is a minimal one:
@@ -214,7 +226,7 @@ Add `.crew/` to your `.gitignore`. The ledger and queue state live there.
 crew plan check                       # rules; exit 1 on a violation
 crew plan show                        # counts per kind, then the steps
 crew plan next                        # steps that are ready, in plan order
-crew plan approve docs                # `extra` steps cannot start without this
+crew plan approve docs                # owner only; `extra` steps cannot start without this
 crew plan status flag running
 
 crew queue worktree new flag          # a worktree and branch crew/flag; prints its path
@@ -226,7 +238,13 @@ crew queue status
 
 The queue lands branches in batches onto `integration_branch`. It runs your `check` commands once per batch, through `crew run` when a `crew` binary is found. When a batch is red, it bisects to the bad branch and lands the rest. A branch that touches a file another branch in the batch already changed waits for the next batch. A step lands only after its `deps` landed.
 
-`crew queue gc` saves the work of a worktree whose owner process died and removes it. `crew queue final` runs the `final` commands on the integration tip.
+`crew queue gc` saves the work of a worktree whose owner process died and removes it, unless a process still works in it or the step was taken over meanwhile; files `.gitignore` hides are not saved, and a failed save keeps the worktree. The owner of a new worktree is the agent session (`claude`, `codex`) above the caller, else the session leader; pass `--owner-pid` to say otherwise. A branch with no commits beyond `base` fails its step instead of landing. A check that is killed by a signal, or that `crew run` refuses or fails, is run once more and then stops the queue without blaming a step. `crew queue final` runs the `final` commands on the integration tip.
+
+Approvals come from the owner, not from an agent. `crew plan approve` shows the step (or the steps `scope` covers) and asks you to type its id back; it works only from a terminal, and exits 1 with `approvals come from the owner` when `CREW_AGENT` is set, when it runs inside a crew job, or when stdin or stdout is not a terminal. An approval records who gave it and a hash of the step, so a step that is edited afterwards (a bigger budget, another kind of review) needs a new approval, and `crew plan check` reports a step that runs without one. Approvals recorded by an earlier version keep counting.
+
+A script that approves for you uses `--owner-confirmed` together with the environment variable `CREW_OWNER_TOKEN`, which must equal the token in `~/.config/crew/owner-token` (mode 0600; `crew plan owner-token` writes it, from a terminal only). Put the token in your own shell, never in an agent's environment, and tell agents not to read the file. This guards against mistakes; it is not a security boundary, because agents run as the same user and could read the file.
+
+Statuses follow rules: a step becomes `landed` only through a landing record with the merge sha (the queue writes it, or `crew plan landed <id> <sha>`), only from approved, running or built, and only after its `deps` landed; a landed step stays landed; a dropped step can only go back to `planned`. Step ids use letters, digits, `.`, `_` and `-`, not starting with `.` or `-`. A ledger record whose length is damaged in the middle of the file is an error (nothing after it is dropped); a cut-off last record is ignored, and a copy of the file is kept before the next write cuts it off.
 
 ### 6. Build through the cache
 
@@ -256,6 +274,7 @@ Other agents run on this machine. Use crew so we do not starve each other.
 - Run heavy commands as `crew run -- <command>`: builds, test suites, benchmarks, anything that uses many cores or much memory. Build Rust with `crew cargo <args>`; it goes through the same admission.
 - A job that will wait for hours, or that must keep waiting after you are gone, goes in as `crew run --detach -- <command>`. The usher keeps it, even across its own restarts. Follow it with `crew wait job <id>`, look at `crew jobs`, read the log it names.
 - Run `crew top` to see what is running and what you are waiting on. Do not start a second copy of a job that is already queued.
+- Never run `crew plan approve`, and never read `~/.config/crew/owner-token`. Approvals come from the owner. If a step is gated, report it and wait.
 - `crew run` exits 75 when it refuses a job (low disk, no display while the owner is here). Do not retry in a loop. Report it.
 - Do not open windows. crew removes DISPLAY and WAYLAND_DISPLAY from your jobs on purpose.
 - Set `CREW_AGENT=<your name>` so crew can tell sessions apart.
@@ -298,11 +317,14 @@ freeze_psi_cpu = 40.0
 | `max_games` | How many `game` jobs may run at once. `0` refuses them. |
 | `cpu_oversub` | Granted cores may add up to `cpu count × this`, minus cores used by processes outside crew. |
 | `watched_paths` | Paths whose free disk space the usher measures and `crew top` shows. Default: `/`, plus `$HOME` when it is on another filesystem. |
-| `min_free_disk_gib` | Path to GiB. Build, test and harness jobs are refused while a path has less free space than listed. The path must also be in `watched_paths`. Default: `/` at 20. |
-| `tmp_root` | Each job gets `TMPDIR=<tmp_root>/<job id>`. Default: `$XDG_RUNTIME_DIR/crew/tmp`, else `<system temp dir>/crew`. |
+| `min_free_disk_gib` | Path to GiB. Build, test and harness jobs are refused while a path has less free space than listed, or cannot be measured. The path must also be in `watched_paths`; a written threshold for another path is an error. Default: `/` at 20. |
+| `tmp_root` | Each job gets `TMPDIR=<tmp_root>/<job id>`, a directory only you can enter. Default: `$XDG_RUNTIME_DIR/crew/tmp`, else `<system temp dir>/crew`. A root owned by another user is refused (the job runs without a private `TMPDIR`). At start the usher removes job directories (UUID-named, older than 5 minutes) that no scope or known job holds. |
 | `owner_present_weights` | While you are present, running jobs get at most this cgroup `cpu.weight` and `io.weight` (the normal weight is 100). |
 | `idle_timeout_secs` | Seconds without input before the compositor calls you idle. |
-| `starve_after_secs` | A job that waited this long stops later jobs from jumping ahead of it. |
+| `starve_after_secs` | A job that waited this long stops later jobs from jumping ahead of it. A starved job that waits for the game cap holds back other games only. |
+| `manual_away_max_secs` | A manual `crew owner away` ends after this long. Default 8 hours. |
+| `learn_min_wall_secs` | Runs shorter than this, and runs that failed, teach the usher nothing about a command's size. Default 5. |
+| `max_connections` | Open client connections beyond this are turned away. Every queued `crew run` and every waiter holds one. Default 512. |
 | `adopt.*` | Agent sessions. See [Safety](#safety). |
 
 `$XDG_RUNTIME_DIR` is usually a small RAM-backed filesystem. If your builds write large temporary files, point `tmp_root` at a big disk, and list that disk in `watched_paths` and `min_free_disk_gib`.
@@ -333,11 +355,11 @@ mem_cap_gib = 8
 
 Built-in values: every kind expects 2 GiB, 1 core and weight 100. Exceptions: `build` expects 4 cores. `game` is capped at 6 GiB and expects 6. `bench` is exclusive. `lsp` has `cpu_weight` 20.
 
-Once the usher has seen a command run, it reserves the median of its last 20 runs instead of these numbers. It keeps them in `$XDG_STATE_HOME/crew/usher-sizes.pb`. The log is `usher.log` in the same directory. Detached jobs keep `usher-jobs.pb` and a `jobs/` folder there too.
+Once the usher has seen a command run, it reserves the median of its last 20 successful runs instead of these numbers, held between half and eight times the kind's expectation. A size you give with `--mem` always wins. The figure is the job's working set (anonymous, shared and kernel memory), sampled while it runs: page cache a build writes is not counted. Commands unseen for 28 days are forgotten. It keeps them in `$XDG_STATE_HOME/crew/usher-sizes.pb`. The log is `usher.log` in the same directory. Detached jobs keep `usher-jobs.pb` and a `jobs/` folder there too.
 
 ### `depot.toml` and `[depot]`
 
-Path: `$XDG_CONFIG_HOME/crew/depot.toml`, normally `~/.config/crew/depot.toml`. It holds one `[depot]` table. The same table in a project's `crew.toml` overrides it key by key, and profiles merge field by field. Every key is optional. Unknown keys inside `[depot]` are an error. `crew cargo` reads both files on each run. The usher reads only `depot.toml`, at start.
+Path: `$XDG_CONFIG_HOME/crew/depot.toml`, normally `~/.config/crew/depot.toml`. It holds one `[depot]` table. The same table in a project's `crew.toml` overrides it key by key, and profiles merge field by field. Every key is optional. Unknown keys inside `[depot]` are an error. `crew cargo` reads both files on each run. The usher reads only `depot.toml`, at start, so the pool keys (`mbx`, `mbx_path`, `mbx_reserve`, `reserve_cpus`, `reserve_memory_gib`) are user-level for it: when a project's `crew.toml` changes one, `crew cargo` obeys it and says that the usher does not. `crew cargo` also says when an inherited `RUSTUP_TOOLCHAIN` or `CARGO_BUILD_JOBS` overrides a setting or the grant, and when `RUSTFLAGS` or `RUSTC_BOOTSTRAP` is set while mbx is used (they change the cache keys).
 
 <!-- test:depot-example -->
 ```toml
@@ -399,7 +421,7 @@ One file at the repo root. Each tool reads its own table and ignores the others.
 | `review` | `owner-before`, `owner-after` or `none`. Default: `owner-before` for `core-design`, else `none`. |
 | `issue` | An issue number. |
 
-`extra` and `owner-before` steps cannot start until `crew plan approve <id>`. `crew plan approve scope` approves all `extra` steps that need no review before. Budgets are advisory: `crew plan may-run` and `crew plan check` report an overspend, and nothing stops a process.
+`extra` and `owner-before` steps cannot start until `crew plan approve <id>`. `crew plan approve scope` approves the `extra` steps that need no review before, as listed when you approve; an extra added later needs its own approval. Budgets are advisory: `crew plan may-run` and `crew plan check` report an overspend, and nothing stops a process.
 
 `[queue]`
 
@@ -437,7 +459,8 @@ A broken `[usher]` table, a `crew.toml` that is not valid TOML, or an unreadable
 | `CREW_AGENT` | all | Your agent name. `crew plan` falls back to `$USER`. |
 | `CREW_SOCKET` | `crew`, `crew-usher` | The usher socket. Default `$XDG_RUNTIME_DIR/crew/usher.sock`. |
 | `CREW_STRICT` | `crew run`, `crew cargo` | `1`: fail when the usher is down instead of running unmanaged. (A job already queued never runs unmanaged, with or without it.) |
-| `CREW_JOB` | set by `crew run` | Set inside a granted job. A nested `crew run` runs in that job instead of queueing behind it. |
+| `CREW_JOB` | set by `crew run` | Set inside a granted job. A nested `crew run` runs in that job instead of queueing behind it, but only when the usher confirms that the caller's own process is inside that running job's scope. A leaked or exported value is ignored and the job is admitted as usual. |
+| `CREW_OWNER_TOKEN` | `crew plan approve --owner-confirmed` | The owner's token, for scripts. Keep it out of agents' environments. |
 | `CREW_DESKTOP` | `crew run` | `1`: keep the owner's display variables in the job (never for `bench`). |
 | `CREW_ROOT` | `crew plan` | The project root, instead of searching upward. |
 | `CREW_BIN` | `crew queue` | The `crew` binary that runs check commands. |
@@ -472,6 +495,7 @@ Why separate programs:
 - Agent sessions (processes named `claude` or `codex`) are observed, not managed. `[adopt]` can move a session into a crew cgroup and freeze the busiest one under CPU pressure. Neither is implemented yet. `move` and `freeze` default to `false`, and when set they only write "would do" lines to the log. Sessions with a terminal, without `CREW_AGENT`, or listed in `protect` are never candidates.
 - The usher runs as you and listens on a socket in a `0700` directory. There is no authentication beyond that.
 - `crew queue` runs your `check` commands with your permissions, in worktrees under `.crew/`.
+- The usher answers anyone who can open its socket. `JobDone` is accepted only from the connection the job was granted to, a queued job is not taken over by another process, and ids are plain (1 to 64 letters, digits, dashes). The state directory lock, the connection cap and the owner rules above keep a mistake from doing damage; none of this stops a hostile process of the same user.
 
 ## Development
 

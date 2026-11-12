@@ -59,8 +59,7 @@ fn parent_and_comm(pid: u64) -> Option<(u64, String)> {
     Some((ppid, stat[open + 1..close].to_string()))
 }
 
-/// Who owns a new worktree when nobody says: the agent session above the caller, else the session leader.
-/// The caller's own parent is often a `sh -c` that is gone a moment later.
+/// The owner of a new worktree: the agent session above the caller, else the session leader (the parent is often a short-lived `sh -c`).
 pub fn default_owner(chain: &[(u64, String)], session: u64) -> u64 {
     chain
         .iter()
@@ -81,8 +80,7 @@ fn ancestors() -> Vec<(u64, String)> {
     out
 }
 
-/// Create (or take over, when its owner is dead) the step's worktree. The whole decision runs under the
-/// queue's state lock, so two callers cannot both believe they own the step.
+/// Create (or take over, when its owner is dead) the step's worktree, deciding under the queue's state lock.
 pub fn new(ctx: &Ctx, step: &str, owner_pid: Option<u64>) -> Result<PathBuf> {
     if !crew_ledger::valid_id(step) {
         bail!(
@@ -209,11 +207,15 @@ fn pids_working_in(dir: &Path) -> Vec<u32> {
         .filter(|pid| {
             std::fs::read_link(format!("/proc/{pid}/cwd")).is_ok_and(|cwd| cwd.starts_with(dir))
         })
+        // git's own background upkeep (`gc --auto`) runs in the worktree after a commit and is nobody's editor.
+        .filter(|pid| {
+            !std::fs::read_to_string(format!("/proc/{pid}/comm"))
+                .is_ok_and(|c| c.starts_with("git"))
+        })
         .collect()
 }
 
-/// Salvage then remove every dead registered worktree; a failed salvage keeps the worktree, and so does a
-/// process still working in it or an owner that came back. Ignored files (.gitignore) are not saved.
+/// Salvage then remove every dead worktree; a failed salvage, a process working in it or a takeover keeps it.
 pub fn gc(ctx: &Ctx) -> Result<Vec<GcRow>> {
     let store = Store::new(&ctx.crew_dir());
     let dead: Vec<WorktreeReg> = store

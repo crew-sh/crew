@@ -42,8 +42,7 @@ pub struct RunOptions {
     pub strict: bool,
     /// Progress as JSON lines on stderr instead of text.
     pub json: bool,
-    /// The job id the caller found in `CREW_JOB`. If the usher confirms the caller really runs inside that job's
-    /// scope, the command runs there instead of asking again; otherwise the claim is ignored.
+    /// The job id found in `CREW_JOB`; it only skips admission when the usher confirms the caller runs inside that job.
     pub claimed_job: Option<String>,
     /// With `Client::detach`: where the job's output goes; default is a file in the usher's state directory.
     pub log: Option<PathBuf>,
@@ -258,8 +257,7 @@ impl Client {
         }
     }
 
-    /// Whether the usher says this process runs inside the running job `claimed`. A leaked or forged `CREW_JOB`,
-    /// an unreachable usher or an unknown job all mean no.
+    /// Whether the usher says this process runs inside the running job `claimed`; any doubt means no.
     fn confirmed_inside(&self, claimed: Option<&str>) -> bool {
         let Some(id) = claimed else { return false };
         let answer = self.ask(Body::InsideJobRequest(InsideJobRequest {

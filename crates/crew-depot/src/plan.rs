@@ -33,8 +33,7 @@ fn names_jobs(args: &[String]) -> bool {
         .any(|a| a == "--jobs" || a.starts_with("--jobs=") || a == "-j" || a.starts_with("-j"))
 }
 
-/// Pool settings a project's crew.toml changed from depot.toml. `crew cargo` obeys them; the usher, which holds the
-/// pool and wraps games, reads depot.toml only, so each one is named to the caller instead of silently half-applied.
+/// Pool keys a project's crew.toml changed; the usher reads depot.toml only, so each is named to the caller.
 pub fn usher_side_overrides(user: &Depot, resolved: &Depot) -> Vec<String> {
     let mut out = Vec::new();
     let mut note = |key: &str, differs: bool| {

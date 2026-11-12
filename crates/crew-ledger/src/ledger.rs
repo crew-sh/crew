@@ -46,8 +46,7 @@ pub mod events {
         }
     }
 
-    /// An approval with no owner context, as written before approvals were bound to one: it counts for any
-    /// version of the step. `crew plan approve` no longer writes these.
+    /// An approval with no owner context, as written before approvals were bound to one; it counts for any version of the step.
     pub fn approve_step(step_id: &str, by: &str, note: &str) -> Event {
         Event {
             body: Some(event::Body::Approval(Approval {
@@ -119,10 +118,10 @@ pub mod events {
         Event {
             body: Some(event::Body::BudgetUse(BudgetUse {
                 step_id: step_id.into(),
-                builds: used.builds as u32,
+                builds: u32::try_from(used.builds).unwrap_or(u32::MAX),
                 test_ms: used.test_ms,
-                harnesses: used.harnesses as u32,
-                games: used.games as u32,
+                harnesses: u32::try_from(used.harnesses).unwrap_or(u32::MAX),
+                games: u32::try_from(used.games).unwrap_or(u32::MAX),
                 at_ms: 0,
                 by: by.into(),
             })),
