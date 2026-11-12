@@ -1,146 +1,49 @@
-//! crew-ledger: typed plan (plan.toml) plus append-only run ledger (.crew/ledger.pb).
-//! API stub: signatures are final, bodies are filled in next.
+//! crew-ledger: the typed plan (plan.toml) and the append-only run ledger (.crew/ledger.pb).
 
-use std::path::{Path, PathBuf};
+mod check;
+mod error;
+mod glob;
+mod ledger;
+mod plan;
+mod report;
+mod store;
 
+pub use check::{Violation, check, check_plan, over_budget};
 pub use crew_proto::ledger::{
     Approval, BudgetUse, Event, Landed, ScopeAll, Status, StepStatus, approval, event,
 };
-use serde::{Deserialize, Serialize};
+pub use error::Error;
+pub use ledger::{Ledger, Refusal, Snapshot, StepState, Use, events, now_ms};
+pub use plan::{Budget, Kind, Model, Plan, RESERVED_SCOPE_ID, Review, RunKind, Step};
+pub use report::{
+    KindCount, Show, StepRow, Summary, render_markdown, render_show, show, summarize,
+};
 
-#[derive(Debug, thiserror::Error)]
-pub enum Error {
-    #[error("{0}")]
-    Msg(String),
-}
+pub const STATUSES: [Status; 8] = [
+    Status::Planned,
+    Status::Approved,
+    Status::Running,
+    Status::Built,
+    Status::Landed,
+    Status::Failed,
+    Status::Held,
+    Status::Dropped,
+];
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum Kind {
-    Asked,
-    Extra,
-    CoreDesign,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum Review {
-    OwnerBefore,
-    OwnerAfter,
-    None,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum Model {
-    Sonnet,
-    Opus,
-    Haiku,
-    Fable,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RunKind {
-    Build,
-    Test,
-    Harness,
-    Game,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Budget {
-    pub builds: Option<u32>,
-    pub test_minutes: Option<u32>,
-    pub harnesses: Option<u32>,
-    pub games: Option<u32>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Step {
-    pub id: String,
-    pub title: String,
-    pub kind: Kind,
-    #[serde(default)]
-    pub deps: Vec<String>,
-    #[serde(default = "default_model")]
-    pub model: Model,
-    #[serde(default)]
-    pub owns: Vec<String>,
-    #[serde(default)]
-    pub verify: Vec<String>,
-    #[serde(default)]
-    pub budget: Budget,
-    pub review: Option<Review>,
-    pub issue: Option<u64>,
-}
-
-fn default_model() -> Model {
-    Model::Sonnet
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Plan {
-    pub request: String,
-    pub steps: Vec<Step>,
-}
-
-/// Running totals of a step's recorded `BudgetUse`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
-pub struct Use {
-    pub builds: u64,
-    pub test_ms: u64,
-    pub harnesses: u64,
-    pub games: u64,
-}
-
-/// A step's current state: the fold of its events plus plan rules.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StepState {
-    pub status: Status,
-    /// True when the step may leave PLANNED (no approval needed, or one was recorded).
-    pub allowed: bool,
-    pub landed: Option<Landed>,
-    pub used: Use,
-    pub by: String,
-    pub detail: String,
-    pub at_ms: u64,
-}
-
-pub struct Ledger {
-    root: PathBuf,
-    plan: Plan,
-}
-
-impl Ledger {
-    /// `root` holds `crew.toml`.
-    pub fn open(root: &Path) -> Result<Self, Error> {
-        let _ = (root, &Self { root: PathBuf::new(), plan: Plan { request: String::new(), steps: vec![] } });
-        Err(Error::Msg("not implemented".into()))
+pub fn status_name(s: Status) -> &'static str {
+    match s {
+        Status::Unspecified => "unspecified",
+        Status::Planned => "planned",
+        Status::Approved => "approved",
+        Status::Running => "running",
+        Status::Built => "built",
+        Status::Landed => "landed",
+        Status::Failed => "failed",
+        Status::Held => "held",
+        Status::Dropped => "dropped",
     }
+}
 
-    pub fn root(&self) -> &Path {
-        &self.root
-    }
-
-    pub fn plan(&self) -> &Plan {
-        &self.plan
-    }
-
-    /// Steps whose deps all landed, that are PLANNED/APPROVED and allowed to start, in plan order.
-    pub fn ready_steps(&self) -> Result<Vec<&Step>, Error> {
-        Err(Error::Msg("not implemented".into()))
-    }
-
-    /// Appends one event (validated against the plan and its approval rules).
-    pub fn record(&self, event: Event) -> Result<(), Error> {
-        let _ = event;
-        Err(Error::Msg("not implemented".into()))
-    }
-
-    pub fn state(&self, step_id: &str) -> Result<StepState, Error> {
-        let _ = step_id;
-        Err(Error::Msg("not implemented".into()))
-    }
+pub fn parse_status(s: &str) -> Option<Status> {
+    STATUSES.into_iter().find(|&x| status_name(x) == s)
 }
