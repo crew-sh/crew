@@ -17,11 +17,13 @@ struct Package {
 #[derive(Deserialize)]
 struct Dependency {
     name: String,
+    /// `null` for a normal dependency, `"dev"` or `"build"` otherwise.
+    kind: Option<String>,
 }
 
 struct Crate {
     layer: u8,
-    /// When set, the crate may depend on exactly these workspace crates and no others.
+    /// When set, the crate's normal dependencies may be exactly these workspace crates and no others; dev dependencies only obey the layers.
     only: Option<&'static [&'static str]>,
 }
 
@@ -52,7 +54,7 @@ fn layers() -> BTreeMap<&'static str, Crate> {
             "crew-usher",
             Crate {
                 layer: 1,
-                only: None,
+                only: Some(&["crew-depot-config", "crew-proto", "crew-sys"]),
             },
         ),
         (
@@ -85,7 +87,6 @@ fn layers() -> BTreeMap<&'static str, Crate> {
                     "crew-sys",
                     "crew-usher-client",
                     "crew-depot-config",
-                    "crew-usher",
                 ]),
             },
         ),
@@ -93,7 +94,7 @@ fn layers() -> BTreeMap<&'static str, Crate> {
             "crew-queue",
             Crate {
                 layer: 2,
-                only: Some(&["crew-proto", "crew-git", "crew-ledger", "crew-usher-client"]),
+                only: Some(&["crew-git", "crew-ledger"]),
             },
         ),
         (
@@ -125,7 +126,8 @@ fn violations(packages: &[Package], table: &BTreeMap<&str, Crate>) -> Vec<String
                     p.name, me.layer, d.name, dep.layer
                 ));
             }
-            if me.only.is_some_and(|only| !only.contains(&d.name.as_str())) {
+            let normal = d.kind.is_none();
+            if normal && me.only.is_some_and(|only| !only.contains(&d.name.as_str())) {
                 out.push(format!("{} may not depend on {}", p.name, d.name));
             }
         }
@@ -138,7 +140,10 @@ fn package(name: &str, deps: &[&str]) -> Package {
         name: name.into(),
         dependencies: deps
             .iter()
-            .map(|d| Dependency { name: (*d).into() })
+            .map(|d| Dependency {
+                name: (*d).into(),
+                kind: None,
+            })
             .collect(),
     }
 }
@@ -170,6 +175,22 @@ fn the_check_catches_upward_and_unlisted_dependencies() {
     ];
     let v = violations(&bad, &table);
     assert_eq!(v.len(), 4, "{v:?}");
+    // The usher is pinned like the rest: a sideways dependency is caught, a dev-only one is not.
+    let sideways = violations(&[package("crew-usher", &["crew-depot"])], &table);
+    assert!(
+        sideways
+            .iter()
+            .any(|m| m == "crew-usher may not depend on crew-depot"),
+        "{sideways:?}"
+    );
+    let dev_only = Package {
+        name: "crew-queue".into(),
+        dependencies: vec![Dependency {
+            name: "crew-usher-client".into(),
+            kind: Some("dev".into()),
+        }],
+    };
+    assert!(violations(&[dev_only], &table).is_empty());
     assert!(
         v.iter()
             .any(|m| m.contains("crew-proto") && m.contains("layer 1"))
@@ -178,10 +199,7 @@ fn the_check_catches_upward_and_unlisted_dependencies() {
     assert!(v.iter().any(|m| m.contains("crew-newcomer has no layer")));
     assert!(
         violations(
-            &[package(
-                "crew-usher",
-                &["crew-sys", "crew-proto", "crew-usher-client"]
-            )],
+            &[package("crew-usher", &["crew-sys", "crew-proto"])],
             &table
         )
         .is_empty()

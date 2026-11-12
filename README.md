@@ -501,6 +501,8 @@ Each crate depends only on crates in its own layer or below. `crates/crew/tests/
 | 2 | `crew-depot` | `crew cargo` and `crew build`: cargo through mbx under a build grant, statistics, miss explanations, the sharing report. Program: `crew-depot`. |
 | 4 | `crew` | The command line. |
 
+`crew-queue` also runs the layer-4 `crew` binary at run time to start its checks under admission (`CREW_BIN`, else a `crew` beside it, else one on `PATH`; none means the checks run directly). That is a process it starts, not a dependency, so the layer test cannot see it. Only normal dependencies are pinned per crate; dev dependencies obey the layers only.
+
 Why separate programs:
 
 - `crew <name>` runs `crew-<name>`, as `git` and `cargo` do. Install only what you use. `crew plan` and `crew queue` never need the usher.
