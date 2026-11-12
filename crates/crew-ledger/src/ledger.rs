@@ -657,8 +657,7 @@ impl Ledger {
         file.sync_data().map_err(io)
     }
 
-    /// Rewrites the ledger in place with superseded status records dropped and budget use summed, under the file's lock.
-    /// The result must fold to exactly the same facts, or nothing is changed. The whole old file is kept beside it.
+    /// Rewrites the ledger in place without superseded status records, budget use summed; the old file is kept, and nothing changes unless the facts fold the same.
     pub fn compact(&self) -> Result<Compaction, Error> {
         let io = |e| Error::io(&self.path, e);
         let mut file = match OpenOptions::new().read(true).append(true).open(&self.path) {

@@ -140,8 +140,7 @@ impl DepotTable {
         }
     }
 
-    /// The keys only the user's own `depot.toml` may set (`mbx_path`, `store`) that this table sets.
-    /// A project's `crew.toml` comes with a checked-out branch, and must not choose which program runs or where records go.
+    /// The keys only the user's `depot.toml` may set (`mbx_path`, `store`) that this table sets; a checked-out branch must not choose them.
     pub fn user_only_keys_set(&self) -> Vec<&'static str> {
         let mut out = Vec::new();
         if self.mbx_path.is_some() {

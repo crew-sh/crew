@@ -1,6 +1,5 @@
 #!/bin/sh
-# Installs crew from the latest GitHub release: curl -fsSL https://crew.umceko.dev/install.sh | sh
-# CREW_INSTALL_DIR picks the directory (default ~/.local/bin); CREW_VERSION pins a release such as v0.1.0.
+# Installs crew from the latest GitHub release: curl -fsSL https://crew.umceko.dev/install.sh | sh (CREW_INSTALL_DIR, CREW_VERSION)
 set -eu
 
 repo=${CREW_REPO:-crew-sh/crew}
