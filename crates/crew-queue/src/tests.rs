@@ -54,6 +54,8 @@ impl Fx {
         let remote = tmp.path().join("remote.git");
         fs::create_dir(&root).unwrap();
         git(&root, &["init", "-q", "-b", "main"]);
+        git(&root, &["config", "user.name", "t"]);
+        git(&root, &["config", "user.email", "t@t"]);
         git(
             tmp.path(),
             &["init", "-q", "--bare", remote.to_str().unwrap()],

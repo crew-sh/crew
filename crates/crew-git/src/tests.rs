@@ -41,6 +41,8 @@ fn repo() -> (TempDir, PathBuf) {
     let r = t.path().join("repo");
     fs::create_dir(&r).unwrap();
     sh(&r, &["init", "-q", "-b", "main"]);
+    sh(&r, &["config", "user.name", "t"]);
+    sh(&r, &["config", "user.email", "t@t"]);
     fs::write(r.join("a.txt"), "one\n").unwrap();
     sh(&r, &["add", "."]);
     sh(&r, &["commit", "-qm", "init"]);
