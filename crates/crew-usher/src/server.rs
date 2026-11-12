@@ -2,7 +2,8 @@ use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::net::Shutdown;
-use std::os::unix::fs::PermissionsExt;
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -24,6 +25,10 @@ pub enum ServerError {
     AlreadyRunning(String),
     #[error("socket {path}: {source}")]
     Socket { path: String, source: io::Error },
+    #[error("another usher holds the state directory lock {0}; one state directory has one usher")]
+    StateLocked(String),
+    #[error("state directory lock {path}: {source}")]
+    Lock { path: String, source: io::Error },
 }
 
 #[derive(Clone, Debug)]
@@ -35,6 +40,8 @@ pub struct Paths {
     pub jobs: PathBuf,
     /// Default logs and exit-status files of detached jobs.
     pub job_logs: PathBuf,
+    /// Held for the usher's lifetime: one usher per state directory.
+    pub lock: PathBuf,
 }
 
 impl Paths {
@@ -46,6 +53,7 @@ impl Paths {
             log: state.join("usher.log"),
             jobs: state.join("usher-jobs.pb"),
             job_logs: state.join("jobs"),
+            lock: state.join("usher.lock"),
         }
     }
 
@@ -67,10 +75,40 @@ pub enum IdleSource {
 type Open = Arc<Mutex<HashMap<u64, UnixStream>>>;
 
 pub struct Server {
+    /// Dropping it releases the state directory lock.
+    _lock: fs::File,
     socket: PathBuf,
     tx: Sender<Msg>,
     actor: Option<JoinHandle<()>>,
     open: Open,
+}
+
+/// Takes the exclusive, non-blocking lock on the state directory; the kernel drops it when the usher dies.
+fn lock_state(path: &Path) -> Result<fs::File, ServerError> {
+    let err = |source| ServerError::Lock {
+        path: path.display().to_string(),
+        source,
+    };
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir).map_err(err)?;
+    }
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(err)?;
+    // SAFETY: the descriptor is open for as long as `file` lives.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        let e = io::Error::last_os_error();
+        return Err(if e.kind() == io::ErrorKind::WouldBlock {
+            ServerError::StateLocked(path.display().to_string())
+        } else {
+            err(e)
+        });
+    }
+    Ok(file)
 }
 
 fn bind(path: &Path) -> Result<UnixListener, ServerError> {
@@ -79,8 +117,12 @@ fn bind(path: &Path) -> Result<UnixListener, ServerError> {
         source,
     };
     if let Some(dir) = path.parent() {
+        // Only a directory the usher made gets its mode set; CREW_SOCKET=$HOME/x.sock must not touch $HOME.
+        let made = !dir.exists();
         fs::create_dir_all(dir).map_err(err)?;
-        fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).map_err(err)?;
+        if made {
+            fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).map_err(err)?;
+        }
     }
     if path.exists() {
         if UnixStream::connect(path).is_ok() {
@@ -154,6 +196,7 @@ impl Server {
         idle_source: IdleSource,
         echo_log: bool,
     ) -> Result<Self, ServerError> {
+        let lock = lock_state(&paths.lock)?;
         let listener = bind(&paths.socket)?;
         let log = Arc::new(Log::open(&paths.log, echo_log));
         let (tx, rx) = mpsc::channel();
@@ -223,6 +266,7 @@ impl Server {
 
         log.line(&format!("START socket={}", paths.socket.display()));
         Ok(Self {
+            _lock: lock,
             socket: paths.socket.clone(),
             tx,
             actor: Some(actor),
