@@ -8,6 +8,11 @@ mod gen_ {
 }
 
 pub use gen_::*;
+
+/// Plan and run ledger records (T3).
+pub mod ledger {
+    include!(concat!(env!("OUT_DIR"), "/crew.ledger.rs"));
+}
 pub use prost;
 
 pub const MAX_FRAME: usize = 1 << 20;

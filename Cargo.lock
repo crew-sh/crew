@@ -58,12 +58,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "crew-git"
+version = "0.1.0"
+dependencies = [
+ "crew-proto",
+]
+
+[[package]]
+name = "crew-ledger"
+version = "0.1.0"
+dependencies = [
+ "crew-proto",
+]
+
+[[package]]
 name = "crew-proto"
 version = "0.1.0"
 dependencies = [
  "bytes",
  "prost",
  "prost-build",
+]
+
+[[package]]
+name = "crew-queue"
+version = "0.1.0"
+dependencies = [
+ "crew-git",
+ "crew-ledger",
+ "crew-proto",
+ "crew-usher-client",
 ]
 
 [[package]]

@@ -1,0 +1,5 @@
+syntax = "proto3";
+package crew.ledger;
+
+// Placeholder; T3 defines the ledger records here.
+message Placeholder {}

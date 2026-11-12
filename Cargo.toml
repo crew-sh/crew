@@ -28,6 +28,8 @@ crew-proto = { path = "crates/crew-proto" }
 crew-sys = { path = "crates/crew-sys", default-features = false }
 crew-usher = { path = "crates/crew-usher" }
 crew-usher-client = { path = "crates/crew-usher-client" }
+crew-git = { path = "crates/crew-git" }
+crew-ledger = { path = "crates/crew-ledger" }
 
 [profile.release]
 lto = "thin"
