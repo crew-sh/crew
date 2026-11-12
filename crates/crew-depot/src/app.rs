@@ -73,6 +73,9 @@ fn record_build(store: &Path, root: &Path, args: &[String], report: &Path) {
 pub fn cargo(args: &[String]) -> Result<ExitCode> {
     let cwd = std::env::current_dir()?;
     let depot = depot_for(&cwd)?;
+    for note in plan::usher_side_overrides(&DepotTable::user()?.resolve(), &depot) {
+        eprintln!("{note}");
+    }
     let mbx = depot.find_mbx();
     match (depot.mbx, &mbx) {
         (MbxMode::Required, None) => bail!("depot.mbx is \"required\" but mbx was not found"),

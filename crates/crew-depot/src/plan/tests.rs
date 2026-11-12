@@ -173,3 +173,76 @@ fn a_leftover_rustc_wrapper_is_dropped_for_mbx_only_and_said_so() {
             .is_empty()
     );
 }
+
+#[test]
+fn inherited_variables_that_override_settings_are_named_in_a_note() {
+    let d = fast_depot();
+    let e = env(&[("RUSTUP_TOOLCHAIN", "nightly"), ("CARGO_BUILD_JOBS", "64")]);
+    let g = grant(4, BuildPriority::Normal);
+    let p = plan(&d, "build", &e, false, Some(&g));
+    assert!(
+        p.env_set.is_empty() || !p.env_set.contains_key("RUSTUP_TOOLCHAIN"),
+        "nothing set by the caller is overridden"
+    );
+    let notes = p.notes.join("\n");
+    assert!(
+        notes.contains("RUSTUP_TOOLCHAIN=nightly") && notes.contains("1.99.1"),
+        "{notes}"
+    );
+    assert!(
+        notes.contains("CARGO_BUILD_JOBS=64") && notes.contains("4 cores"),
+        "{notes}"
+    );
+    // The same value as the setting says nothing.
+    let same = plan(
+        &d,
+        "build",
+        &env(&[("RUSTUP_TOOLCHAIN", "1.99.1")]),
+        false,
+        None,
+    );
+    assert!(same.notes.is_empty(), "{:?}", same.notes);
+}
+
+#[test]
+fn flags_that_change_the_cache_keys_are_mentioned_when_mbx_is_used() {
+    let d = Depot::default();
+    let p = plan(
+        &d,
+        "build",
+        &env(&[("RUSTFLAGS", "-C target-cpu=native")]),
+        true,
+        None,
+    );
+    assert!(
+        p.notes.iter().any(|n| n.contains("RUSTFLAGS")),
+        "{:?}",
+        p.notes
+    );
+    let plain = plan(
+        &d,
+        "build",
+        &env(&[("RUSTFLAGS", "-C debuginfo=0")]),
+        false,
+        None,
+    );
+    assert!(plain.notes.is_empty());
+}
+
+#[test]
+fn project_settings_the_usher_cannot_see_are_named() {
+    let user = Depot::default();
+    assert!(usher_side_overrides(&user, &user).is_empty());
+    let project = DepotTable {
+        mbx_reserve: Some(true),
+        reserve_cpus: Some(2),
+        mbx: Some(crew_depot_config::MbxMode::Off),
+        ..DepotTable::default()
+    }
+    .resolve();
+    let notes = usher_side_overrides(&user, &project).join("\n");
+    for key in ["mbx_reserve", "reserve_cpus", "mbx in"] {
+        assert!(notes.contains(key), "{key} missing from {notes}");
+    }
+    assert!(!notes.contains("reserve_memory_gib") && !notes.contains("mbx_path"));
+}
