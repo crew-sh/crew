@@ -1,12 +1,13 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::fs::{self, OpenOptions};
-use std::io;
+use std::io::{self, Write};
+use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -49,9 +50,16 @@ const SCOPE_START_GRACE_MS: u64 = 10_000;
 /// A cancelled job gets SIGTERM, then SIGKILL after this long.
 const CANCEL_GRACE_MS: u64 = 10_000;
 
+/// Replies a client may leave unread before the usher gives up on it.
+const OUTBOX: usize = 64;
+/// A client that takes no bytes for this long is dropped.
+const WRITE_STALL: Duration = Duration::from_secs(2);
+
 #[derive(Clone)]
 pub struct Conn {
-    stream: Arc<Mutex<UnixStream>>,
+    stream: Arc<UnixStream>,
+    /// Whole frames for the connection's writer thread, so a stuck client never holds up the actor.
+    outbox: SyncSender<Vec<u8>>,
     /// The client process, as the kernel saw it connect.
     pid: Option<u32>,
     /// Set by the connection's reader when the peer is gone.
@@ -60,12 +68,30 @@ pub struct Conn {
 
 impl Conn {
     pub fn new(stream: UnixStream) -> io::Result<Self> {
-        stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+        stream.set_write_timeout(Some(WRITE_STALL))?;
         let pid = procs::peer_pid(&stream);
+        let stream = Arc::new(stream);
+        let closed = Arc::new(AtomicBool::new(false));
+        let (outbox, frames) = mpsc::sync_channel::<Vec<u8>>(OUTBOX);
+        let (mut out, shared, flag) = (
+            stream.try_clone()?,
+            Arc::clone(&stream),
+            Arc::clone(&closed),
+        );
+        thread::Builder::new().name("reply".into()).spawn(move || {
+            for frame in frames {
+                if out.write_all(&frame).and_then(|()| out.flush()).is_err() {
+                    flag.store(true, Ordering::Relaxed);
+                    let _ = shared.shutdown(Shutdown::Both);
+                    return;
+                }
+            }
+        })?;
         Ok(Self {
-            stream: Arc::new(Mutex::new(stream)),
+            stream,
+            outbox,
             pid,
-            closed: Arc::new(AtomicBool::new(false)),
+            closed,
         })
     }
 
@@ -92,12 +118,16 @@ impl Conn {
         }
     }
 
+    /// Queues a reply; a client that cannot keep up is disconnected instead of waited for.
     fn send(&self, body: envelope::Body) {
-        let mut s = self
-            .stream
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _ = crew_proto::write_frame(&mut *s, &Envelope::of(body));
+        let mut frame = Vec::new();
+        if crew_proto::write_frame(&mut frame, &Envelope::of(body)).is_err() {
+            return;
+        }
+        if self.outbox.try_send(frame).is_err() {
+            self.mark_closed();
+            let _ = self.stream.shutdown(Shutdown::Both);
+        }
     }
 }
 
@@ -722,7 +752,8 @@ impl Daemon {
         };
         let max_ms = self.cfg.manual_away_max_secs.saturating_mul(1000);
         if manual.expired(self.now_ms(), max_ms) {
-            self.log.line("OWNER manual away expired while the usher was down");
+            self.log
+                .line("OWNER manual away expired while the usher was down");
             self.save_owner();
             return;
         }
@@ -2163,6 +2194,45 @@ mod tests {
     use super::*;
 
     const GIB: u64 = 1 << 30;
+
+    fn ack(message: String) -> envelope::Body {
+        envelope::Body::Ack(Ack { ok: true, message })
+    }
+
+    #[test]
+    fn a_client_that_stops_reading_cannot_stall_the_sender() {
+        let (ours, _theirs) = UnixStream::pair().unwrap();
+        let conn = Conn::new(ours).unwrap();
+        let started = Instant::now();
+        for _ in 0..3 {
+            conn.send(ack("x".repeat(900_000)));
+        }
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "three sends to a stalled client took {:?}",
+            started.elapsed()
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !conn.is_closed() {
+            assert!(Instant::now() < deadline, "the stalled client stayed open");
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    #[test]
+    fn replies_reach_a_reading_client_whole_and_in_order() {
+        let (ours, mut theirs) = UnixStream::pair().unwrap();
+        let conn = Conn::new(ours).unwrap();
+        for i in 0..5 {
+            conn.send(ack(format!("reply {i}")));
+        }
+        for i in 0..5 {
+            match crew_proto::read_frame(&mut theirs).unwrap().unwrap().body {
+                Some(envelope::Body::Ack(a)) => assert_eq!(a.message, format!("reply {i}")),
+                other => panic!("{other:?}"),
+            }
+        }
+    }
 
     #[test]
     fn only_the_owning_process_or_a_gone_one_may_be_replaced() {
