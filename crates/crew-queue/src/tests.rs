@@ -1,13 +1,14 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 use crew_ledger::Status;
 use tempfile::TempDir;
 
 use crate::check::{CheckOutcome, CheckRunner};
 use crate::lock::FileLock;
-use crate::runner::Runner;
+use crate::runner::{Runner, Summary, backoff, drive};
 use crate::{Ctx, status, submit, worktrees};
 
 /// Scratch dirs go under `CREW_TEST_TMP` when set (a big disk), else the system temp dir.
@@ -259,10 +260,77 @@ fn a_second_runner_is_refused_while_the_first_holds_the_lock() {
         .unwrap()
         .unwrap();
     let err = Runner::new(&fx.ctx, CheckRunner::default())
+        .with_lock_wait(Duration::from_millis(100))
         .run(true)
         .unwrap_err();
     assert!(err.to_string().contains("another queue runner"), "{err}");
     assert!(status::report(&fx.ctx).unwrap().runner_active);
+}
+
+#[test]
+fn a_runner_that_starts_while_status_peeks_at_the_lock_waits_instead_of_refusing() {
+    let fx = Fx::new(&[("s1", &[])], "");
+    let path = fx.ctx.crew_dir().join("queue.lock");
+    let peek = std::thread::spawn({
+        let path = path.clone();
+        move || {
+            // What `crew queue status` does: take the lock to see who holds it, then let go.
+            let held = FileLock::try_exclusive(&path).unwrap().unwrap();
+            std::thread::sleep(Duration::from_millis(400));
+            drop(held);
+        }
+    });
+    std::thread::sleep(Duration::from_millis(100));
+    let summary = Runner::new(&fx.ctx, CheckRunner::default()).run(true);
+    peek.join().unwrap();
+    assert!(summary.is_ok(), "{summary:?}");
+}
+
+fn landed_one() -> Summary {
+    Summary {
+        landed: vec![("s1".into(), "abc".into())],
+        batches: 1,
+        ..Summary::default()
+    }
+}
+
+#[test]
+fn a_looping_runner_survives_failed_passes_and_a_single_run_reports_them() {
+    let mut script = vec![
+        Err(anyhow::anyhow!("usher says no")),
+        Err(anyhow::anyhow!("git hiccup")),
+        Ok(landed_one()),
+        Ok(Summary::default()),
+    ]
+    .into_iter();
+    let mut waits = Vec::new();
+    let total = drive(
+        false,
+        || script.next().unwrap(),
+        |d| {
+            waits.push(d);
+            // Stop at the first idle wait, after the failures were ridden out.
+            waits.len() < 3
+        },
+    )
+    .unwrap();
+    assert_eq!(total.landed.len(), 1);
+    assert!(
+        waits[1] > waits[0],
+        "the wait grows with each failure: {waits:?}"
+    );
+
+    let mut once = vec![Err(anyhow::anyhow!("usher says no"))].into_iter();
+    let err = drive(true, || once.next().unwrap(), |_| true).unwrap_err();
+    assert!(err.to_string().contains("usher says no"));
+}
+
+#[test]
+fn the_wait_after_errors_grows_and_is_capped() {
+    let waits: Vec<_> = (1..=10).map(backoff).collect();
+    assert!(waits.windows(2).all(|w| w[0] <= w[1]), "{waits:?}");
+    assert_eq!(waits[9], Duration::from_secs(60));
+    assert!(waits[0] < Duration::from_secs(30));
 }
 
 #[test]

@@ -2,6 +2,7 @@ use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::fd::AsRawFd;
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 /// An advisory exclusive flock held until dropped.
 pub struct FileLock {
@@ -34,6 +35,20 @@ impl FileLock {
             Ok(None)
         } else {
             Err(err)
+        }
+    }
+
+    /// Like `try_exclusive`, but tries again for up to `wait` before giving up.
+    pub fn try_exclusive_for(path: &Path, wait: Duration) -> io::Result<Option<Self>> {
+        let deadline = Instant::now() + wait;
+        loop {
+            if let Some(lock) = Self::try_exclusive(path)? {
+                return Ok(Some(lock));
+            }
+            if Instant::now() >= deadline {
+                return Ok(None);
+            }
+            std::thread::sleep(Duration::from_millis(50));
         }
     }
 

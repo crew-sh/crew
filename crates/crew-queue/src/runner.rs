@@ -13,6 +13,49 @@ use crate::store::{Store, Submission};
 use crate::submit::{record_landed, record_status, state_of};
 
 const POLL: Duration = Duration::from_secs(3);
+/// The longest wait between passes after errors.
+const MAX_BACKOFF: Duration = Duration::from_secs(60);
+/// `crew queue status` takes the runner lock for a moment to see whether a runner lives; a runner starting then waits this long.
+const LOCK_WAIT: Duration = Duration::from_secs(2);
+
+/// Waits after the `failures`th error in a row: the poll interval, doubled each time, up to a minute.
+pub(crate) fn backoff(failures: u32) -> Duration {
+    POLL.saturating_mul(1u32 << failures.min(5))
+        .min(MAX_BACKOFF)
+}
+
+/// Runs passes until `once` is satisfied or `wait` says stop. A failing pass ends a `once` run; a loop logs it, waits longer each time, and carries on, since a usher refusal or a git hiccup passes.
+pub(crate) fn drive(
+    once: bool,
+    mut pass: impl FnMut() -> Result<Summary>,
+    mut wait: impl FnMut(Duration) -> bool,
+) -> Result<Summary> {
+    let mut total = Summary::default();
+    let mut failures = 0;
+    loop {
+        match pass() {
+            Ok(s) => {
+                failures = 0;
+                let idle = s.batches == 0;
+                total.landed.extend(s.landed);
+                total.failed.extend(s.failed);
+                total.batches += s.batches;
+                total.push_errors.extend(s.push_errors);
+                if idle && (once || !wait(POLL)) {
+                    return Ok(total);
+                }
+            }
+            Err(e) if once => return Err(e),
+            Err(e) => {
+                failures += 1;
+                eprintln!("queue: pass failed ({failures} in a row): {e:#}; trying again");
+                if !wait(backoff(failures)) {
+                    return Err(e);
+                }
+            }
+        }
+    }
+}
 
 /// What one `run_once` pass did.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -31,34 +74,39 @@ enum Fate {
 pub struct Runner<'a> {
     ctx: &'a Ctx,
     check: CheckRunner,
+    lock_wait: Duration,
 }
 
 impl<'a> Runner<'a> {
     pub fn new(ctx: &'a Ctx, check: CheckRunner) -> Self {
-        Self { ctx, check }
+        Self {
+            ctx,
+            check,
+            lock_wait: LOCK_WAIT,
+        }
+    }
+
+    /// How long `run` waits for another holder of the runner lock before it refuses.
+    #[must_use]
+    pub fn with_lock_wait(mut self, wait: Duration) -> Self {
+        self.lock_wait = wait;
+        self
     }
 
     /// Hold the single-runner lock for the life of the loop; `once` returns when nothing is ready.
     pub fn run(&self, once: bool) -> Result<Summary> {
         let lock_path = self.ctx.crew_dir().join("queue.lock");
-        let Some(_lock) = FileLock::try_exclusive(&lock_path)? else {
+        let Some(_lock) = FileLock::try_exclusive_for(&lock_path, self.lock_wait)? else {
             bail!("another queue runner holds {}", lock_path.display());
         };
-        let mut total = Summary::default();
-        loop {
-            let s = self.run_pass()?;
-            let idle = s.batches == 0;
-            total.landed.extend(s.landed);
-            total.failed.extend(s.failed);
-            total.batches += s.batches;
-            total.push_errors.extend(s.push_errors);
-            if idle {
-                if once {
-                    return Ok(total);
-                }
-                std::thread::sleep(POLL);
-            }
-        }
+        drive(
+            once,
+            || self.run_pass(),
+            |d| {
+                std::thread::sleep(d);
+                true
+            },
+        )
     }
 
     /// Land ready batches until none is left; everything is recomputed from git and the ledger each round.
