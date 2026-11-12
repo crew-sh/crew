@@ -145,6 +145,10 @@ impl Client {
             display: opts.display,
         });
 
+        // A command already inside a granted job runs within that job's scope and grant; asking again could deadlock on the parent's reservation.
+        if env.contains_key("CREW_JOB") {
+            return run_nested(&opts.argv, &cwd, env);
+        }
         let mut stream = match self.connect() {
             Ok(s) => s,
             Err(e) if opts.strict => return Err(e),
@@ -197,6 +201,24 @@ impl Client {
         let _ = crew_proto::read_frame(&mut stream);
         Ok(code)
     }
+}
+
+fn run_nested(
+    argv: &[String],
+    cwd: &Path,
+    env: BTreeMap<String, String>,
+) -> Result<i32, ClientError> {
+    let status = Command::new(&argv[0])
+        .args(&argv[1..])
+        .current_dir(cwd)
+        .env_clear()
+        .envs(&env)
+        .status()
+        .map_err(|source| ClientError::Spawn {
+            command: argv[0].clone(),
+            source,
+        })?;
+    Ok(exit_code(status))
 }
 
 fn run_unmanaged(

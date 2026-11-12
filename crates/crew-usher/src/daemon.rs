@@ -408,7 +408,11 @@ impl Daemon {
             job_id: job.req.id.clone(),
             limits: Some(limits),
             scope_name: scope_name.clone(),
-            env_set: [("TMPDIR".to_string(), tmpdir)].into(),
+            env_set: [
+                ("TMPDIR".to_string(), tmpdir),
+                ("CREW_JOB".to_string(), job.req.id.clone()),
+            ]
+            .into(),
             env_unset,
         };
         self.log.line(&format!(

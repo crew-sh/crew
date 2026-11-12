@@ -235,3 +235,24 @@ fn sigterm_to_crew_run_kills_the_scope_and_exits_143() {
     assert_eq!(status.code(), Some(143));
     assert!(stdout(&d.crew(&["top"])).contains("RUNNING (0)"));
 }
+
+#[test]
+fn a_crew_run_inside_a_granted_job_runs_in_that_job_instead_of_queueing_behind_it() {
+    let Some(d) = Daemon::start() else { return };
+    assert!(d.crew(&["owner", "away"]).status.success());
+    let inner = format!("{CREW} run -- sh -c 'echo inner:$CREW_JOB'");
+    let out = crew_with(
+        &d.socket,
+        &[
+            "run", "--kind", "bench", "--", "timeout", "20", "sh", "-c", &inner,
+        ],
+        &[],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert!(
+        stdout(&out).trim().starts_with("inner:"),
+        "{}",
+        stdout(&out)
+    );
+    assert_ne!(stdout(&out).trim(), "inner:");
+}
