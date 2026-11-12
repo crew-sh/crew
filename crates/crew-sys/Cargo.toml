@@ -1,9 +1,12 @@
 [package]
 name = "crew-sys"
+description = "Linux system access for crew: /proc, cgroups, systemd scopes, display and idle detection."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [features]
 default = ["idle-wayland"]

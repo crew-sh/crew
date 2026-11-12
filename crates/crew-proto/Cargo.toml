@@ -1,9 +1,12 @@
 [package]
 name = "crew-proto"
+description = "Protobuf wire types and framing shared by the crew programs."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [dependencies]
 bytes.workspace = true

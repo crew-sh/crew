@@ -9,7 +9,7 @@ mod gen_ {
 
 pub use gen_::*;
 
-/// Plan and run ledger records (T3).
+/// Plan and run ledger records.
 pub mod ledger {
     include!(concat!(env!("OUT_DIR"), "/crew.ledger.rs"));
 }

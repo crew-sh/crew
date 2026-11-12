@@ -460,14 +460,14 @@ mod tests {
         let w = tempfile::tempdir().unwrap();
         let repo_a = repo(w.path(), "myrepo");
         let crew = repo(w.path(), "crew");
-        // t3 session: claude -> sh -> cargo -> nested claude, alone in its cgroup.
+        // A session: claude -> sh -> cargo -> nested claude, alone in its cgroup.
         f.proc(P {
             pid: 10,
             comm: ".claude-wrapped",
             ppid: 1,
             tty: 0,
             ticks: 100,
-            cgroup: "/t3/a.scope",
+            cgroup: "/agents/a.scope",
             env: "CREW_AGENT=t1;X=1",
             cwd: &repo_a,
         });
@@ -477,7 +477,7 @@ mod tests {
             ppid: 10,
             tty: 0,
             ticks: 100,
-            cgroup: "/t3/a.scope",
+            cgroup: "/agents/a.scope",
             env: "",
             cwd: &repo_a,
         });
@@ -487,7 +487,7 @@ mod tests {
             ppid: 11,
             tty: 0,
             ticks: 100,
-            cgroup: "/t3/a.scope",
+            cgroup: "/agents/a.scope",
             env: "",
             cwd: &repo_a,
         });
@@ -497,11 +497,11 @@ mod tests {
             ppid: 12,
             tty: 0,
             ticks: 100,
-            cgroup: "/t3/a.scope",
+            cgroup: "/agents/a.scope",
             env: "",
             cwd: &repo_a,
         });
-        f.cgroup("/t3/a.scope", &[10, 11, 12, 13]);
+        f.cgroup("/agents/a.scope", &[10, 11, 12, 13]);
         // owner session: codex with a tty sharing its cgroup with vim.
         f.proc(P {
             pid: 30,

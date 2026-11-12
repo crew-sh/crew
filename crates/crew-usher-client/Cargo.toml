@@ -1,9 +1,12 @@
 [package]
 name = "crew-usher-client"
+description = "The client side of the usher: job requests, kind inference, scope runner and top rendering."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [dependencies]
 crew-proto.workspace = true

@@ -1,9 +1,12 @@
 [package]
 name = "crew"
+description = "The crew command line: run jobs under the usher, top, owner, wait, and plugin dispatch."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [[bin]]
 name = "crew"

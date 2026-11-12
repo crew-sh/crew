@@ -1,9 +1,12 @@
 [package]
 name = "crew-ledger"
+description = "The crew plan ledger: typed plan.toml, an append-only ledger, check rules, and the crew-plan CLI."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [[bin]]
 name = "crew-plan"

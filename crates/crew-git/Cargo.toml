@@ -1,9 +1,12 @@
 [package]
 name = "crew-git"
+description = "Git helpers for crew: worktree lifecycle, branch queries and salvage of dead worktrees."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [dependencies]
 crew-proto.workspace = true
