@@ -458,7 +458,7 @@ mod tests {
     fn sessions_are_outermost_agent_trees_with_project_and_accounting() {
         let f = Fake::new();
         let w = tempfile::tempdir().unwrap();
-        let hz = repo(w.path(), "horizonmc");
+        let repo_a = repo(w.path(), "myrepo");
         let crew = repo(w.path(), "crew");
         // t3 session: claude -> sh -> cargo -> nested claude, alone in its cgroup.
         f.proc(P {
@@ -469,7 +469,7 @@ mod tests {
             ticks: 100,
             cgroup: "/t3/a.scope",
             env: "CREW_AGENT=t1;X=1",
-            cwd: &hz,
+            cwd: &repo_a,
         });
         f.proc(P {
             pid: 11,
@@ -479,7 +479,7 @@ mod tests {
             ticks: 100,
             cgroup: "/t3/a.scope",
             env: "",
-            cwd: &hz,
+            cwd: &repo_a,
         });
         f.proc(P {
             pid: 12,
@@ -489,7 +489,7 @@ mod tests {
             ticks: 100,
             cgroup: "/t3/a.scope",
             env: "",
-            cwd: &hz,
+            cwd: &repo_a,
         });
         f.proc(P {
             pid: 13,
@@ -499,7 +499,7 @@ mod tests {
             ticks: 100,
             cgroup: "/t3/a.scope",
             env: "",
-            cwd: &hz,
+            cwd: &repo_a,
         });
         f.cgroup("/t3/a.scope", &[10, 11, 12, 13]);
         // owner session: codex with a tty sharing its cgroup with vim.
@@ -554,7 +554,7 @@ mod tests {
         );
         assert_eq!(
             (a.project.as_str(), a.named, a.has_tty, a.actionable),
-            ("horizonmc", true, false, true)
+            ("myrepo", true, false, true)
         );
         assert_eq!(a.source, AccountingSource::Cgroup);
         assert_eq!(
@@ -654,7 +654,7 @@ mod tests {
             name: name.into(),
             kind: AgentKind::Claude,
             pid: 1,
-            project: "horizonmc".into(),
+            project: "myrepo".into(),
             toplevel: top.into(),
             cwd: top.into(),
             processes: 2,
@@ -671,17 +671,14 @@ mod tests {
             actionable: true,
         };
         let agents = [
-            mk("a", "/projects/horizonmc", 100),
-            mk("b", "/projects/horizonmc", 50),
-            mk("c", "/w/horizonmc", 1),
+            mk("a", "/work/myrepo", 100),
+            mk("b", "/work/myrepo", 50),
+            mk("c", "/w/myrepo", 1),
         ];
-        let jobs = BTreeMap::from([("horizonmc".to_string(), (2, 1))]);
+        let jobs = BTreeMap::from([("myrepo".to_string(), (2, 1))]);
         let p = project_views(&agents, &jobs);
         assert_eq!(p.len(), 2);
-        let main = p
-            .iter()
-            .find(|p| p.toplevel == "/projects/horizonmc")
-            .unwrap();
+        let main = p.iter().find(|p| p.toplevel == "/work/myrepo").unwrap();
         assert_eq!(
             (
                 main.agents,

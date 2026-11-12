@@ -6,11 +6,13 @@ use tempfile::TempDir;
 
 use super::*;
 
+/// Scratch dirs go under `CREW_TEST_TMP` when set (a big disk), else the system temp dir.
 pub fn tmp() -> TempDir {
-    fs::create_dir_all("/projects/.hz-tmp").unwrap();
+    let base = std::env::var_os("CREW_TEST_TMP").map_or_else(std::env::temp_dir, PathBuf::from);
+    fs::create_dir_all(&base).unwrap();
     tempfile::Builder::new()
         .prefix("crew-git-")
-        .tempdir_in("/projects/.hz-tmp")
+        .tempdir_in(base)
         .unwrap()
 }
 

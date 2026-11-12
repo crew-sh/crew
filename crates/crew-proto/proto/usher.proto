@@ -29,7 +29,7 @@ message JobRequest {
   string agent = 6;
   Limits declared = 7;
   bool needs_display = 8;
-  bool hz_desktop = 9;
+  bool desktop = 9;
   // WAYLAND_DISPLAY, WAYLAND_SOCKET and DISPLAY as the client sees them.
   map<string, string> display_env = 10;
 }

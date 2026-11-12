@@ -158,7 +158,7 @@ mod tests {
                 cpus: None,
             }),
             needs_display: true,
-            hz_desktop: false,
+            desktop: false,
             display_env: [("DISPLAY".to_string(), ":0".to_string())].into(),
         }))
     }

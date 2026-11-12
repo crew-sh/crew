@@ -60,7 +60,7 @@ pub fn build(i: &Inputs<'_>) -> JobRequest {
         agent: i.env.get("CREW_AGENT").cloned().unwrap_or_default(),
         declared,
         needs_display: i.display,
-        hz_desktop: i.env.get("HZ_DESKTOP").is_some_and(|v| v == "1"),
+        desktop: i.env.get("CREW_DESKTOP").is_some_and(|v| v == "1"),
         display_env: DISPLAY_VARS
             .iter()
             .filter_map(|k| i.env.get(*k).map(|v| ((*k).to_string(), v.clone())))
@@ -96,7 +96,7 @@ mod tests {
     fn request_carries_env_derived_fields() {
         let env: BTreeMap<String, String> = [
             ("CREW_AGENT", "a1"),
-            ("HZ_DESKTOP", "1"),
+            ("CREW_DESKTOP", "1"),
             ("DISPLAY", ":0"),
             ("HOME", "/h"),
         ]
@@ -114,7 +114,7 @@ mod tests {
             display: true,
         });
         assert_eq!(
-            (r.agent.as_str(), r.hz_desktop, r.needs_display),
+            (r.agent.as_str(), r.desktop, r.needs_display),
             ("a1", true, true)
         );
         assert_eq!(r.display_env.len(), 1);

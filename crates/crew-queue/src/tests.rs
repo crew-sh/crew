@@ -10,6 +10,16 @@ use crate::lock::FileLock;
 use crate::runner::Runner;
 use crate::{Ctx, status, submit, worktrees};
 
+/// Scratch dirs go under `CREW_TEST_TMP` when set (a big disk), else the system temp dir.
+fn tempdir(prefix: &str) -> TempDir {
+    let base = std::env::var_os("CREW_TEST_TMP").map_or_else(std::env::temp_dir, PathBuf::from);
+    fs::create_dir_all(&base).unwrap();
+    tempfile::Builder::new()
+        .prefix(prefix)
+        .tempdir_in(base)
+        .unwrap()
+}
+
 fn git(dir: &Path, args: &[&str]) -> String {
     let out = Command::new("git")
         .arg("-C")
@@ -39,11 +49,7 @@ struct Fx {
 impl Fx {
     /// A repo on `main` with files a..d, a plan of `steps` (id, deps) and `[queue]` using `queue_extra` lines.
     fn new(steps: &[(&str, &[&str])], queue_extra: &str) -> Self {
-        fs::create_dir_all("/projects/.hz-tmp").unwrap();
-        let tmp = tempfile::Builder::new()
-            .prefix("crew-queue-")
-            .tempdir_in("/projects/.hz-tmp")
-            .unwrap();
+        let tmp = tempdir("crew-queue-");
         let root = tmp.path().join("repo");
         let remote = tmp.path().join("remote.git");
         fs::create_dir(&root).unwrap();
@@ -133,8 +139,8 @@ impl Fx {
 
 #[test]
 fn a_batch_of_disjoint_branches_lands_in_one_check() {
-    let log = "/projects/.hz-tmp/crew-queue-count-batch";
-    let _ = fs::remove_file(log);
+    let scratch = tempdir("crew-queue-count-");
+    let log = scratch.path().join("batch").display().to_string();
     let fx = Fx::new(
         &[("s1", &[]), ("s2", &[]), ("s3", &[])],
         &format!("check = [\"echo x >> {log}\"]"),
@@ -144,7 +150,7 @@ fn a_batch_of_disjoint_branches_lands_in_one_check() {
     fx.built("s3", &[("c.txt", "three\n")]);
     let s = fx.run();
     assert_eq!((s.landed.len(), s.failed.len(), s.batches), (3, 0, 1));
-    assert_eq!(fs::read_to_string(log).unwrap().lines().count(), 1);
+    assert_eq!(fs::read_to_string(&log).unwrap().lines().count(), 1);
     for step in ["s1", "s2", "s3"] {
         let state = fx.ctx.ledger().unwrap().state(step).unwrap();
         assert_eq!(state.status, Status::Landed);
@@ -160,13 +166,12 @@ fn a_batch_of_disjoint_branches_lands_in_one_check() {
     for branch in ["crew/s1", "crew/s2", "crew/s3"] {
         assert!(crew_git::is_ancestor(&fx.root, branch, &tip).unwrap());
     }
-    let _ = fs::remove_file(log);
 }
 
 #[test]
 fn bisect_finds_the_culprit_and_lands_the_rest() {
-    let log = "/projects/.hz-tmp/crew-queue-count-bisect";
-    let _ = fs::remove_file(log);
+    let scratch = tempdir("crew-queue-count-");
+    let log = scratch.path().join("bisect").display().to_string();
     let check =
         format!("echo x >> {log}; test ! -e BROKEN || {{ echo 'BROKEN is present'; exit 1; }}");
     let fx = Fx::new(
@@ -192,8 +197,7 @@ fn bisect_finds_the_culprit_and_lands_the_rest() {
     assert!(!fx.integration_has("BROKEN"));
     assert!(fx.integration_has("d.txt") && fx.integration_has("a.txt"));
     // 4 -> (2) green, (2) red -> 1 green, 1 red: five checks, not one per branch plus retries
-    assert_eq!(fs::read_to_string(log).unwrap().lines().count(), 5);
-    let _ = fs::remove_file(log);
+    assert_eq!(fs::read_to_string(&log).unwrap().lines().count(), 5);
 }
 
 #[test]
@@ -344,10 +348,7 @@ fn a_refused_check_stops_the_run_and_blames_nobody() {
 
 #[test]
 fn the_check_runner_reports_red_with_the_output_tail_and_stops_at_the_first_failure() {
-    let t = tempfile::Builder::new()
-        .prefix("crew-queue-chk-")
-        .tempdir_in("/projects/.hz-tmp")
-        .unwrap();
+    let t = tempdir("crew-queue-chk-");
     let cmds: Vec<String> = vec![
         "echo first".into(),
         "seq 1 100; echo oops >&2; exit 3".into(),
@@ -485,10 +486,7 @@ fn submit_refuses_a_missing_branch_and_a_landed_step() {
 
 #[test]
 fn queue_file_round_trips_and_survives_concurrent_style_updates() {
-    let t = tempfile::Builder::new()
-        .prefix("crew-queue-store-")
-        .tempdir_in("/projects/.hz-tmp")
-        .unwrap();
+    let t = tempdir("crew-queue-store-");
     let store = crate::store::Store::new(t.path());
     store
         .update(|f| {

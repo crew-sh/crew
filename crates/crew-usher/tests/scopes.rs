@@ -1,5 +1,5 @@
 //! Real `systemd-run --user --scope` scopes around trivial commands; skipped when user scopes are unavailable.
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -8,6 +8,16 @@ use crew_proto::{JobKind, RefusalReason, WaitingOn};
 use crew_usher::config::Config;
 use crew_usher::server::{IdleSource, Paths, Server};
 use crew_usher_client::{Client, ClientError, OwnerArg, RunOptions};
+
+/// Scratch dirs go under `CREW_TEST_TMP` when set (a big disk), else the system temp dir.
+fn tempdir(prefix: &str) -> tempfile::TempDir {
+    let base = std::env::var_os("CREW_TEST_TMP").map_or_else(std::env::temp_dir, PathBuf::from);
+    std::fs::create_dir_all(&base).unwrap();
+    tempfile::Builder::new()
+        .prefix(prefix)
+        .tempdir_in(base)
+        .unwrap()
+}
 
 fn unit_name() -> String {
     let nanos = std::time::SystemTime::now()
@@ -46,11 +56,7 @@ impl Fixture {
             skip("systemd-run --user --scope is unavailable");
             return None;
         }
-        let dir = tempfile::Builder::new()
-            .prefix("crew-it-")
-            .tempdir_in("/projects/.hz-tmp")
-            .or_else(|_| tempfile::tempdir())
-            .unwrap();
+        let dir = tempdir("crew-it-");
         let mut cfg = Config {
             min_free_mem_gib: 0,
             watched_paths: vec![],

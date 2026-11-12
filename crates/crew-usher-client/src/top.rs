@@ -240,7 +240,7 @@ mod tests {
             running: vec![JobView {
                 kind: JobKind::Build as i32,
                 agent: "a1".into(),
-                project: "horizon".into(),
+                project: "myrepo".into(),
                 command: "cargo check".into(),
                 age_ms: 65_000,
                 cpu_usec: 130_000_000,
@@ -249,7 +249,7 @@ mod tests {
             }],
             queued: vec![JobView {
                 kind: JobKind::Game as i32,
-                command: "horizon-client".into(),
+                command: "my-game".into(),
                 waiting_on: WaitingOn::GameCap as i32,
                 expected_mem_bytes: 6 << 30,
                 ..Default::default()
@@ -259,7 +259,7 @@ mod tests {
                 mem_available: 40 << 30,
                 cpu_count: 24,
                 disk: vec![DiskView {
-                    path: "/projects".into(),
+                    path: "/data".into(),
                     free_bytes: 100 << 30,
                     min_free_bytes: 50 << 30,
                 }],
@@ -271,14 +271,11 @@ mod tests {
         };
         let s = render(&t);
         assert!(s.contains("RUNNING (1)") && s.contains("QUEUED (1)"), "{s}");
-        assert!(
-            s.contains("game cap") && s.contains("horizon-client"),
-            "{s}"
-        );
+        assert!(s.contains("game cap") && s.contains("my-game"), "{s}");
         assert!(s.contains("2.0/4.0"), "{s}");
         assert!(
             s.contains("40.0 of 64.0 GiB")
-                && s.contains("/projects 100.0 GiB free (min 50.0)")
+                && s.contains("/data 100.0 GiB free (min 50.0)")
                 && s.contains("present (manual)"),
             "{s}"
         );
@@ -289,7 +286,7 @@ mod tests {
         let agent = |name: &str, tty: bool, actionable: bool, source: AccountingSource| AgentView {
             name: name.into(),
             kind: AgentKind::Claude as i32,
-            project: "horizonmc".into(),
+            project: "myrepo".into(),
             processes: 7,
             cpu_milli: 2500,
             cpu_usec: 90_000_000,
@@ -309,7 +306,7 @@ mod tests {
                 agent("lead", false, false, AccountingSource::Proc),
             ],
             projects: vec![ProjectView {
-                name: "horizonmc".into(),
+                name: "myrepo".into(),
                 agents: 3,
                 processes: 21,
                 running_jobs: 2,
@@ -336,7 +333,7 @@ mod tests {
         );
         assert!(line("claude-9").ends_with("terminal"), "{s}");
         assert!(line("lead").ends_with("protected"), "{s}");
-        assert!(line("horizonmc").contains("2/1"), "{s}");
+        assert!(line("myrepo").contains("2/1"), "{s}");
     }
 
     #[test]

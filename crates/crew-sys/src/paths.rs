@@ -111,12 +111,12 @@ mod tests {
     #[test]
     fn project_is_the_git_toplevel_basename() {
         let dir = tempfile::tempdir().unwrap();
-        let top = dir.path().join("horizonmc");
+        let top = dir.path().join("myrepo");
         let deep = top.join("a/b");
         fs::create_dir_all(&deep).unwrap();
         fs::create_dir(top.join(".git")).unwrap();
         assert_eq!(repo_root(&deep), Some(top.clone()));
-        assert_eq!(project_of(&deep), "horizonmc");
+        assert_eq!(project_of(&deep), "myrepo");
         let plain = dir.path().join("plain");
         fs::create_dir(&plain).unwrap();
         assert_eq!(project_of(&plain), "plain");
@@ -125,7 +125,7 @@ mod tests {
     #[test]
     fn a_linked_worktree_belongs_to_the_repo_it_was_added_from() {
         let dir = tempfile::tempdir().unwrap();
-        let repo = fs::canonicalize(dir.path()).unwrap().join("horizonmc");
+        let repo = fs::canonicalize(dir.path()).unwrap().join("myrepo");
         fs::create_dir_all(repo.join(".git")).unwrap();
         // The layout crew-queue uses: a worktree inside the repo, and one far away.
         let inside = repo.join(".crew/wt/.integration");
@@ -134,7 +134,7 @@ mod tests {
         worktree(&repo, &outside, "feature-x", true);
         for cwd in [inside.join("crates/a"), outside.clone()] {
             fs::create_dir_all(&cwd).unwrap();
-            assert_eq!(project_of(&cwd), "horizonmc", "{}", cwd.display());
+            assert_eq!(project_of(&cwd), "myrepo", "{}", cwd.display());
             assert_eq!(repo_root(&cwd), Some(repo.clone()));
         }
     }

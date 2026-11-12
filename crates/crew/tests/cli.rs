@@ -5,6 +5,16 @@ use std::time::{Duration, Instant};
 
 const CREW: &str = env!("CARGO_BIN_EXE_crew");
 
+/// Scratch dirs go under `CREW_TEST_TMP` when set (a big disk), else the system temp dir.
+fn tempdir(prefix: &str) -> tempfile::TempDir {
+    let base = std::env::var_os("CREW_TEST_TMP").map_or_else(std::env::temp_dir, PathBuf::from);
+    std::fs::create_dir_all(&base).unwrap();
+    tempfile::Builder::new()
+        .prefix(prefix)
+        .tempdir_in(base)
+        .unwrap()
+}
+
 fn usher_binary() -> Option<PathBuf> {
     let p = Path::new(CREW).parent()?.join("crew-usher");
     p.exists().then_some(p)
@@ -56,11 +66,7 @@ impl Daemon {
             skip("systemd-run --user --scope is unavailable");
             return None;
         }
-        let dir = tempfile::Builder::new()
-            .prefix("crew-cli-")
-            .tempdir_in("/projects/.hz-tmp")
-            .or_else(|_| tempfile::tempdir())
-            .unwrap();
+        let dir = tempdir("crew-cli-");
         let socket = dir.path().join("usher.sock");
         let config = dir.path().join("config/crew");
         std::fs::create_dir_all(&config).unwrap();
@@ -508,9 +514,7 @@ fn agent_sessions_are_observed_per_project_and_never_touched() {
     ) else {
         return;
     };
-    let root = tempfile::tempdir_in("/projects/.hz-tmp")
-        .or_else(|_| tempfile::tempdir())
-        .unwrap();
+    let root = tempdir("crew-agents-");
     let (Some(busy), Some(guarded)) = (
         fake_agent(root.path(), "fake-busy"),
         fake_agent(root.path(), "fake-protected"),
@@ -559,4 +563,64 @@ fn agent_sessions_are_observed_per_project_and_never_touched() {
         "{state}"
     );
     drop(guarded);
+}
+
+#[test]
+fn crew_toml_usher_kinds_classify_what_crew_run_launches() {
+    let Some(d) = Daemon::start() else { return };
+    assert!(d.crew(&["owner", "away"]).status.success());
+    let repo = tempdir("crew-kinds-");
+    std::fs::write(
+        repo.path().join("crew.toml"),
+        "[plan]\nfile = \"plan.toml\"\n[usher.kinds]\nbench = [\"sleep 2\"]\n",
+    )
+    .unwrap();
+    let mut child = Command::new(CREW)
+        .args(["run", "--", "sleep", "2"])
+        .current_dir(repo.path())
+        .env("CREW_SOCKET", &d.socket)
+        .env_remove("CREW_JOB")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let running = until("the sleep to run", || top_json(&d).running.pop());
+    assert_eq!(running.kind, "bench");
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[test]
+fn a_bad_usher_table_stops_crew_run_but_an_explicit_kind_skips_the_file() {
+    let repo = tempdir("crew-badkinds-");
+    std::fs::write(repo.path().join("crew.toml"), "[usher]\nnope = 1\n").unwrap();
+    let socket = repo.path().join("none.sock");
+    let run = |args: &[&str]| {
+        Command::new(CREW)
+            .args(args)
+            .current_dir(repo.path())
+            .env("CREW_SOCKET", &socket)
+            .env_remove("CREW_STRICT")
+            .env_remove("CREW_JOB")
+            .output()
+            .unwrap()
+    };
+    let o = run(&["run", "--", "true"]);
+    assert_eq!(o.status.code(), Some(125), "{}", stderr(&o));
+    assert!(
+        stderr(&o).contains("crew.toml") && stderr(&o).contains("nope"),
+        "{}",
+        stderr(&o)
+    );
+    let o = run(&["run", "--json", "--", "true"]);
+    assert!(
+        stderr(&o).contains(r#""kind":"project_config""#),
+        "{}",
+        stderr(&o)
+    );
+    assert!(
+        run(&["run", "--kind", "other", "--", "true"])
+            .status
+            .success()
+    );
 }

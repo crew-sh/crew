@@ -476,7 +476,7 @@ impl Daemon {
             ..base_limits
         };
 
-        let desktop = if job.req.hz_desktop && job.kind != JobKind::Bench {
+        let desktop = if job.req.desktop && job.kind != JobKind::Bench {
             Desktop::Allowed
         } else {
             Desktop::Denied

@@ -52,12 +52,8 @@ fn cargo_detail(args: &[String]) -> String {
 pub fn key(req: &JobRequest) -> String {
     let kind = JobKind::try_from(req.kind).unwrap_or(JobKind::Other);
     let mut argv = req.argv.iter().map(String::as_str);
-    let mut program = argv.next().map_or("", base);
-    let mut rest: Vec<String> = argv.map(str::to_string).collect();
-    if program == "hz" && rest.first().is_some_and(|a| a == "cargo") {
-        program = "cargo";
-        rest.remove(0);
-    }
+    let program = argv.next().map_or("", base);
+    let rest: Vec<String> = argv.map(str::to_string).collect();
     let detail = if program == "cargo" {
         cargo_detail(&rest)
     } else {
@@ -138,7 +134,7 @@ mod tests {
     fn req(argv: &[&str]) -> JobRequest {
         JobRequest {
             kind: JobKind::Build as i32,
-            project: "horizon".into(),
+            project: "myrepo".into(),
             argv: argv.iter().map(|s| (*s).to_string()).collect(),
             ..Default::default()
         }
@@ -159,21 +155,21 @@ mod tests {
             "warnings",
         ]));
         let b = key(&req(&[
-            "/home/x/.cargo/bin/cargo",
+            "/usr/local/bin/cargo",
             "+nightly",
             "clippy",
             "--package=a",
             "-pb",
         ]));
-        assert_eq!(a, "horizon|build|cargo clippy -p a,b dev");
+        assert_eq!(a, "myrepo|build|cargo clippy -p a,b dev");
         assert_eq!(a, b);
         assert_eq!(
-            key(&req(&["hz", "cargo", "build", "--release"])),
-            "horizon|build|cargo build -p  release"
+            key(&req(&["cargo", "build", "--release"])),
+            "myrepo|build|cargo build -p  release"
         );
         assert_eq!(
             key(&req(&["cargo", "build", "--profile", "fast"])),
-            "horizon|build|cargo build -p  fast"
+            "myrepo|build|cargo build -p  fast"
         );
     }
 
@@ -182,13 +178,13 @@ mod tests {
         assert_eq!(
             key(&req(&[
                 "/usr/bin/python3",
-                "tools/parity.py",
-                "mob_ai",
-                "sculk"
+                "tools/check.py",
+                "unit_a",
+                "unit_b"
             ])),
-            "horizon|build|python3 tools/parity.py"
+            "myrepo|build|python3 tools/check.py"
         );
-        assert_eq!(key(&req(&["true"])), "horizon|build|true");
+        assert_eq!(key(&req(&["true"])), "myrepo|build|true");
     }
 
     #[test]
