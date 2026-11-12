@@ -203,3 +203,34 @@ fn salvage_of_a_clean_worktree_is_empty() {
     let s = salvage(&w, &t.path().join("out"), &["main".to_owned()]).unwrap();
     assert!(s.is_empty());
 }
+
+#[test]
+fn update_ref_is_compare_and_swap_and_checked_out_at_finds_the_holder() {
+    let (t, r) = repo();
+    let w = t.path().join("wt");
+    worktree_add(&r, &w, "feat", "main").unwrap();
+    commit_file(&w, "b.txt", "b\n");
+    let (old, new) = (
+        sh(&r, &["rev-parse", "main"]),
+        sh(&r, &["rev-parse", "feat"]),
+    );
+    assert!(update_ref(&r, "refs/heads/main", &new, &"0".repeat(40)).is_err());
+    update_ref(&r, "refs/heads/main", &new, &old).unwrap();
+    assert_eq!(sh(&r, &["rev-parse", "main"]), new);
+    assert_eq!(checked_out_at(&r, "feat").unwrap(), Some(w));
+    assert_eq!(checked_out_at(&r, "nope").unwrap(), None);
+}
+
+#[test]
+fn clean_untracked_keeps_ignored_files_and_refuses_main() {
+    let (t, r) = repo();
+    let d = t.path().join("det");
+    worktree_add_detached(&r, &d, "main").unwrap();
+    fs::write(d.join(".gitignore"), "target/\n").unwrap();
+    fs::create_dir(d.join("target")).unwrap();
+    fs::write(d.join("target/x"), "1").unwrap();
+    fs::write(d.join("stray"), "1").unwrap();
+    clean_untracked(&d).unwrap();
+    assert!(!d.join("stray").exists() && d.join("target/x").exists());
+    assert!(clean_untracked(&r).is_err());
+}

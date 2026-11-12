@@ -6,9 +6,9 @@ mod worktree;
 
 pub use run::{Error, Result};
 pub use salvage::{Salvaged, salvage};
-pub use worktree::{Worktree, worktree_add, worktree_list, worktree_remove};
+pub use worktree::{Worktree, worktree_add, worktree_add_detached, worktree_list, worktree_remove};
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use run::{OutputExt, git, git_out};
 
@@ -111,6 +111,56 @@ pub fn reset_hard(worktree: &Path, rev: &str) -> Result<()> {
 /// True when `worktree` has tracked changes, untracked files, or an unfinished merge.
 pub fn is_dirty(worktree: &Path) -> Result<bool> {
     Ok(!git(worktree, &["status", "--porcelain"])?.is_empty())
+}
+
+/// Remove untracked files (not ignored ones) from a linked worktree; refuses the main worktree.
+pub fn clean_untracked(worktree: &Path) -> Result<()> {
+    refuse_main(worktree)?;
+    git(worktree, &["clean", "-fdq"]).map(|_| ())
+}
+
+/// Move `refname` to `new` only if it still points at `old` (empty `old` = must not exist yet).
+pub fn update_ref(repo: &Path, refname: &str, new: &str, old: &str) -> Result<()> {
+    git(repo, &["update-ref", refname, new, old]).map(|_| ())
+}
+
+/// Push `local` to `remote_branch` on `remote`.
+pub fn push(repo: &Path, remote: &str, local: &str, remote_branch: &str) -> Result<()> {
+    git(
+        repo,
+        &[
+            "push",
+            remote,
+            &format!("{local}:refs/heads/{remote_branch}"),
+        ],
+    )
+    .map(|_| ())
+}
+
+/// The worktree (if any) that has `branch` checked out.
+pub fn checked_out_at(repo: &Path, branch: &str) -> Result<Option<PathBuf>> {
+    Ok(worktree_list(repo)?
+        .into_iter()
+        .find(|w| w.branch.as_deref() == Some(branch))
+        .map(|w| w.path))
+}
+
+fn refuse_main(worktree: &Path) -> Result<()> {
+    let git_dir = git(
+        worktree,
+        &["rev-parse", "--path-format=absolute", "--git-dir"],
+    )?;
+    let common = git(
+        worktree,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )?;
+    if git_dir == common {
+        return Err(Error::Refused(format!(
+            "{} is the main worktree",
+            worktree.display()
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -57,6 +57,18 @@ pub fn worktree_add(repo: &Path, path: &Path, branch: &str, base: &str) -> Resul
     Ok(())
 }
 
+/// Add a detached worktree at `rev` (for callers that move a ref themselves).
+pub fn worktree_add_detached(repo: &Path, path: &Path, rev: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    git(
+        repo,
+        &["worktree", "add", "--detach", &path.to_string_lossy(), rev],
+    )
+    .map(|_| ())
+}
+
 /// Remove a registered worktree; dirty or locked ones need `force` (the double force git requires for locked).
 pub fn worktree_remove(repo: &Path, path: &Path, force: bool) -> Result<()> {
     let registered = worktree_list(repo)?.into_iter().find(|w| w.path == path);
