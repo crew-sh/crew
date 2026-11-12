@@ -17,6 +17,7 @@ use crew_sys::idle;
 
 use crate::config::Config;
 use crate::daemon::{Conn, Daemon, Msg, StatePaths};
+use crate::idle_watch::{self, Backoff};
 use crate::log::Log;
 
 #[derive(Debug, thiserror::Error)]
@@ -65,10 +66,19 @@ impl Paths {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Starts one idle subscription that feeds the sender; tests pass their own.
+pub type Subscribe =
+    Arc<dyn Fn(Sender<idle::IdleEvent>) -> Result<(), idle::IdleError> + Send + Sync>;
+
+#[derive(Clone)]
 pub enum IdleSource {
     Wayland,
     Off,
+    /// A stand-in compositor, retried on `backoff`.
+    Custom {
+        subscribe: Subscribe,
+        backoff: Backoff,
+    },
 }
 
 /// Open client connections, so `stop` can close them the way a dying process would.
@@ -201,27 +211,8 @@ impl Server {
         let log = Arc::new(Log::open(&paths.log, echo_log));
         let (tx, rx) = mpsc::channel();
 
-        if idle_source == IdleSource::Wayland {
-            let (itx, irx) = mpsc::channel();
-            match idle::spawn(Duration::from_secs(cfg.idle_timeout_secs), itx) {
-                Ok(()) => {
-                    log.line("IDLE watching the compositor");
-                    let tx = tx.clone();
-                    thread::spawn(move || {
-                        while let Ok(ev) = irx.recv() {
-                            if tx.send(Msg::Idle(ev)).is_err() {
-                                return;
-                            }
-                        }
-                    });
-                }
-                Err(e) => log.line(&format!(
-                    "IDLE unavailable ({e}); use `crew owner here|away`"
-                )),
-            }
-        }
-
-        let daemon = Daemon::new(
+        let idle_timeout = Duration::from_secs(cfg.idle_timeout_secs);
+        let mut daemon = Daemon::new(
             cfg,
             StatePaths {
                 sizes: paths.sizes.clone(),
@@ -231,6 +222,27 @@ impl Server {
             log.clone(),
             tx.clone(),
         );
+        let subscribe: Option<(Subscribe, Backoff)> = match idle_source {
+            IdleSource::Off => None,
+            IdleSource::Wayland => Some((
+                Arc::new(move |events| idle::spawn(idle_timeout, events)),
+                Backoff::DEFAULT,
+            )),
+            IdleSource::Custom { subscribe, backoff } => Some((subscribe, backoff)),
+        };
+        if let Some((subscribe, backoff)) = subscribe {
+            daemon = daemon.expecting_idle_watcher();
+            idle_watch::supervise(
+                move |events| subscribe(events),
+                tx.clone(),
+                log.clone(),
+                backoff,
+            )
+            .map_err(|source| ServerError::Socket {
+                path: "idle watcher thread".into(),
+                source,
+            })?;
+        }
         let actor = thread::Builder::new()
             .name("usher".into())
             .spawn(move || daemon.run(&rx))

@@ -11,14 +11,15 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crew_proto::{
-    Ack, Decision, DetachedAccepted, DetachedJob, DiskView, Envelope, Grant, JobDone, JobKind,
-    JobPhase, JobRequest, JobSummary, JobView, JobsReply, Limits, MachineView, OwnerSet,
+    Ack, Decision, DetachedAccepted, DetachedJob, DiskView, Envelope, Grant, IdleWatcher, JobDone,
+    JobKind, JobPhase, JobRequest, JobSummary, JobView, JobsReply, Limits, MachineView, OwnerSet,
     OwnerSource, Queued, Refusal, RefusalReason, Reply, TopReply, WaitCondition, WaitOutcome,
     WaitReply, WaitRequest, WaitingOn, envelope, reply,
 };
 use crew_sys::display::{self, Desktop};
 use crew_sys::idle::IdleEvent;
 use crew_sys::machine;
+use crew_sys::procs;
 use crew_sys::scope::{self, KillSignal, ScopeLimits};
 
 use crate::admission::{self, Facts, Running, Verdict, Waiting};
@@ -42,21 +43,40 @@ const SCOPE_START_GRACE_MS: u64 = 10_000;
 const CANCEL_GRACE_MS: u64 = 10_000;
 
 #[derive(Clone)]
-pub struct Conn(Arc<Mutex<UnixStream>>);
+pub struct Conn {
+    stream: Arc<Mutex<UnixStream>>,
+    /// The client process, as the kernel saw it connect.
+    pid: Option<u32>,
+}
 
 impl Conn {
     pub fn new(stream: UnixStream) -> io::Result<Self> {
         stream.set_write_timeout(Some(Duration::from_secs(2)))?;
-        Ok(Self(Arc::new(Mutex::new(stream))))
+        let pid = procs::peer_pid(&stream);
+        Ok(Self {
+            stream: Arc::new(Mutex::new(stream)),
+            pid,
+        })
     }
 
     pub fn same(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.0, &other.0)
+        Arc::ptr_eq(&self.stream, &other.stream)
+    }
+
+    /// `pid (command)` of the client, for log lines.
+    fn who(&self) -> String {
+        match self.pid {
+            Some(pid) => match procs::read_comm(Path::new("/proc"), pid) {
+                Some(comm) => format!("pid {pid} ({comm})"),
+                None => format!("pid {pid}"),
+            },
+            None => "an unknown process".to_string(),
+        }
     }
 
     fn send(&self, body: envelope::Body) {
         let mut s = self
-            .0
+            .stream
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _ = crew_proto::write_frame(&mut *s, &Envelope::of(body));
@@ -103,7 +123,19 @@ pub enum Msg {
         conn: Conn,
     },
     Idle(IdleEvent),
+    /// The idle watcher's subscription changed state.
+    IdleWatcher(WatcherEvent),
     Stop,
+}
+
+/// What the idle watcher supervisor tells the actor.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WatcherEvent {
+    Watching,
+    /// The compositor subscription ended after it had worked.
+    Lost(String),
+    /// A subscription could not be made.
+    Unavailable(String),
 }
 
 /// Who owns a job: a `crew run` client on a connection, or the usher itself.
@@ -173,15 +205,33 @@ struct PendingWait {
     deadline_ms: Option<u64>,
 }
 
-#[derive(Default)]
+/// A `crew owner here|away` override and when it was set.
+#[derive(Clone, Copy)]
+struct Manual {
+    present: bool,
+    since_ms: u64,
+}
+
 struct Owner {
-    manual: Option<bool>,
+    manual: Option<Manual>,
     idle: Option<bool>,
+    watcher: IdleWatcher,
+}
+
+impl Default for Owner {
+    fn default() -> Self {
+        Self {
+            manual: None,
+            idle: None,
+            watcher: IdleWatcher::NotConfigured,
+        }
+    }
 }
 
 impl Owner {
+    /// Presence is the safe answer: without an override or an idle event, the owner is here.
     fn present(&self) -> bool {
-        self.manual.or(self.idle).unwrap_or(true)
+        self.manual.map(|m| m.present).or(self.idle).unwrap_or(true)
     }
 
     fn source(&self) -> OwnerSource {
@@ -310,6 +360,13 @@ fn nonzero(v: u32, fallback: u32) -> u32 {
 }
 
 impl Daemon {
+    /// Marks idle detection as configured but not yet connected; the supervisor reports the rest.
+    #[must_use]
+    pub fn expecting_idle_watcher(mut self) -> Self {
+        self.owner.watcher = IdleWatcher::Unavailable;
+        self
+    }
+
     pub fn new(cfg: Config, paths: StatePaths, log: Arc<Log>, events: Sender<Msg>) -> Self {
         let sizes = Sizes::load(&paths.sizes);
         let sizes_path = paths.sizes;
@@ -410,9 +467,32 @@ impl Daemon {
                 conn.send(envelope::Body::TopReply(reply));
             }
             Msg::Owner { set, conn } => {
+                let now = self.now_ms();
                 match OwnerSource::try_from(set.source) {
-                    Ok(OwnerSource::Auto) => self.set_owner(|o| o.manual = None),
-                    _ => self.set_owner(|o| o.manual = Some(set.present)),
+                    Ok(OwnerSource::Auto) => {
+                        self.log
+                            .line(&format!("OWNER auto requested by {}", conn.who()));
+                        self.set_owner(|o| o.manual = None);
+                    }
+                    Ok(OwnerSource::Manual) => {
+                        self.log.line(&format!(
+                            "OWNER {} requested by {}",
+                            if set.present { "here" } else { "away" },
+                            conn.who()
+                        ));
+                        self.set_owner(|o| {
+                            o.manual = Some(Manual {
+                                present: set.present,
+                                since_ms: now,
+                            });
+                        });
+                    }
+                    _ => {
+                        return Self::reject(
+                            &conn,
+                            "unknown owner source; use here, away or auto".into(),
+                        );
+                    }
                 }
                 let msg = format!(
                     "owner {} ({})",
@@ -430,20 +510,80 @@ impl Daemon {
             }
             Msg::Wait { req, conn } => self.begin_wait(&req, conn),
             Msg::Hangup { conn } => self.waits.retain(|w| !w.conn.same(&conn)),
-            Msg::Idle(ev) => self.set_owner(|o| o.idle = Some(ev == IdleEvent::Resumed)),
+            Msg::Idle(IdleEvent::Lost) => {
+                self.watcher_event(WatcherEvent::Lost("the compositor connection ended".into()))
+            }
+            Msg::Idle(ev) => self.set_owner(|o| {
+                o.idle = Some(ev == IdleEvent::Resumed);
+                // Input after a manual `away` means the owner is back.
+                if ev == IdleEvent::Resumed && o.manual.is_some_and(|m| !m.present) {
+                    o.manual = None;
+                }
+            }),
+            Msg::IdleWatcher(ev) => self.watcher_event(ev),
             Msg::Stop => {}
         }
     }
 
+    /// A dead or missing watcher cannot say the owner left, so the owner counts as present until it reports again.
+    fn watcher_event(&mut self, ev: WatcherEvent) {
+        let (state, note) = match ev {
+            WatcherEvent::Watching => {
+                (IdleWatcher::Watching, "watching the compositor".to_string())
+            }
+            WatcherEvent::Lost(why) => (
+                IdleWatcher::Lost,
+                format!("lost ({why}); the owner counts as present until an idle event arrives"),
+            ),
+            WatcherEvent::Unavailable(why) => {
+                (IdleWatcher::Unavailable, format!("unavailable ({why})"))
+            }
+        };
+        let changed = self.owner.watcher != state;
+        if changed {
+            self.log.line(&format!("IDLE {note}"));
+        }
+        self.set_owner_quiet(|o| {
+            o.watcher = state;
+            if state != IdleWatcher::Watching {
+                o.idle = None;
+            }
+        });
+    }
+
+    /// Drops a manual `away` that has outlived `manual_away_max_secs`.
+    fn expire_manual_away(&mut self) {
+        let now = self.now_ms();
+        let max_ms = self.cfg.manual_away_max_secs.saturating_mul(1000);
+        if self
+            .owner
+            .manual
+            .is_some_and(|m| !m.present && now.saturating_sub(m.since_ms) >= max_ms)
+        {
+            self.log.line("OWNER manual away expired");
+            self.set_owner(|o| o.manual = None);
+        }
+    }
+
     fn set_owner(&mut self, change: impl FnOnce(&mut Owner)) {
-        let before = self.owner.present();
+        self.set_owner_with(change, true);
+    }
+
+    fn set_owner_quiet(&mut self, change: impl FnOnce(&mut Owner)) {
+        self.set_owner_with(change, false);
+    }
+
+    fn set_owner_with(&mut self, change: impl FnOnce(&mut Owner), always_log: bool) {
+        let before = (self.owner.present(), self.owner.source());
         change(&mut self.owner);
         let now = self.owner.present();
-        self.log.line(&format!(
-            "OWNER present={now} source={}",
-            source_name(self.owner.source())
-        ));
-        if before != now {
+        if always_log || before != (now, self.owner.source()) {
+            self.log.line(&format!(
+                "OWNER present={now} source={}",
+                source_name(self.owner.source())
+            ));
+        }
+        if before.0 != now {
             self.apply_weights(now);
             self.sync_pool();
         }
@@ -946,6 +1086,7 @@ impl Daemon {
             self.log.line(&line);
         }
         self.update_load();
+        self.expire_manual_away();
         self.watch_detached();
         self.reschedule();
         self.adopt_dry_run();
@@ -1192,6 +1333,7 @@ impl Daemon {
                 disk,
                 owner_present: self.owner.present(),
                 owner_source: self.owner.source() as i32,
+                idle_watcher: self.owner.watcher as i32,
                 unmanaged_cpu_pct: self.load.unmanaged_cores / f64::from(snap.cpu_count.max(1))
                     * 100.0,
             }),

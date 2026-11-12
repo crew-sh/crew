@@ -1,8 +1,8 @@
 //! Typed JSON for every client-visible record: mirrors of the socket messages, enums as snake_case names.
 use crew_proto::{
-    AccountingSource, AgentKind, AgentView, DiskView, JobKind, JobPhase, JobSummary, JobView,
-    JobsReply, MachineView, OwnerSource, ProjectView, RefusalReason, TopReply, WaitCondition,
-    WaitOutcome, WaitReply, WaitingOn,
+    AccountingSource, AgentKind, AgentView, DiskView, IdleWatcher, JobKind, JobPhase, JobSummary,
+    JobView, JobsReply, MachineView, OwnerSource, ProjectView, RefusalReason, TopReply,
+    WaitCondition, WaitOutcome, WaitReply, WaitingOn,
 };
 use serde::Serialize;
 
@@ -54,6 +54,16 @@ mirror!(
             WaylandIdle,
             Auto,
             Default
+        }
+);
+mirror!(
+    Watcher
+        <= IdleWatcher {
+            Unspecified,
+            NotConfigured,
+            Watching,
+            Lost,
+            Unavailable
         }
 );
 mirror!(
@@ -180,6 +190,7 @@ pub struct Machine {
     pub disk: Vec<Disk>,
     pub owner_present: bool,
     pub owner_source: Owner,
+    pub idle_watcher: Watcher,
     pub unmanaged_cpu_pct: f64,
 }
 
@@ -196,6 +207,7 @@ impl From<&MachineView> for Machine {
             disk: m.disk.iter().map(Disk::from).collect(),
             owner_present: m.owner_present,
             owner_source: m.owner_source.into(),
+            idle_watcher: m.idle_watcher.into(),
             unmanaged_cpu_pct: m.unmanaged_cpu_pct,
         }
     }

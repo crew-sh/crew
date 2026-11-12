@@ -1,8 +1,8 @@
 use std::fmt::Write;
 
 use crew_proto::{
-    AccountingSource, AgentKind, AgentView, JobKind, JobView, MachineView, OwnerSource,
-    ProjectView, TopReply, WaitingOn,
+    AccountingSource, AgentKind, AgentView, IdleWatcher, JobKind, JobView, MachineView,
+    OwnerSource, ProjectView, TopReply, WaitingOn,
 };
 
 const GIB: f64 = (1u64 << 30) as f64;
@@ -69,7 +69,13 @@ fn machine_lines(m: &MachineView, out: &mut String) {
             gib(d.min_free_bytes)
         );
     }
-    let _ = writeln!(out, "owner    {owner} ({source})");
+    let watcher = match IdleWatcher::try_from(m.idle_watcher).unwrap_or(IdleWatcher::Unspecified) {
+        IdleWatcher::Watching | IdleWatcher::Unspecified => "",
+        IdleWatcher::NotConfigured => "; idle detection is off",
+        IdleWatcher::Lost => "; idle watcher lost, retrying",
+        IdleWatcher::Unavailable => "; idle watcher unavailable, retrying",
+    };
+    let _ = writeln!(out, "owner    {owner} ({source}{watcher})");
 }
 
 fn running_row(v: &JobView) -> String {
@@ -279,6 +285,25 @@ mod tests {
                 && s.contains("present (manual)"),
             "{s}"
         );
+    }
+
+    #[test]
+    fn a_lost_idle_watcher_shows_next_to_the_owner() {
+        let machine = |w: IdleWatcher| MachineView {
+            owner_present: true,
+            owner_source: OwnerSource::Default as i32,
+            idle_watcher: w as i32,
+            ..Default::default()
+        };
+        let render_with = |w| {
+            render(&TopReply {
+                machine: Some(machine(w)),
+                ..Default::default()
+            })
+        };
+        assert!(render_with(IdleWatcher::Lost).contains("idle watcher lost, retrying"));
+        assert!(render_with(IdleWatcher::Unavailable).contains("idle watcher unavailable"));
+        assert!(!render_with(IdleWatcher::Watching).contains("watcher"));
     }
 
     #[test]

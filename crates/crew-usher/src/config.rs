@@ -138,6 +138,8 @@ pub struct Config {
     pub tmp_root: String,
     pub idle_timeout_secs: u64,
     pub starve_after_secs: u64,
+    /// A manual `crew owner away` ends after this long, so a forgotten one cannot admit benches forever.
+    pub manual_away_max_secs: u64,
     pub kinds: Kinds,
     pub adopt: Adopt,
     /// From depot.toml, not usher.toml: the main program loads it beside this file.
@@ -157,6 +159,7 @@ impl Default for Config {
             tmp_root: default_tmp_root(),
             idle_timeout_secs: 120,
             starve_after_secs: 600,
+            manual_away_max_secs: 8 * 3600,
             kinds: Kinds::default(),
             adopt: Adopt::default(),
             depot: Depot::default(),

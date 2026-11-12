@@ -117,6 +117,38 @@ pub fn read_env_var(root: &Path, pid: u32, name: &str) -> Option<String> {
     parse_env_var(&fs::read(proc_file(root, pid, "environ")).ok()?, name)
 }
 
+/// The process on the other end of a Unix socket, as the kernel recorded it when the peer connected.
+pub fn peer_pid(stream: &std::os::unix::net::UnixStream) -> Option<u32> {
+    use std::os::fd::AsRawFd;
+    let mut cred = libc::ucred {
+        pid: 0,
+        uid: 0,
+        gid: 0,
+    };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: `cred` and `len` are valid for the call, and the descriptor is open as long as `stream` is borrowed.
+    let rc = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&raw mut cred).cast(),
+            &raw mut len,
+        )
+    };
+    (rc == 0 && cred.pid > 0).then_some(cred.pid.cast_unsigned())
+}
+
+/// The command name of a process (`/proc/<pid>/comm`).
+pub fn read_comm(root: &Path, pid: u32) -> Option<String> {
+    Some(
+        fs::read_to_string(proc_file(root, pid, "comm"))
+            .ok()?
+            .trim()
+            .to_string(),
+    )
+}
+
 /// Pids listed directly in the cgroup directory, `None` when it is gone.
 pub fn cgroup_pids(dir: &Path) -> Option<Vec<u32>> {
     let text = fs::read_to_string(dir.join("cgroup.procs")).ok()?;

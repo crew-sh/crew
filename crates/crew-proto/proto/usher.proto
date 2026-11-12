@@ -181,6 +181,19 @@ message MachineView {
   bool owner_present = 9;
   OwnerSource owner_source = 10;
   double unmanaged_cpu_pct = 11;
+  IdleWatcher idle_watcher = 12;
+}
+
+// How the usher's idle detection is doing; anything but WATCHING means the owner counts as present.
+enum IdleWatcher {
+  IDLE_WATCHER_UNSPECIFIED = 0;
+  // The usher runs without idle detection (`crew owner here|away` only).
+  IDLE_WATCHER_NOT_CONFIGURED = 1;
+  IDLE_WATCHER_WATCHING = 2;
+  // The subscription ended; the usher is retrying with backoff.
+  IDLE_WATCHER_LOST = 3;
+  // No subscription was ever made (no compositor, or it lacks the protocol); the usher keeps retrying.
+  IDLE_WATCHER_UNAVAILABLE = 4;
 }
 
 enum AgentKind {
