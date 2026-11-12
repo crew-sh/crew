@@ -234,3 +234,18 @@ fn clean_untracked_keeps_ignored_files_and_refuses_main() {
     assert!(!d.join("stray").exists() && d.join("target/x").exists());
     assert!(clean_untracked(&r).is_err());
 }
+
+#[test]
+fn salvage_with_no_integration_ref_keeps_every_unpushed_commit() {
+    let (t, r) = repo();
+    let w = t.path().join("wt");
+    worktree_add(&r, &w, "feat", "main").unwrap();
+    commit_file(&w, "kept.txt", "committed\n");
+    let s = salvage(
+        &w,
+        &t.path().join("out"),
+        &["refs/heads/missing".to_owned()],
+    )
+    .unwrap();
+    assert_eq!(s.patches.len(), 2);
+}

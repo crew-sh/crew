@@ -62,7 +62,7 @@ pub fn salvage(worktree: &Path, dest: &Path, keep_refs: &[String]) -> Result<Sal
         out.untracked = Some(p);
     }
 
-    let mut args: Vec<String> = ["format-patch", "-o"].map(str::to_owned).into();
+    let mut args: Vec<String> = ["format-patch", "--root", "-o"].map(str::to_owned).into();
     let patch_dir = dest.join("patches");
     args.push(patch_dir.to_string_lossy().into_owned());
     args.push("HEAD".into());

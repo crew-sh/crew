@@ -90,10 +90,17 @@ dependencies = [
 name = "crew-queue"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "crew-git",
  "crew-ledger",
  "crew-proto",
  "crew-usher-client",
+ "libc",
+ "prost",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "toml",
 ]
 
 [[package]]
@@ -101,6 +108,7 @@ name = "crew-sys"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "tempfile",
  "thiserror",
  "wayland-client",
  "wayland-protocols",
@@ -127,6 +135,8 @@ version = "0.1.0"
 dependencies = [
  "crew-proto",
  "crew-sys",
+ "serde",
+ "serde_json",
  "tempfile",
  "thiserror",
 ]
