@@ -144,6 +144,8 @@ pub struct Config {
     pub manual_away_max_secs: u64,
     /// Runs shorter than this, and runs that failed, teach the usher nothing about a command's size.
     pub learn_min_wall_secs: u64,
+    /// Open client connections beyond this are turned away; every queued client and waiter holds one.
+    pub max_connections: usize,
     pub kinds: Kinds,
     pub adopt: Adopt,
     /// From depot.toml, not usher.toml: the main program loads it beside this file.
@@ -165,6 +167,7 @@ impl Default for Config {
             starve_after_secs: 600,
             manual_away_max_secs: 8 * 3600,
             learn_min_wall_secs: 5,
+            max_connections: 512,
             kinds: Kinds::default(),
             adopt: Adopt::default(),
             depot: Depot::default(),

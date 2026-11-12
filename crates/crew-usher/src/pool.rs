@@ -2,6 +2,9 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::mpsc::{self, Receiver};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use crew_depot_config::Depot;
 use crew_proto::{BuildGrant, BuildPriority, JobKind, PoolReserve};
@@ -10,7 +13,56 @@ use crate::config::Config;
 
 const MIB_PER_GIB: u64 = 1024;
 
+/// A failed hold is tried again after this long.
+const RETRY_AFTER: Duration = Duration::from_secs(5 * 60);
+/// Most of a failing reserve's stderr that is kept for the log.
+const STDERR_KEEP: usize = 4096;
+/// How long to wait for a finished reserve's stderr to drain before logging what arrived.
+const STDERR_GRACE: Duration = Duration::from_millis(250);
+
+/// A child's stderr collected on its own thread, so a grandchild holding the pipe cannot block the usher.
+struct Stderr {
+    text: Arc<Mutex<Vec<u8>>>,
+    eof: Receiver<()>,
+}
+
+impl Stderr {
+    fn collect(mut pipe: impl Read + Send + 'static) -> Self {
+        let text = Arc::new(Mutex::new(Vec::new()));
+        let (done, eof) = mpsc::channel();
+        let sink = Arc::clone(&text);
+        std::thread::spawn(move || {
+            let mut chunk = [0u8; 1024];
+            while let Ok(n @ 1..) = pipe.read(&mut chunk) {
+                let mut kept = sink
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let room = STDERR_KEEP.saturating_sub(kept.len());
+                kept.extend_from_slice(&chunk[..n.min(room)]);
+            }
+            let _ = done.send(());
+        });
+        Self { text, eof }
+    }
+
+    /// What arrived so far, after giving the pipe a moment to reach EOF.
+    fn first_line(&self) -> String {
+        let _ = self.eof.recv_timeout(STDERR_GRACE);
+        let kept = self
+            .text
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        String::from_utf8_lossy(&kept)
+            .trim()
+            .lines()
+            .next()
+            .unwrap_or("no output")
+            .to_string()
+    }
+}
+
 struct Held {
+    stderr: Stderr,
     child: Child,
     // Closing this ends the reservation's `cat`, which releases the capacity; it also closes if the usher dies.
     _release: Option<ChildStdin>,
@@ -20,8 +72,10 @@ struct Held {
 pub struct PoolHold {
     held: Option<Held>,
     releasing: Vec<Child>,
-    /// A failed start is not retried until the owner's presence changes.
-    failed: bool,
+    /// When a failed start may be tried again; a change of presence clears it.
+    failed_at: Option<Instant>,
+    /// Said once: mbx cannot be found.
+    warned_missing: bool,
 }
 
 /// The `mbx reserve` command line that holds `cpus` cores and `memory_mib` MiB until stdin closes.
@@ -45,19 +99,23 @@ impl PoolHold {
         let want = depot.mbx_reserve && owner_present;
         let mut log = Vec::new();
         if !want {
-            self.failed = false;
+            self.failed_at = None;
+            self.warned_missing = false;
             if let Some(h) = self.held.take() {
                 self.releasing.push(h.child);
                 log.push("POOL released".to_string());
             }
             return log;
         }
-        if self.held.is_some() || self.failed {
+        if self.held.is_some() || self.failed_at.is_some_and(|t| t.elapsed() < RETRY_AFTER) {
             return log;
         }
         let Some(mbx) = mbx else {
-            self.failed = true;
-            log.push("WARN depot.mbx_reserve is on but mbx was not found".to_string());
+            self.failed_at = Some(Instant::now());
+            if !self.warned_missing {
+                self.warned_missing = true;
+                log.push("WARN depot.mbx_reserve is on but mbx was not found".to_string());
+            }
             return log;
         };
         let mut cmd = reserve_command(
@@ -71,7 +129,12 @@ impl PoolHold {
         match cmd.spawn() {
             Ok(mut child) => {
                 let release = child.stdin.take();
+                let stderr = child
+                    .stderr
+                    .take()
+                    .map_or_else(|| Stderr::collect(std::io::empty()), Stderr::collect);
                 self.held = Some(Held {
+                    stderr,
                     child,
                     _release: release,
                 });
@@ -81,7 +144,7 @@ impl PoolHold {
                 ));
             }
             Err(e) => {
-                self.failed = true;
+                self.failed_at = Some(Instant::now());
                 log.push(format!("WARN cannot start {}: {e}", mbx.display()));
             }
         }
@@ -98,15 +161,12 @@ impl PoolHold {
             .as_mut()
             .and_then(|h| h.child.try_wait().ok().flatten());
         if let Some(status) = ended {
-            let mut held = self.held.take().expect("held checked above");
-            let mut why = String::new();
-            if let Some(mut e) = held.child.stderr.take() {
-                let _ = e.read_to_string(&mut why);
-            }
-            self.failed = true;
+            let held = self.held.take().expect("held checked above");
+            self.failed_at = Some(Instant::now());
             log.push(format!(
-                "WARN mbx reserve ended ({status}): {}",
-                why.trim().lines().next().unwrap_or("no output")
+                "WARN mbx reserve ended ({status}); retrying in {}m: {}",
+                RETRY_AFTER.as_secs() / 60,
+                held.stderr.first_line()
             ));
         }
         log
@@ -338,6 +398,56 @@ mod tests {
         assert!(
             !pool.sync(&d, true, Some(mbx)).is_empty(),
             "retried after a change"
+        );
+    }
+
+    /// An mbx that fails at once while a child it started keeps the stderr pipe open.
+    fn fake_mbx_with_lingering_child(dir: &Path) -> PathBuf {
+        let p = dir.join("mbx-linger");
+        fs::write(
+            &p,
+            "#!/bin/sh\n(sleep 20 &)\necho 'the pool is gone' >&2\nexit 9\n",
+        )
+        .unwrap();
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+        p
+    }
+
+    #[test]
+    fn a_failed_reserve_whose_child_keeps_stderr_open_does_not_block_the_usher() {
+        let dir = tempfile::tempdir().unwrap();
+        let mbx = fake_mbx_with_lingering_child(dir.path());
+        let mut pool = PoolHold::default();
+        pool.sync(&depot(true), true, Some(mbx));
+        let started = Instant::now();
+        let mut lines = Vec::new();
+        wait_for("the failure to show", || {
+            lines.extend(pool.poll());
+            !lines.is_empty()
+        });
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "poll waited on the lingering child"
+        );
+        assert!(lines[0].contains("the pool is gone"), "{lines:?}");
+    }
+
+    #[test]
+    fn a_dead_hold_is_tried_again_on_a_timer() {
+        let dir = tempfile::tempdir().unwrap();
+        let mbx = fake_mbx(dir.path(), true);
+        let mut pool = PoolHold::default();
+        let d = depot(true);
+        pool.sync(&d, true, Some(mbx.clone()));
+        wait_for("the failure", || !pool.poll().is_empty());
+        assert!(
+            pool.sync(&d, true, Some(mbx.clone())).is_empty(),
+            "too soon to retry"
+        );
+        pool.failed_at = Instant::now().checked_sub(RETRY_AFTER + Duration::from_secs(1));
+        assert!(
+            !pool.sync(&d, true, Some(mbx)).is_empty(),
+            "retried after the wait"
         );
     }
 

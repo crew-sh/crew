@@ -3,6 +3,7 @@ pub mod display;
 pub mod idle;
 pub mod machine;
 pub mod paths;
+pub mod private;
 pub mod procs;
 pub mod scope;
 pub mod signals;

@@ -533,7 +533,7 @@ fn run_granted(
     let mut env_set = grant.env_set.clone();
     if tmpdir
         .as_ref()
-        .is_some_and(|dir| std::fs::create_dir_all(dir).is_err())
+        .is_some_and(|dir| crew_sys::private::create_dir(dir).is_err())
     {
         env_set.remove("TMPDIR");
     }

@@ -39,6 +39,8 @@ const MIN_LEARNED_CORES_MILLI: u32 = 100;
 const FATE_HISTORY: usize = 1024;
 /// A client that lost the usher may claim its old queue time from a daemon that started this recently.
 const RESUBMIT_GRACE: Duration = Duration::from_secs(10 * 60);
+/// A temp dir younger than this may belong to a job whose scope is not up yet.
+const TMP_SWEEP_MIN_AGE: Duration = Duration::from_secs(5 * 60);
 /// The longest queue time a client of a pre-record usher may claim.
 const LEGACY_CLAIM_MAX_MS: u64 = 24 * 3600 * 1000;
 /// A job started this recently may not have its scope yet, so a missing scope proves nothing.
@@ -375,6 +377,15 @@ pub struct Daemon {
     legacy_claims: bool,
 }
 
+/// The shape `crew` gives its ids (a v4 UUID); the temp sweep touches nothing else under a shared `tmp_root`.
+fn looks_like_job_id(name: &str) -> bool {
+    name.len() == 36
+        && name.char_indices().all(|(i, c)| match i {
+            8 | 13 | 18 | 23 => c == '-',
+            _ => c.is_ascii_hexdigit(),
+        })
+}
+
 /// Ids become unit names, file names and directory names, so they stay plain.
 fn id_is_valid(id: &str) -> bool {
     !id.is_empty() && id.len() <= 64 && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
@@ -507,6 +518,13 @@ impl Daemon {
             legacy_claims: false,
         };
         daemon.restore();
+        daemon.sweep_tmp();
+        if let Err(e) = crew_sys::private::create_dir(Path::new(&daemon.cfg.tmp_root)) {
+            daemon.log.line(&format!(
+                "WARN tmp_root {} is not usable ({e}); jobs run without a private TMPDIR",
+                daemon.cfg.tmp_root
+            ));
+        }
         daemon
     }
 
@@ -1119,7 +1137,7 @@ impl Daemon {
         }
         let mut env_set = grant.env_set.clone();
         let tmpdir = env_set.get("TMPDIR").map(PathBuf::from);
-        let tmpdir = tmpdir.filter(|dir| fs::create_dir_all(dir).is_ok());
+        let tmpdir = tmpdir.filter(|dir| crew_sys::private::create_dir(dir).is_ok());
         if tmpdir.is_none() {
             env_set.remove("TMPDIR");
         }
@@ -1233,6 +1251,7 @@ impl Daemon {
             scope::kill(&job.scope_name, KillSignal::Kill);
             self.log
                 .line(&format!("GONE id={job_id} while running; scope killed"));
+            let _ = fs::remove_dir_all(self.job_tmpdir(job_id));
             self.persist();
         }
     }
@@ -1247,6 +1266,7 @@ impl Daemon {
         for line in self.pool.poll() {
             self.log.line(&line);
         }
+        self.sync_pool();
         self.update_load();
         self.expire_manual_away();
         self.expire_resubmits();
@@ -1255,6 +1275,48 @@ impl Daemon {
         self.reschedule();
         self.adopt_dry_run();
         self.settle_waits();
+    }
+
+    fn job_tmpdir(&self, id: &str) -> PathBuf {
+        Path::new(self.cfg.tmp_root.trim_end_matches('/')).join(id)
+    }
+
+    /// Removes job temp dirs that no scope and no known job accounts for: a killed client leaves its dir behind.
+    fn sweep_tmp(&self) {
+        let live = scope::live_scopes();
+        let known: Vec<&Path> = self
+            .running
+            .iter()
+            .filter_map(|r| r.tmpdir.as_deref())
+            .collect();
+        let Ok(entries) = fs::read_dir(&self.cfg.tmp_root) else {
+            return;
+        };
+        let mut removed = 0;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let recent = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .is_ok_and(|t| t.elapsed().unwrap_or_default() < TMP_SWEEP_MIN_AGE);
+            let owned = live.iter().any(|s| s.ends_with(&format!("-{name}")));
+            if entry.file_type().is_ok_and(|t| t.is_dir())
+                && looks_like_job_id(&name)
+                && !recent
+                && !owned
+                && !known.contains(&path.as_path())
+                && fs::remove_dir_all(&path).is_ok()
+            {
+                removed += 1;
+            }
+        }
+        if removed > 0 {
+            self.log.line(&format!(
+                "SWEEP removed {removed} leftover job temp dir(s) under {}",
+                self.cfg.tmp_root
+            ));
+        }
     }
 
     /// An adopted `crew run` job whose client died while no usher watched has nobody to stop it: stop its scope.
@@ -1810,9 +1872,7 @@ impl Daemon {
             .position(|r| r.req.id == id && matches!(r.origin, Origin::Adopted))
         {
             let job = self.running.remove(at);
-            if let Some(dir) = &job.tmpdir {
-                let _ = fs::remove_dir_all(dir);
-            }
+            let _ = fs::remove_dir_all(self.job_tmpdir(&job.req.id));
             self.log
                 .line(&format!("END id={id} adopted job's scope is gone"));
             self.persist();
@@ -1968,6 +2028,20 @@ mod tests {
     use super::*;
 
     const GIB: u64 = 1 << 30;
+
+    #[test]
+    fn only_uuid_shaped_names_are_job_dirs() {
+        assert!(looks_like_job_id("5cbd0f7a-0000-4000-8000-0000000000aa"));
+        for not in [
+            "",
+            "not-a-job",
+            "5cbd0f7a-0000-4000-8000-0000000000a",
+            "5cbd0f7a_0000_4000_8000_0000000000aa",
+            "../5cbd0f7a-0000-4000-8000-00000000",
+        ] {
+            assert!(!looks_like_job_id(not), "{not}");
+        }
+    }
 
     #[test]
     fn a_declared_size_beats_a_learned_one() {

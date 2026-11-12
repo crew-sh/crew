@@ -81,6 +81,8 @@ pub enum IdleSource {
     },
 }
 
+const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
+
 /// Open client connections, so `stop` can close them the way a dying process would.
 type Open = Arc<Mutex<HashMap<u64, UnixStream>>>;
 
@@ -90,6 +92,7 @@ pub struct Server {
     socket: PathBuf,
     tx: Sender<Msg>,
     actor: Option<JoinHandle<()>>,
+    acceptor: Option<JoinHandle<()>>,
     open: Open,
 }
 
@@ -143,6 +146,58 @@ fn bind(path: &Path) -> Result<UnixListener, ServerError> {
     let listener = UnixListener::bind(path).map_err(err)?;
     fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(err)?;
     Ok(listener)
+}
+
+/// Accepts until the process ends. Errors are logged and backed off, never spun on; connections past the cap are refused.
+fn accept_loop(listener: &UnixListener, tx: &Sender<Msg>, open: &Open, log: &Log, max: usize) {
+    let next = AtomicU64::new(0);
+    let mut last_error = std::time::Instant::now() - Duration::from_secs(60);
+    for stream in listener.incoming() {
+        let mut stream = match stream {
+            Ok(s) => s,
+            Err(e) => {
+                if last_error.elapsed() > Duration::from_secs(10) {
+                    log.line(&format!("WARN accept failed: {e}"));
+                    last_error = std::time::Instant::now();
+                }
+                thread::sleep(ACCEPT_BACKOFF);
+                continue;
+            }
+        };
+        let id = next.fetch_add(1, Ordering::Relaxed);
+        let mut table = open
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if table.len() >= max {
+            drop(table);
+            log.line(&format!("WARN refusing a connection: {max} are open"));
+            let busy = Body::Ack(crew_proto::Ack {
+                ok: false,
+                message: format!("the usher has {max} connections open; try again shortly"),
+            });
+            let _ = crew_proto::write_frame(&mut stream, &crew_proto::Envelope::of(busy));
+            continue;
+        }
+        if let Ok(copy) = stream.try_clone() {
+            table.insert(id, copy);
+        }
+        drop(table);
+        let (tx, registry) = (tx.clone(), Arc::clone(open));
+        let served = thread::Builder::new().name("client".into()).spawn(move || {
+            serve_connection(stream, &tx);
+            registry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&id);
+        });
+        if let Err(e) = served {
+            log.line(&format!("WARN cannot start a connection thread: {e}"));
+            open.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&id);
+            thread::sleep(ACCEPT_BACKOFF);
+        }
+    }
 }
 
 fn serve_connection(stream: UnixStream, tx: &Sender<Msg>) {
@@ -216,6 +271,8 @@ impl Server {
         let (tx, rx) = mpsc::channel();
 
         let idle_timeout = Duration::from_secs(cfg.idle_timeout_secs);
+        let max_connections = cfg.max_connections;
+        let open: Open = Open::default();
         let mut daemon = Daemon::new(
             cfg,
             StatePaths {
@@ -252,33 +309,17 @@ impl Server {
             .spawn(move || daemon.run(&rx))
             .expect("spawn actor");
 
-        let accept_tx = tx.clone();
-        let open: Open = Open::default();
-        let accept_open = Arc::clone(&open);
-        thread::Builder::new()
-            .name("accept".into())
-            .spawn(move || {
-                let next = AtomicU64::new(0);
-                for stream in listener.incoming().flatten() {
-                    let tx = accept_tx.clone();
-                    let id = next.fetch_add(1, Ordering::Relaxed);
-                    let registry = Arc::clone(&accept_open);
-                    if let Ok(copy) = stream.try_clone() {
-                        registry
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .insert(id, copy);
-                    }
-                    thread::spawn(move || {
-                        serve_connection(stream, &tx);
-                        registry
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .remove(&id);
-                    });
-                }
-            })
-            .expect("spawn acceptor");
+        let acceptor = {
+            let (accept_tx, accept_open, accept_log) = (tx.clone(), Arc::clone(&open), log.clone());
+            let max = max_connections;
+            thread::Builder::new()
+                .name("accept".into())
+                .spawn(move || accept_loop(&listener, &accept_tx, &accept_open, &accept_log, max))
+                .map_err(|source| ServerError::Socket {
+                    path: "accept thread".into(),
+                    source,
+                })?
+        };
 
         log.line(&format!("START socket={}", paths.socket.display()));
         Ok(Self {
@@ -286,8 +327,15 @@ impl Server {
             socket: paths.socket.clone(),
             tx,
             actor: Some(actor),
+            acceptor: Some(acceptor),
             open,
         })
+    }
+
+    /// False once the actor or the acceptor has ended; a usher without either cannot serve anyone and should exit.
+    pub fn is_running(&self) -> bool {
+        self.actor.as_ref().is_some_and(|h| !h.is_finished())
+            && self.acceptor.as_ref().is_some_and(|h| !h.is_finished())
     }
 
     pub fn stop(mut self) {

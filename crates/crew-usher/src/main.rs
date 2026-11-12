@@ -15,9 +15,14 @@ fn main() -> anyhow::Result<()> {
     signals::install_termination_handler();
     let server = Server::start(cfg, &paths, IdleSource::Wayland, true)?;
     eprintln!("crew-usher: listening on {}", paths.socket.display());
-    while signals::take_pending().is_none() {
+    while signals::take_pending().is_none() && server.is_running() {
         std::thread::sleep(Duration::from_millis(200));
     }
+    let failed = !server.is_running();
     server.stop();
+    // A usher whose actor or acceptor died serves nobody; exit so the service manager restarts it.
+    if failed {
+        anyhow::bail!("the usher's actor or acceptor thread ended");
+    }
     Ok(())
 }

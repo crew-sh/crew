@@ -1133,3 +1133,69 @@ fn ids_that_could_escape_their_directory_or_collide_are_rejected() {
     }
     assert!(f.client.top().unwrap().running.is_empty());
 }
+
+#[test]
+fn connections_past_the_cap_are_turned_away_and_the_usher_stays_usable() {
+    let Some(f) = Fixture::start(|c| c.max_connections = 3) else {
+        return;
+    };
+    let held: Vec<_> = (0..3)
+        .map(|_| std::os::unix::net::UnixStream::connect(f.client.socket()).unwrap())
+        .collect();
+    // Let the acceptor register all three before the fourth arrives.
+    thread::sleep(Duration::from_millis(300));
+    match f.client.top() {
+        Err(ClientError::Rejected(_) | ClientError::Protocol | ClientError::Closed) => {}
+        other => panic!(
+            "a fourth connection was served: {:?}",
+            other.map(|t| t.running.len())
+        ),
+    }
+    assert!(f.log().contains("refusing a connection"), "{}", f.log());
+    drop(held);
+    until("a slot to free up", || f.client.top().ok().map(|_| ()));
+}
+
+#[test]
+fn a_job_temp_dir_is_private_and_a_killed_clients_leftover_is_swept_at_start() {
+    let Some(mut f) = Fixture::start(|_| {}) else {
+        return;
+    };
+    let job = f
+        .client
+        .detach(&detach_opts(
+            JobKind::Other,
+            &["sh", "-c", "stat -c mode=%a \"$TMPDIR\""],
+            None,
+        ))
+        .unwrap();
+    wait_for(&f.client, &job.job_id, WaitCondition::JobExit);
+    let text = std::fs::read_to_string(&job.log_path).unwrap();
+    assert!(text.contains("mode=700"), "{text}");
+
+    // A client killed with SIGKILL leaves its dir; the next start removes it, and only dirs shaped like job ids.
+    let root = PathBuf::from(&f.cfg.tmp_root);
+    let stale = root.join("5cbd0f7a-0000-4000-8000-0000000000aa");
+    let recent = root.join("5cbd0f7a-0000-4000-8000-0000000000bb");
+    let other = root.join("not-a-job");
+    for d in [&stale, &recent, &other] {
+        std::fs::create_dir_all(d).unwrap();
+        std::fs::write(d.join("blob"), "x").unwrap();
+    }
+    let old = std::time::SystemTime::now() - Duration::from_secs(3600);
+    std::fs::File::open(&stale)
+        .unwrap()
+        .set_modified(old)
+        .unwrap();
+    std::fs::File::open(&other)
+        .unwrap()
+        .set_modified(old)
+        .unwrap();
+    f.restart();
+    assert!(!stale.exists(), "the leftover stayed: {}", f.log());
+    assert!(
+        recent.exists(),
+        "a young dir may belong to a job still starting"
+    );
+    assert!(other.exists(), "only job-id shaped names are swept");
+}

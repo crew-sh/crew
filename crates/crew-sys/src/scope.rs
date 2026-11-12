@@ -154,6 +154,25 @@ pub fn spawn_logged(
     cmd.spawn()
 }
 
+/// Names (without `.scope`) of the crew scopes that exist now, from any usher or test of this user.
+pub fn live_scopes() -> Vec<String> {
+    let dir = cgroup_dir("x");
+    let Some(slice) = dir.parent() else {
+        return Vec::new();
+    };
+    fs::read_dir(slice)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            name.strip_suffix(".scope")
+                .filter(|n| n.starts_with("crew-"))
+                .map(str::to_string)
+        })
+        .collect()
+}
+
 /// Whether the scope's cgroup still exists, that is, whether anything in it still runs.
 pub fn alive(name: &str) -> bool {
     cgroup_dir(name).is_dir()
