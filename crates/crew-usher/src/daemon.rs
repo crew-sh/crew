@@ -836,6 +836,25 @@ impl Daemon {
         if before.0 != now {
             self.apply_weights(now);
             self.sync_pool();
+            if now {
+                self.note_away_only_still_running();
+            }
+        }
+    }
+
+    /// Jobs that waited for the owner to leave keep running when they come back; the log says which.
+    fn note_away_only_still_running(&self) {
+        let ids: Vec<String> = self
+            .running
+            .iter()
+            .filter(|r| admission::away_only(&self.cfg, r.kind, r.req.exclusive))
+            .map(|r| label_of(&r.req, r.kind))
+            .collect();
+        if !ids.is_empty() {
+            self.log.line(&format!(
+                "OWNER returned while away-only jobs run (they are not paused): {}",
+                ids.join(", ")
+            ));
         }
     }
 

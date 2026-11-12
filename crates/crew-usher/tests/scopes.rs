@@ -707,6 +707,35 @@ fn cancel_removes_a_queued_job_and_stops_a_running_one() {
 }
 
 #[test]
+fn a_bench_keeps_running_when_the_owner_returns_and_the_log_says_so() {
+    let Some(f) = Fixture::start(|_| {}) else {
+        return;
+    };
+    f.client.set_owner(OwnerArg::Away).unwrap();
+    let bench = f
+        .client
+        .detach(&detach_opts(JobKind::Bench, &["sleep", "60"], None))
+        .unwrap();
+    let _stop_it = StopJob(Client::new(f.client.socket()), bench.job_id.clone());
+    until("the bench to run", || {
+        (phase_of(&f.client.jobs().unwrap(), &bench.job_id) == Some(JobPhase::Running))
+            .then_some(())
+    });
+
+    f.client.set_owner(OwnerArg::Here).unwrap();
+    until("the log to name the bench", || {
+        f.log()
+            .contains("OWNER returned while away-only jobs run")
+            .then_some(())
+    });
+    assert!(f.log().contains(&bench.job_id[..8]), "{}", f.log());
+    assert_eq!(
+        phase_of(&f.client.jobs().unwrap(), &bench.job_id),
+        Some(JobPhase::Running)
+    );
+}
+
+#[test]
 fn cancelling_a_queued_client_refuses_it() {
     let Some(f) = Fixture::start(|_| {}) else {
         return;

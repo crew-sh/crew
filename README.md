@@ -107,6 +107,8 @@ crew run --kind bench --exclusive -- ./time-it.sh
 
 A `bench` is heavy work that waits until you are away; it runs beside other jobs when memory, cores and disk allow. `--exclusive` asks for the machine to itself, for timing benchmarks: nothing else runs beside the job, and it too waits until you are away. Memory measurements and builds never need it.
 
+"Waits until you are away" is about when a job starts. A bench or exclusive job that is already running when you come back is not paused: it gets the lower CPU and I/O weights for a present owner, and the usher logs `OWNER returned while away-only jobs run`, naming them. Cancel one with `crew cancel` if it must stop.
+
 If the usher is not running when `crew run` starts, it prints a note and runs the command unmanaged. Set `CREW_STRICT=1` to make that an error.
 
 A job whose memory can never fit is refused at once (exit 75) with the numbers: its expected size plus `min_free_mem_gib` must not exceed the machine's total memory. Lower `--mem` or `min_free_mem_gib`.

@@ -70,7 +70,7 @@ pub fn runs_alone(cfg: &Config, kind: JobKind, asked: bool) -> bool {
 }
 
 /// The job runs only while the owner is away.
-fn away_only(cfg: &Config, kind: JobKind, asked: bool) -> bool {
+pub fn away_only(cfg: &Config, kind: JobKind, asked: bool) -> bool {
     runs_alone(cfg, kind, asked) || cfg.kind(kind).away_only
 }
 
