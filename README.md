@@ -24,11 +24,19 @@ Early. It works and has tests, but the formats may still change.
 
 - Linux with a systemd user session only. Jobs run in `systemd-run --user --scope` scopes, so cgroup v2 is needed.
 - Agent accounting is observe-only. See [Safety](#safety).
-- Not on crates.io. Install from git.
+- Not on crates.io. Install a release binary or build from git.
 
 ## Install
 
-You need Rust (edition 2024, 1.97 or newer) and `protoc`, the protobuf compiler. The build compiles `.proto` files and does not bundle `protoc`.
+The quick way is a prebuilt release (Linux, x86_64 or aarch64, statically linked):
+
+```sh
+curl -fsSL https://crew.umceko.dev/install.sh | sh
+```
+
+It downloads the latest release from GitHub, checks its sha256 against the release's `SHA256SUMS`, and installs the five programs into `~/.local/bin` (`CREW_INSTALL_DIR` picks another directory, `CREW_VERSION=v0.1.0` pins a release). Nothing is installed if the sum does not match. It also leaves a ready `crew-usher.service` in `~/.local/share/crew/` and prints the commands that enable it as a user service. Read the script first if you like: it is [site/install.sh](site/install.sh). Release files are on the [releases page](https://github.com/crew-sh/crew/releases).
+
+Or build it yourself with `cargo install`. You need Rust (edition 2024, 1.97 or newer) and `protoc`, the protobuf compiler. The build compiles `.proto` files and does not bundle `protoc`.
 
 ```sh
 sudo apt install protobuf-compiler          # Debian, Ubuntu
@@ -58,7 +66,7 @@ From a clone, install each crate (`cargo install` takes one `--path`):
 for c in crew crew-usher crew-queue crew-ledger crew-depot; do cargo install --locked --path crates/$c; done
 ```
 
-Make sure `~/.cargo/bin` is on `PATH`. `crew` looks for plugins next to itself, then on `PATH`.
+Make sure `~/.cargo/bin` (or the directory you installed into) is on `PATH`. `crew` looks for plugins next to itself, then on `PATH`.
 
 ## Quickstart
 
@@ -73,7 +81,7 @@ systemctl --user daemon-reload
 systemctl --user enable --now crew-usher
 ```
 
-The unit runs `%h/.cargo/bin/crew-usher`. Edit `ExecStart` if you installed elsewhere.
+The unit runs `%h/.cargo/bin/crew-usher`. Edit `ExecStart` if you installed elsewhere. (`install.sh` leaves a copy with `ExecStart` already pointing at its install directory, in `~/.local/share/crew/`.)
 
 To tell when you are at the machine, the usher asks the Wayland compositor about idle time. That needs `WAYLAND_DISPLAY` in the user manager. Most desktop sessions import it already. If yours does not, run this once per login:
 
@@ -81,6 +89,8 @@ To tell when you are at the machine, the usher asks the Wayland compositor about
 systemctl --user import-environment WAYLAND_DISPLAY
 systemctl --user restart crew-usher
 ```
+
+A user service stops with your last login session. To keep the usher, and the queue it keeps, running across a logout or a reboot nobody logs in after, run `loginctl enable-linger $USER` once.
 
 Without it the usher still works. It assumes you are present until you say otherwise with `crew owner here|away`.
 
