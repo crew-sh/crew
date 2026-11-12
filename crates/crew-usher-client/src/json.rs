@@ -142,6 +142,10 @@ pub struct Job {
     pub mem_bytes: u64,
     pub io_bytes: u64,
     pub waiting_on: Waiting,
+    /// Queued jobs: when the job should start, from learned durations.
+    pub starts_in_ms: Option<u64>,
+    /// Queued jobs: what the wait is, with the numbers.
+    pub detail: String,
 }
 
 impl From<&JobView> for Job {
@@ -159,6 +163,8 @@ impl From<&JobView> for Job {
             mem_bytes: v.mem_bytes,
             io_bytes: v.io_bytes,
             waiting_on: v.waiting_on.into(),
+            starts_in_ms: v.starts_in_ms,
+            detail: v.detail.clone(),
         }
     }
 }
@@ -194,6 +200,8 @@ pub struct Machine {
     pub owner_source: Owner,
     pub idle_watcher: Watcher,
     pub unmanaged_cpu_pct: f64,
+    /// The exclusive job the usher drains the machine for; empty when none.
+    pub draining_for: String,
 }
 
 impl From<&MachineView> for Machine {
@@ -211,6 +219,7 @@ impl From<&MachineView> for Machine {
             owner_source: m.owner_source.into(),
             idle_watcher: m.idle_watcher.into(),
             unmanaged_cpu_pct: m.unmanaged_cpu_pct,
+            draining_for: m.draining_for.clone(),
         }
     }
 }
@@ -360,6 +369,8 @@ pub struct JobRecord {
     pub queued_at_unix_ms: u64,
     pub started_at_unix_ms: u64,
     pub finished_at_unix_ms: u64,
+    /// Queued jobs: when the job should start, from learned durations.
+    pub starts_in_ms: Option<u64>,
 }
 
 impl From<&JobSummary> for JobRecord {
@@ -380,6 +391,7 @@ impl From<&JobSummary> for JobRecord {
             queued_at_unix_ms: j.queued_at_unix_ms,
             started_at_unix_ms: j.started_at_unix_ms,
             finished_at_unix_ms: j.finished_at_unix_ms,
+            starts_in_ms: j.starts_in_ms,
         }
     }
 }

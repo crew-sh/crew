@@ -22,6 +22,15 @@ pub(crate) fn duration(ms: u64) -> String {
     }
 }
 
+/// When a queued job should start: `~12m`, `now`, or `-` when the usher cannot tell.
+pub(crate) fn starts_in(ms: Option<u64>) -> String {
+    match ms {
+        None => "-".to_string(),
+        Some(0) => "now".to_string(),
+        Some(ms) => format!("~{}", duration(ms)),
+    }
+}
+
 pub(crate) fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_string()
@@ -76,6 +85,13 @@ fn machine_lines(m: &MachineView, out: &mut String) {
         IdleWatcher::Unavailable => "; idle watcher unavailable, retrying",
     };
     let _ = writeln!(out, "owner    {owner} ({source}{watcher})");
+    if !m.draining_for.is_empty() {
+        let _ = writeln!(
+            out,
+            "drain    draining for {}: no new job starts until it has run",
+            m.draining_for
+        );
+    }
 }
 
 fn running_row(v: &JobView) -> String {
@@ -102,12 +118,13 @@ fn running_row(v: &JobView) -> String {
 fn queued_row(v: &JobView) -> String {
     let waiting = WaitingOn::try_from(v.waiting_on).unwrap_or(WaitingOn::Unspecified);
     format!(
-        "{:<8} {:<10} {:<12} {:>7} {:<14} {:>6}  {}",
+        "{:<8} {:<10} {:<12} {:>7} {:<14} {:>7} {:>6}  {}",
         kind_name(v),
         truncate(&v.agent, 10),
         truncate(&v.project, 12),
         duration(v.age_ms),
         waiting.name(),
+        starts_in(v.starts_in_ms),
         gib(v.expected_mem_bytes),
         truncate(&v.command, 60),
     )
@@ -224,8 +241,8 @@ pub fn render(t: &TopReply) -> String {
     if !t.queued.is_empty() {
         let _ = writeln!(
             out,
-            "{:<8} {:<10} {:<12} {:>7} {:<14} {:>6}  COMMAND",
-            "KIND", "AGENT", "PROJECT", "WAITED", "WAITING ON", "MEM"
+            "{:<8} {:<10} {:<12} {:>7} {:<14} {:>7} {:>6}  COMMAND",
+            "KIND", "AGENT", "PROJECT", "WAITED", "WAITING ON", "STARTS", "MEM"
         );
     }
     for v in &t.queued {
@@ -253,13 +270,22 @@ mod tests {
                 expected_cores_milli: 4000,
                 ..Default::default()
             }],
-            queued: vec![JobView {
-                kind: JobKind::Game as i32,
-                command: "my-game".into(),
-                waiting_on: WaitingOn::GameCap as i32,
-                expected_mem_bytes: 6 << 30,
-                ..Default::default()
-            }],
+            queued: vec![
+                JobView {
+                    kind: JobKind::Game as i32,
+                    command: "my-game".into(),
+                    waiting_on: WaitingOn::GameCap as i32,
+                    expected_mem_bytes: 6 << 30,
+                    ..Default::default()
+                },
+                JobView {
+                    kind: JobKind::Test as i32,
+                    command: "cargo test".into(),
+                    waiting_on: WaitingOn::Drain as i32,
+                    starts_in_ms: Some(12 * 60_000),
+                    ..Default::default()
+                },
+            ],
             machine: Some(MachineView {
                 mem_total: 64 << 30,
                 mem_available: 40 << 30,
@@ -271,13 +297,22 @@ mod tests {
                 }],
                 owner_present: true,
                 owner_source: OwnerSource::Manual as i32,
+                draining_for: "bench 1a2b3c4d (myrepo: ./time.sh)".into(),
                 ..Default::default()
             }),
             ..Default::default()
         };
         let s = render(&t);
-        assert!(s.contains("RUNNING (1)") && s.contains("QUEUED (1)"), "{s}");
+        assert!(s.contains("RUNNING (1)") && s.contains("QUEUED (2)"), "{s}");
         assert!(s.contains("game cap") && s.contains("my-game"), "{s}");
+        let game = s.lines().find(|l| l.contains("my-game")).unwrap();
+        assert!(
+            game.contains(" - "),
+            "no estimate without durations: {game}"
+        );
+        let test = s.lines().find(|l| l.contains("cargo test")).unwrap();
+        assert!(test.contains("drain") && test.contains("~12m00s"), "{test}");
+        assert!(s.contains("draining for bench 1a2b3c4d"), "{s}");
         assert!(s.contains("2.0/4.0"), "{s}");
         assert!(
             s.contains("40.0 of 64.0 GiB")

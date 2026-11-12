@@ -172,9 +172,11 @@ KIND     AGENT      PROJECT          AGE CPU act/exp MEM act/exp GiB       IO  C
 build    agent-a    myrepo           41s  3.8/4.0     1.9/2.0        120M  cargo build
 
 QUEUED (1)
-KIND     AGENT      PROJECT       WAITED WAITING ON        MEM  COMMAND
-test     agent-b    myrepo           12s cpu               2.0  cargo test
+KIND     AGENT      PROJECT       WAITED WAITING ON      STARTS    MEM  COMMAND
+test     agent-b    myrepo           12s cpu            ~3m10s    2.0  cargo test
 ```
+
+`STARTS` is when the usher expects the job to start: it replays its own rules as the running jobs end at their learned durations. It shows `-` while a job it waits on has never been timed, or while it waits for you to leave. `crew jobs` shows the same estimate and the full reason.
 
 `crew top` also lists the agent sessions it sees (processes named `claude` or `codex`) and the projects they work in, with their CPU, memory and I/O.
 
@@ -367,7 +369,7 @@ mem_cap_gib = 8
 
 Built-in values: every kind expects 2 GiB, 1 core and weight 100. Exceptions: `build` expects 4 cores. `game` is capped at 6 GiB and expects 6. `bench` runs only while you are away (it is not exclusive; `--exclusive` asks for that). `lsp` has `cpu_weight` 20.
 
-Once the usher has seen a command run, it reserves the median of its last 20 successful runs instead of these numbers, held between half and eight times the kind's expectation. A size you give with `--mem` always wins. The figure is the job's working set (anonymous, shared and kernel memory), sampled while it runs: page cache a build writes is not counted. Commands unseen for 28 days are forgotten. It keeps them in `$XDG_STATE_HOME/crew/usher-sizes.pb`. The log is `usher.log` in the same directory. Detached jobs keep `usher-jobs.pb` and a `jobs/` folder there too.
+Once the usher has seen a command run, it reserves the median of its last 20 successful runs instead of these numbers (and estimates start times from their median duration), held between half and eight times the kind's expectation. A size you give with `--mem` always wins. The figure is the job's working set (anonymous, shared and kernel memory), sampled while it runs: page cache a build writes is not counted. Commands unseen for 28 days are forgotten. It keeps them in `$XDG_STATE_HOME/crew/usher-sizes.pb`. The log is `usher.log` in the same directory. Detached jobs keep `usher-jobs.pb` and a `jobs/` folder there too.
 
 ### `depot.toml` and `[depot]`
 

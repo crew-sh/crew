@@ -3,7 +3,7 @@ use std::fmt::Write;
 
 use crew_proto::{JobKind, JobPhase, JobSummary, JobsReply, WaitingOn};
 
-use crate::top::{duration, truncate};
+use crate::top::{duration, starts_in, truncate};
 
 fn phase(j: &JobSummary) -> JobPhase {
     JobPhase::try_from(j.phase).unwrap_or(JobPhase::Unspecified)
@@ -63,7 +63,7 @@ pub fn render(r: &JobsReply, now_ms: u64) -> String {
     section(&mut out, "QUEUED", &by(JobPhase::Queued), |j| {
         let waiting = WaitingOn::try_from(j.waiting_on).unwrap_or(WaitingOn::Unspecified);
         format!(
-            "{}  {:<8} {:<6} {:<10} {:<12} waited {:>7}  on {:<13} {}",
+            "{}  {:<8} {:<6} {:<10} {:<12} waited {:>7}  on {:<13} starts {:>7}  {}",
             j.id,
             kind(j),
             owner(j),
@@ -71,6 +71,7 @@ pub fn render(r: &JobsReply, now_ms: u64) -> String {
             truncate(&j.project, 12),
             ago(now_ms, j.queued_at_unix_ms),
             waiting.name(),
+            starts_in(j.starts_in_ms),
             truncate(&j.command, 50),
         )
     });
@@ -136,6 +137,7 @@ mod tests {
                 JobSummary {
                     reason: "memory rule".into(),
                     waiting_on: WaitingOn::Memory as i32,
+                    starts_in_ms: Some(90_000),
                     ..job("q1", JobPhase::Queued)
                 },
                 job("r1", JobPhase::Running),
@@ -157,6 +159,7 @@ mod tests {
             "cancelled",
             "memory rule",
             "on memory",
+            "starts  ~1m30s",
         ] {
             assert!(text.contains(part), "{part} missing from\n{text}");
         }
