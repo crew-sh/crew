@@ -27,6 +27,15 @@ pub struct QueueConfig {
     /// Step branches are `<prefix><step id>`.
     #[serde(default = "default_prefix")]
     pub branch_prefix: String,
+    /// Build folders of the integration worktree that a new step worktree gets as copy-on-write clones.
+    #[serde(default = "default_warm")]
+    pub warm: Vec<PathBuf>,
+}
+
+fn default_warm() -> Vec<PathBuf> {
+    ["target", "node_modules", ".venv"]
+        .map(PathBuf::from)
+        .to_vec()
 }
 
 fn default_max_batch() -> usize {
@@ -53,5 +62,12 @@ pub fn load(root: &Path) -> Result<QueueConfig> {
         .queue
         .with_context(|| format!("{} has no [queue] table", path.display()))?;
     q.max_batch = q.max_batch.max(1);
+    if let Some(bad) = q.warm.iter().find(|n| !crate::warm::valid_name(n)) {
+        anyhow::bail!(
+            "{}: [queue] warm names `{}`, which is not a relative folder name",
+            path.display(),
+            bad.display()
+        );
+    }
     Ok(q)
 }

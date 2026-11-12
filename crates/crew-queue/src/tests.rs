@@ -929,3 +929,75 @@ fn a_pass_reads_the_ledger_once_not_once_per_submission_and_dependency() {
         "the pass folded the ledger more than once"
     );
 }
+
+/// Whether the test scratch dir can reflink, so the warm-worktree tests know to run.
+fn scratch_can_reflink() -> bool {
+    let t = tempdir("crew-queue-reflink-");
+    fs::write(t.path().join("a"), "x").unwrap();
+    crate::warm::clone_file(&t.path().join("a"), &t.path().join("b")).is_ok()
+}
+
+#[test]
+fn a_new_worktree_starts_with_the_integration_worktrees_build_folders() {
+    if !scratch_can_reflink() {
+        eprintln!(
+            "skipped: the scratch dir cannot reflink; set CREW_TEST_TMP to a btrfs or XFS dir"
+        );
+        return;
+    }
+    let fx = Fx::new(&[("s1", &[]), ("s2", &[])], "warm = [\"target\", \"out\"]");
+    let integration = fx.ctx.integration_worktree();
+    Runner::new(&fx.ctx, CheckRunner::default())
+        .ensure_integration()
+        .unwrap();
+    fs::create_dir_all(integration.join("target/debug")).unwrap();
+    fs::write(integration.join("target/debug/dep.rlib"), "built once").unwrap();
+    fs::create_dir_all(integration.join("node_modules")).unwrap();
+    fs::write(integration.join("node_modules/not-in-the-list"), "x").unwrap();
+
+    let me = Some(u64::from(std::process::id()));
+    let wt = worktrees::new(&fx.ctx, "s1", me).unwrap();
+    assert_eq!(
+        fs::read_to_string(wt.join("target/debug/dep.rlib")).unwrap(),
+        "built once"
+    );
+    assert!(
+        !wt.join("node_modules").exists(),
+        "only the configured folders"
+    );
+    // Editing in the new tree does not touch the integration tree's copy.
+    fs::write(wt.join("target/debug/dep.rlib"), "rebuilt").unwrap();
+    assert_eq!(
+        fs::read_to_string(integration.join("target/debug/dep.rlib")).unwrap(),
+        "built once"
+    );
+
+    // A resumed worktree keeps what it has; --no-warm skips the clone.
+    fs::remove_dir_all(wt.join("target")).unwrap();
+    worktrees::new(&fx.ctx, "s1", me).unwrap();
+    assert!(
+        !wt.join("target").exists(),
+        "an existing worktree is not warmed again"
+    );
+    let cold = worktrees::new_with(&fx.ctx, "s2", me, false).unwrap();
+    assert!(!cold.join("target").exists());
+}
+
+#[test]
+fn warm_names_that_leave_the_tree_are_a_config_error_and_the_default_list_is_the_usual_build_folders()
+ {
+    let fx = Fx::new(&[("s1", &[])], "");
+    assert_eq!(
+        fx.ctx.config.warm,
+        ["target", "node_modules", ".venv"].map(PathBuf::from)
+    );
+    let toml = fs::read_to_string(fx.root.join("crew.toml")).unwrap();
+    fs::write(fx.root.join("crew.toml"), format!("{toml}\n")).unwrap();
+    let bad = toml.replace("[queue]\n", "[queue]\nwarm = [\"../outside\"]\n");
+    fs::write(fx.root.join("crew.toml"), bad).unwrap();
+    let err = Ctx::at(&fx.root).err().unwrap();
+    assert!(
+        err.to_string().contains("not a relative folder name"),
+        "{err:#}"
+    );
+}

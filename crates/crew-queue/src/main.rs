@@ -12,7 +12,7 @@ usage: crew queue [--repo DIR] <command>
   submit <branch> --step ID     record the step BUILT and queue its branch
   run [--once]                  land ready branches in batches (single runner per repo)
   status [--json]               queued, landed and failed steps; worktrees and their owners
-  worktree new <step> [--owner-pid N]   create the step's worktree (a dead owner's is taken over)
+  worktree new <step> [--no-warm] [--owner-pid N]   create the step's worktree (a dead owner's is taken over)
   worktree done <step>          mark finished and drop its target dir
   salvage [<step>] [--all-dead] --to DIR   save diff, untracked files and unlanded commits
   gc                            salvage then remove worktrees whose owner is dead and that no process works in
@@ -107,12 +107,16 @@ fn run() -> Result<u8> {
                         .value("--owner-pid")?
                         .map(|v| v.parse::<u64>())
                         .transpose()?;
+                    let warm = !args.flag("--no-warm");
                     let step = args.positional();
                     args.finish()?;
                     let Some(step) = step else {
-                        bail!("usage: worktree new <step>")
+                        bail!("usage: worktree new <step> [--no-warm]")
                     };
-                    println!("{}", worktrees::new(&ctx, &step, owner)?.display());
+                    println!(
+                        "{}",
+                        worktrees::new_with(&ctx, &step, owner, warm)?.display()
+                    );
                 }
                 Some("done") => {
                     let owner = args

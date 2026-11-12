@@ -8,6 +8,7 @@ pub mod runner;
 pub mod status;
 pub mod store;
 pub mod submit;
+pub mod warm;
 pub mod worktrees;
 
 pub use ctx::Ctx;

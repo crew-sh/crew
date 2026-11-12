@@ -89,7 +89,13 @@ fn caller_owner(owner_pid: Option<u64>) -> u64 {
 }
 
 /// Create (or take over, when its owner is dead) the step's worktree, deciding under the queue's state lock.
+/// A worktree made now starts with the `[queue] warm` folders of the integration worktree, cloned copy-on-write where the filesystem can.
 pub fn new(ctx: &Ctx, step: &str, owner_pid: Option<u64>) -> Result<PathBuf> {
+    new_with(ctx, step, owner_pid, true)
+}
+
+/// `new`, with `warm` saying whether a fresh worktree gets the warm folders.
+pub fn new_with(ctx: &Ctx, step: &str, owner_pid: Option<u64>, warm: bool) -> Result<PathBuf> {
     if !crew_ledger::valid_id(step) {
         bail!(
             "`{step}` is not a usable step id (letters, digits, `.`, `_`, `-`; not starting with `.` or `-`)"
@@ -100,7 +106,7 @@ pub fn new(ctx: &Ctx, step: &str, owner_pid: Option<u64>) -> Result<PathBuf> {
     }
     let owner = caller_owner(owner_pid);
     let path = ctx.worktree_root().join(step);
-    Store::new(&ctx.crew_dir()).update(|f| -> Result<()> {
+    let created = Store::new(&ctx.crew_dir()).update(|f| -> Result<bool> {
         if let Some(reg) = f.worktrees.iter().find(|w| w.step_id == step)
             && !is_dead(reg)
             && reg.owner_pid != owner
@@ -114,20 +120,30 @@ pub fn new(ctx: &Ctx, step: &str, owner_pid: Option<u64>) -> Result<PathBuf> {
         let listed = crew_git::worktree_list(&ctx.root)?
             .into_iter()
             .find(|w| w.path == path);
-        match listed {
-            Some(w) if !w.prunable && path.exists() => {}
+        let created = match listed {
+            Some(w) if !w.prunable && path.exists() => false,
             Some(_) => {
                 crew_git::worktree_remove(&ctx.root, &path, true)?;
                 crew_git::worktree_add(&ctx.root, &path, &ctx.step_branch(step), &ctx.config.base)?;
+                true
             }
             None => {
                 crew_git::worktree_add(&ctx.root, &path, &ctx.step_branch(step), &ctx.config.base)?;
+                true
             }
-        }
+        };
         f.worktrees.retain(|w| w.step_id != step);
         f.worktrees.push(new_reg(ctx, step, &path, owner));
-        Ok(())
+        Ok(created)
     })??;
+    if warm && created {
+        let from = ctx.integration_worktree();
+        for (name, outcome) in crate::warm::warm(&from, &path, &ctx.config.warm) {
+            if let Some(line) = crate::warm::note(&name, &outcome) {
+                eprintln!("{line}");
+            }
+        }
+    }
     Ok(path)
 }
 
