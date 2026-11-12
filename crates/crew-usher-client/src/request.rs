@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crew_proto::{JobKind, JobRequest, Limits};
 
@@ -33,18 +33,7 @@ pub fn new_id() -> String {
     )
 }
 
-/// Basename of the nearest enclosing git checkout, else of `cwd` itself.
-pub fn project_of(cwd: &Path) -> String {
-    let top: Option<PathBuf> = cwd
-        .ancestors()
-        .find(|d| d.join(".git").exists())
-        .map(Path::to_path_buf);
-    let dir = top.as_deref().unwrap_or(cwd);
-    dir.file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("")
-        .to_string()
-}
+pub use crew_sys::paths::project_of;
 
 pub struct Inputs<'a> {
     pub kind: JobKind,

@@ -135,7 +135,11 @@ fn read_u64(path: &Path) -> u64 {
 
 /// `None` once the scope's cgroup is gone.
 pub fn stats(name: &str) -> Option<Stats> {
-    let dir = cgroup_dir(name);
+    stats_at(&cgroup_dir(name))
+}
+
+/// Reads the accounting files of any cgroup directory.
+pub fn stats_at(dir: &Path) -> Option<Stats> {
     let cpu = fs::read_to_string(dir.join("cpu.stat")).ok()?;
     let (io_read, io_write) =
         fs::read_to_string(dir.join("io.stat")).map_or((0, 0), |t| parse_io_stat(&t));
