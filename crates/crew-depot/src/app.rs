@@ -16,6 +16,9 @@ use crate::report::{self, GraphRun};
 use crate::stats::{self, Build, MbxReport};
 use crate::{mbx, why};
 
+/// A report older than this belongs to a run that died; no build takes a day.
+const REPORT_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
+
 pub const EXIT_ERROR: u8 = 125;
 pub const EXIT_REFUSED: u8 = 75;
 
@@ -52,6 +55,7 @@ fn repo_of(cwd: &Path) -> PathBuf {
 fn report_file(store: &Path) -> Option<PathBuf> {
     let dir = store.join("stats");
     std::fs::create_dir_all(&dir).ok()?;
+    stats::sweep_reports(&dir, REPORT_MAX_AGE);
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos());
@@ -130,7 +134,7 @@ pub fn cargo(args: &[String]) -> Result<ExitCode> {
         record_build(&depot.store, &repo_of(&cwd), args, r);
     }
     Ok(match result {
-        Ok(code) => ExitCode::from(u8::try_from(code & 0xff).unwrap_or(EXIT_ERROR)),
+        Ok(code) => ExitCode::from(crew_usher_client::jobs::exit_byte(code)),
         Err(e) => fail(&e),
     })
 }

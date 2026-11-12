@@ -89,7 +89,7 @@ fn main() -> ExitCode {
             opts.strict = std::env::var("CREW_STRICT").is_ok_and(|v| v == "1");
             opts.claimed_job = std::env::var("CREW_JOB").ok();
             match client.run(&opts) {
-                Ok(code) => ExitCode::from(u8::try_from(code & 0xff).unwrap_or(EXIT_ERROR)),
+                Ok(code) => ExitCode::from(jobs::exit_byte(code)),
                 Err(e) => fail(&e, opts.json),
             }
         }
@@ -182,9 +182,7 @@ fn main() -> ExitCode {
                 }
                 match WaitOutcome::try_from(reply.outcome).unwrap_or(WaitOutcome::Unspecified) {
                     WaitOutcome::Satisfied => match reply.exit_code {
-                        Some(code) => {
-                            ExitCode::from(u8::try_from(code & 0xff).unwrap_or(EXIT_ERROR))
-                        }
+                        Some(code) => ExitCode::from(jobs::exit_byte(code)),
                         None => ExitCode::SUCCESS,
                     },
                     WaitOutcome::TimedOut => ExitCode::from(EXIT_TIMEOUT),

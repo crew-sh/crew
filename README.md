@@ -192,7 +192,7 @@ crew wait job <id>
 
 `wait` blocks until the usher reports the condition. It exits 0 when the condition holds, 124 on timeout, and 2 if the job never ran. The usher notifies. Nothing polls.
 
-`crew wait job <id>` on a detached job waits until it finishes and exits with the job's exit code (the low 8 bits). It exits 2 if the job never ran (cancelled while queued, refused, could not start) and 125 if it ran and was lost with no exit status. A job's own exit code can be 2, 124 or 125 too; `--json` has an `outcome` and an `exit_code` to tell them apart. For a job that a `crew run` client holds, `crew wait job <id>` returns as soon as the job is running or has finished, because that client has the exit code. `crew wait job-granted <id>` means that for any job, a detached one included.
+`crew wait job <id>` on a detached job waits until it finishes and exits with the job's exit code (a code outside 0 to 255 is a crew error, 125, never masked into another value). It exits 2 if the job never ran (cancelled while queued, refused, could not start) and 125 if it ran and was lost with no exit status. A job's own exit code can be 2, 124 or 125 too; `--json` has an `outcome` and an `exit_code` to tell them apart. For a job that a `crew run` client holds, `crew wait job <id>` returns as soon as the job is running or has finished, because that client has the exit code. `crew wait job-granted <id>` means that for any job, a detached one included.
 
 Set the owner by hand with `crew owner here`, `crew owner away` or `crew owner auto`.
 
@@ -272,6 +272,8 @@ crew build report --shared ../other   # which dependency units ../other would sh
 ```
 
 What the grant changes: the build runs with at most the granted cores (`CARGO_BUILD_JOBS`, unless you pass `-j`), and with mbx's `low` scheduler priority while you are at the machine (`MBX_SCHEDULER_PRIORITY`). Nothing you set yourself is overridden. A leftover `RUSTC_WRAPPER` is dropped for mbx, with a note, because mbx caches nothing when another wrapper holds that slot.
+
+The per-project record behind `crew build stats` is written through a synced file. One that cannot be read is moved to `<name>.corrupt-<time>` with a message, never silently replaced, and run reports that a killed `crew cargo` left behind are removed after a day.
 
 `crew build report` runs `cargo build --unit-graph` in both projects (with `RUSTC_BOOTSTRAP=1` on that one planning command, since the flag is unstable; no compiler runs). For every registry or git unit of this project it prints `shared`, or the first reason it is not: the compiler, the lock file's version, features, a profile field, or a dependency. It reports and edits nothing.
 
@@ -376,7 +378,7 @@ Once the usher has seen a command run, it reserves the median of its last 20 suc
 
 ### `depot.toml` and `[depot]`
 
-Path: `$XDG_CONFIG_HOME/crew/depot.toml`, normally `~/.config/crew/depot.toml`. It holds one `[depot]` table. The same table in a project's `crew.toml` overrides it key by key, and profiles merge field by field. Every key is optional. Unknown keys inside `[depot]` are an error. `crew cargo` reads both files on each run. The usher reads only `depot.toml`, at start, so the pool keys (`mbx`, `mbx_path`, `mbx_reserve`, `reserve_cpus`, `reserve_memory_gib`) are user-level for it: when a project's `crew.toml` changes one, `crew cargo` obeys it and says that the usher does not. `crew cargo` also says when an inherited `RUSTUP_TOOLCHAIN` or `CARGO_BUILD_JOBS` overrides a setting or the grant, and when `RUSTFLAGS` or `RUSTC_BOOTSTRAP` is set while mbx is used (they change the cache keys).
+Path: `$XDG_CONFIG_HOME/crew/depot.toml`, normally `~/.config/crew/depot.toml`. It holds one `[depot]` table. The same table in a project's `crew.toml` overrides it key by key, and profiles merge field by field, except `mbx_path` and `store`: a project comes with a checked-out branch, and a branch must not choose which program `crew cargo` runs or where it writes, so `crew cargo` ignores those two keys there and says so. Every key is optional. Unknown keys inside `[depot]` are an error. `crew cargo` reads both files on each run. The usher reads only `depot.toml`, at start, so the pool keys (`mbx`, `mbx_path`, `mbx_reserve`, `reserve_cpus`, `reserve_memory_gib`) are user-level for it: when a project's `crew.toml` changes one, `crew cargo` obeys it and says that the usher does not. `crew cargo` also says when an inherited `RUSTUP_TOOLCHAIN` or `CARGO_BUILD_JOBS` overrides a setting or the grant, and when `RUSTFLAGS` or `RUSTC_BOOTSTRAP` is set while mbx is used (they change the cache keys).
 
 <!-- test:depot-example -->
 ```toml
@@ -395,11 +397,11 @@ codegen-units = 256
 |---|---|---|
 | `toolchain` | none | A rustup toolchain every `crew cargo` build uses (`RUSTUP_TOOLCHAIN`). A `+toolchain` argument or an existing `RUSTUP_TOOLCHAIN` wins. One toolchain per machine is what lets projects share compiled dependencies. |
 | `mbx` | `"auto"` | `"auto"` uses mbx when it is installed and says so when it is not. `"off"` never does. `"required"` fails when mbx is missing. |
-| `mbx_path` | none | The mbx program. Default: `PATH`, then `$CARGO_HOME/bin`. |
+| `mbx_path` | none | The mbx program. Default: `PATH`, then `$CARGO_HOME/bin`. Only `depot.toml` may set it. |
 | `mbx_reserve` | `false` | While the owner is present the usher holds `reserve_cpus` cores and `reserve_memory_gib` GiB of mbx's compile pool (`mbx reserve`), and `crew run` wraps games and harnesses in `mbx reserve` for what the usher expects them to use. Compilers then leave room. |
 | `reserve_cpus` | `4` | Cores the usher holds while the owner is present. |
 | `reserve_memory_gib` | `8` | Memory the usher holds while the owner is present. |
-| `store` | `$XDG_CACHE_HOME/crew` | Where `crew build` keeps its per-project statistics. |
+| `store` | `$XDG_CACHE_HOME/crew` | Where `crew build` keeps its per-project statistics. Only `depot.toml` may set it. |
 | `store_budget_gib` | `60` | Reserved for the snapshot store of a later milestone. Not enforced yet. |
 | `profiles.<name>` | none | `lto` (`"off"`, `"thin"`, `"fat"`) and `codegen-units` for one cargo profile, set as `CARGO_PROFILE_<NAME>_LTO` and `_CODEGEN_UNITS` for agent builds. Off unless you write it: it changes the generated code, so measure the binary first. With `lto = "off"` and many codegen units, mbx can keep incremental state for an optimized profile. |
 

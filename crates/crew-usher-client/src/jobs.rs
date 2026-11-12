@@ -166,3 +166,24 @@ mod tests {
         assert_eq!(render(&JobsReply::default(), 0), "no jobs\n");
     }
 }
+
+/// What `crew` exits with when a job reports an exit code outside 0..=255: a crew error, never a masked (and possibly "success") value.
+pub const EXIT_ERROR: u8 = 125;
+
+/// A job's exit code as a process exit status.
+pub fn exit_byte(code: i32) -> u8 {
+    u8::try_from(code).unwrap_or(EXIT_ERROR)
+}
+
+#[cfg(test)]
+mod exit_tests {
+    use super::*;
+
+    #[test]
+    fn codes_in_range_pass_through_and_others_are_errors_not_masked() {
+        assert_eq!([0, 1, 2, 137, 255].map(exit_byte), [0, 1, 2, 137, 255]);
+        for out_of_range in [256, 512, 0x1_0000, -1, i32::MIN, i32::MAX] {
+            assert_eq!(exit_byte(out_of_range), EXIT_ERROR, "{out_of_range}");
+        }
+    }
+}

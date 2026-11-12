@@ -1,7 +1,7 @@
 //! Per-project build-cache numbers: mbx's build report folded into a record per repository, plus mbx's own lifetime totals.
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
-use std::io;
+use std::io::{self, Write};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 
@@ -113,6 +113,74 @@ pub fn record_path(store: &Path, root: &Path) -> PathBuf {
     ))
 }
 
+/// The record, or why it cannot be used: a file that is there but damaged or from another version.
+fn read_record(path: &Path) -> Result<Option<ProjectStats>, String> {
+    let bytes = match fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("cannot read it: {e}")),
+    };
+    match ProjectStats::decode(bytes.as_slice()) {
+        Ok(s) if s.version == STATS_VERSION => Ok(Some(s)),
+        Ok(s) => Err(format!(
+            "it is format {}, this crew reads {STATS_VERSION}",
+            s.version
+        )),
+        Err(e) => Err(format!("it is not a valid record: {e}")),
+    }
+}
+
+/// Replaces `path` with `bytes` so a crash leaves the old file or the new one, synced to disk.
+fn write_synced(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let tmp = path.with_extension("tmp");
+    let mut file = File::create(&tmp)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    fs::rename(&tmp, path)?;
+    if let Some(dir) = path.parent() {
+        File::open(dir)?.sync_all()?;
+    }
+    Ok(())
+}
+
+/// Moves an unusable record to `<name>.corrupt-<unix secs>` so the next save cannot overwrite it.
+fn set_aside(path: &Path, why: &str) {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".corrupt-{secs}"));
+    let to = path.with_file_name(name);
+    match fs::rename(path, &to) {
+        Ok(()) => eprintln!(
+            "crew: the build record {} is unusable ({why}); starting a new one, the old is {}",
+            path.display(),
+            to.display()
+        ),
+        Err(e) => eprintln!(
+            "crew: the build record {} is unusable ({why}) and could not be moved aside: {e}",
+            path.display()
+        ),
+    }
+}
+
+/// Run reports older than `max_age` are left over from a `crew cargo` that was killed before it could remove its own.
+pub fn sweep_reports(stats_dir: &Path, max_age: std::time::Duration) {
+    let Ok(entries) = fs::read_dir(stats_dir) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        let stale = e
+            .metadata()
+            .and_then(|m| m.modified())
+            .is_ok_and(|t| t.elapsed().unwrap_or_default() > max_age);
+        if name.starts_with("run-") && name.ends_with(".json") && stale {
+            let _ = fs::remove_file(e.path());
+        }
+    }
+}
+
 pub fn load(path: &Path) -> Option<ProjectStats> {
     let bytes = fs::read(path).ok()?;
     ProjectStats::decode(bytes.as_slice())
@@ -147,12 +215,18 @@ pub struct Build<'a> {
     pub at_secs: u64,
 }
 
-/// Adds one build to the repository's record. An unreadable old record starts over.
+/// Adds one build to the repository's record. An unreadable old record is kept aside and a new one started.
 pub fn record(store: &Path, b: &Build<'_>) -> io::Result<()> {
     let path = record_path(store, b.root);
     fs::create_dir_all(path.parent().expect("record path has a parent"))?;
     let _lock = Lock::exclusive(&path.with_extension("lock"))?;
-    let mut s = load(&path).unwrap_or_default();
+    let mut s = match read_record(&path) {
+        Ok(found) => found.unwrap_or_default(),
+        Err(why) => {
+            set_aside(&path, &why);
+            ProjectStats::default()
+        }
+    };
     s.version = STATS_VERSION;
     s.project = crew_sys::paths::project_of(b.root);
     s.root = b.root.display().to_string();
@@ -161,9 +235,7 @@ pub fn record(store: &Path, b: &Build<'_>) -> io::Result<()> {
     s.last_command = b.command.to_string();
     add(s.total.get_or_insert_with(Default::default), &b.counts);
     s.last = Some(b.counts);
-    let tmp = path.with_extension("tmp");
-    fs::write(&tmp, s.encode_to_vec())?;
-    fs::rename(tmp, path)
+    write_synced(&path, &s.encode_to_vec())
 }
 
 fn secs(ns: u64) -> String {

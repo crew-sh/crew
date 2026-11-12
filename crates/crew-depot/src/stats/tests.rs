@@ -106,6 +106,61 @@ fn two_directories_with_one_name_get_two_records_and_a_broken_record_starts_over
 }
 
 #[test]
+fn a_record_that_cannot_be_read_is_kept_aside_not_silently_replaced() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = Path::new("/x/proj");
+    let p = record_path(dir.path(), root);
+    fs::create_dir_all(p.parent().unwrap()).unwrap();
+    fs::write(&p, b"\xff\xff damaged by a power cut").unwrap();
+    let build = Build {
+        root,
+        command: "check",
+        counts: BuildCounts::default(),
+        at_secs: 1,
+    };
+    record(dir.path(), &build).unwrap();
+    assert_eq!(load(&p).unwrap().builds, 1);
+    let kept: Vec<_> = fs::read_dir(p.parent().unwrap())
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().contains(".corrupt-"))
+        .collect();
+    assert_eq!(kept.len(), 1, "the unreadable record must survive");
+    assert_eq!(
+        fs::read(kept[0].path()).unwrap(),
+        b"\xff\xff damaged by a power cut"
+    );
+}
+
+#[test]
+fn report_files_a_killed_run_left_behind_are_swept_and_fresh_ones_are_not() {
+    let dir = tempfile::tempdir().unwrap();
+    let old = dir.path().join("run-1-1.json");
+    let fresh = dir.path().join("run-2-2.json");
+    let other = dir.path().join("proj-0123.pb");
+    for f in [&old, &fresh, &other] {
+        fs::write(f, "x").unwrap();
+    }
+    let week = std::time::Duration::from_secs(7 * 24 * 3600);
+    File::options()
+        .write(true)
+        .open(&old)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - week)
+        .unwrap();
+    File::options()
+        .write(true)
+        .open(&other)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - week)
+        .unwrap();
+    sweep_reports(dir.path(), std::time::Duration::from_secs(24 * 3600));
+    assert!(!old.exists());
+    assert!(fresh.exists(), "a run in progress");
+    assert!(other.exists(), "only run reports are swept");
+}
+
+#[test]
 fn the_text_report_says_what_is_missing_and_what_is_known() {
     assert!(render(None, None, 0).contains("no build of this project"));
     let s = ProjectStats {
