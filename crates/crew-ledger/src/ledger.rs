@@ -176,7 +176,7 @@ impl StepState {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 struct Raw {
     status: Status,
     /// Hashes of the step as approved; empty for an approval from before hashes.
@@ -286,6 +286,14 @@ impl Snapshot {
         s
     }
 
+    /// Whether two folds hold the same facts: every step's state, the approvals and the warnings.
+    fn same_facts(&self, other: &Self) -> bool {
+        self.raw == other.raw
+            && self.scope_legacy == other.scope_legacy
+            && self.scope_steps == other.scope_steps
+            && self.warnings == other.warnings
+    }
+
     pub fn scope_approved(&self) -> bool {
         self.scope_legacy || !self.scope_steps.is_empty()
     }
@@ -342,6 +350,85 @@ fn transition_error(from: Status, to: Status, by_landed_event: bool) -> Option<S
         }
         _ => None,
     }
+}
+
+/// What `Ledger::compact` did to the file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Compaction {
+    pub events_before: usize,
+    pub events_after: usize,
+    pub bytes_before: u64,
+    pub bytes_after: u64,
+    /// The whole file as it was, kept when the file changed.
+    pub backup: Option<PathBuf>,
+}
+
+/// The events that give the same fold as `events` with every superseded status record dropped and each step's budget use summed.
+fn compacted(events: &[Event]) -> Vec<Event> {
+    #[derive(Default)]
+    struct Keep {
+        last_status: Option<usize>,
+        last_landed: Option<usize>,
+        used: Use,
+        used_at_ms: u64,
+        used_any: bool,
+    }
+    let mut steps: BTreeMap<&str, Keep> = BTreeMap::new();
+    for (i, e) in events.iter().enumerate() {
+        match &e.body {
+            Some(event::Body::Status(st)) if st.status() != Status::Unspecified => {
+                let k = steps.entry(&st.step_id).or_default();
+                k.last_status = Some(i);
+            }
+            Some(event::Body::Landed(l)) => {
+                steps.entry(&l.step_id).or_default().last_landed = Some(i)
+            }
+            Some(event::Body::BudgetUse(b)) => {
+                let k = steps.entry(&b.step_id).or_default();
+                k.used.builds += u64::from(b.builds);
+                k.used.test_ms += b.test_ms;
+                k.used.harnesses += u64::from(b.harnesses);
+                k.used.games += u64::from(b.games);
+                k.used_at_ms = k.used_at_ms.max(b.at_ms);
+                k.used_any = true;
+            }
+            _ => {}
+        }
+    }
+    let mut keep: BTreeSet<usize> = BTreeSet::new();
+    for k in steps.values() {
+        keep.extend(k.last_status);
+        keep.extend(k.last_landed);
+    }
+    let mut out: Vec<Event> = events
+        .iter()
+        .enumerate()
+        .filter(|(i, e)| {
+            let record = matches!(
+                e.body,
+                Some(event::Body::Status(_) | event::Body::Landed(_) | event::Body::BudgetUse(_))
+            );
+            // Approvals are the audit trail and stay as written; so does anything this does not understand.
+            !record || keep.contains(i)
+        })
+        .map(|(_, e)| e.clone())
+        .collect();
+    for (step, k) in &steps {
+        if k.used_any {
+            out.push(Event {
+                body: Some(event::Body::BudgetUse(BudgetUse {
+                    step_id: (*step).to_string(),
+                    builds: u32::try_from(k.used.builds).unwrap_or(u32::MAX),
+                    test_ms: k.used.test_ms,
+                    harnesses: u32::try_from(k.used.harnesses).unwrap_or(u32::MAX),
+                    games: u32::try_from(k.used.games).unwrap_or(u32::MAX),
+                    at_ms: k.used_at_ms,
+                    by: "compacted".into(),
+                })),
+            });
+        }
+    }
+    out
 }
 
 /// Why a tool should not start more work for a step.
@@ -568,6 +655,61 @@ impl Ledger {
         }
         file.write_all(&store::encode(&event)).map_err(io)?;
         file.sync_data().map_err(io)
+    }
+
+    /// Rewrites the ledger in place with superseded status records dropped and budget use summed, under the file's lock.
+    /// The result must fold to exactly the same facts, or nothing is changed. The whole old file is kept beside it.
+    pub fn compact(&self) -> Result<Compaction, Error> {
+        let io = |e| Error::io(&self.path, e);
+        let mut file = match OpenOptions::new().read(true).append(true).open(&self.path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Compaction {
+                    events_before: 0,
+                    events_after: 0,
+                    bytes_before: 0,
+                    bytes_after: 0,
+                    backup: None,
+                });
+            }
+            Err(e) => return Err(io(e)),
+        };
+        file.lock().map_err(io)?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).map_err(io)?;
+        let parsed = store::parse(&self.path, &bytes)?;
+        let after = compacted(&parsed.events);
+        let mut out = Vec::new();
+        for e in &after {
+            out.extend(store::encode(e));
+        }
+        let unchanged = Compaction {
+            events_before: parsed.events.len(),
+            events_after: after.len(),
+            bytes_before: bytes.len() as u64,
+            bytes_after: out.len() as u64,
+            backup: None,
+        };
+        if out.len() >= bytes.len() {
+            return Ok(unchanged);
+        }
+        if !Snapshot::fold(&parsed.events).same_facts(&Snapshot::fold(&after)) {
+            return Err(Error::Invalid(
+                "the compacted ledger would not fold to the same facts; nothing was changed".into(),
+            ));
+        }
+        let backup = self
+            .path
+            .with_extension(format!("pb.pre-compact-{}", now_ms()));
+        fs::write(&backup, &bytes).map_err(io)?;
+        File::open(&backup).and_then(|f| f.sync_all()).map_err(io)?;
+        file.set_len(0).map_err(io)?;
+        file.write_all(&out).map_err(io)?;
+        file.sync_data().map_err(io)?;
+        Ok(Compaction {
+            backup: Some(backup),
+            ..unchanged
+        })
     }
 
     /// `None` means the step may run another job of this kind; a spent budget refuses the next one.

@@ -722,3 +722,67 @@ fn check_rejects_step_ids_that_git_or_the_filesystem_would_misread() {
             .any(|v| matches!(v, Violation::BadId(_)))
     );
 }
+
+fn facts(l: &Ledger) -> Vec<(String, crew_ledger::StepState)> {
+    l.plan()
+        .steps
+        .iter()
+        .map(|s| (s.id.clone(), l.state(&s.id).unwrap()))
+        .collect()
+}
+
+#[test]
+fn compaction_keeps_every_fact_and_shrinks_the_file() {
+    let (_d, l) = project(PLAN);
+    l.record(events::approve_step("x", "owner", "ok")).unwrap();
+    for status in [Status::Approved, Status::Running, Status::Built] {
+        set(&l, "a", status);
+    }
+    for _ in 0..30 {
+        l.record(events::budget_use(
+            "a",
+            "t",
+            Use {
+                builds: 1,
+                test_ms: 1000,
+                ..Use::default()
+            },
+        ))
+        .unwrap();
+    }
+    set(&l, "x", Status::Running);
+    set(&l, "x", Status::Failed);
+    set(&l, "x", Status::Running);
+    l.record(events::landed("a", &"c".repeat(40), "b1"))
+        .unwrap();
+    let before = facts(&l);
+    let before_bytes = std::fs::read(l.path()).unwrap();
+
+    let c = l.compact().unwrap();
+
+    assert_eq!(facts(&l), before, "compaction changed what the ledger says");
+    assert!(c.events_after < c.events_before / 2, "{c:?}");
+    assert!(c.bytes_after < c.bytes_before);
+    assert_eq!(std::fs::read(l.path()).unwrap().len() as u64, c.bytes_after);
+    assert_eq!(std::fs::read(c.backup.unwrap()).unwrap(), before_bytes);
+    assert_eq!(l.state("a").unwrap().used.builds, 30);
+    assert!(l.state("x").unwrap().allowed, "the approval is still there");
+
+    // The ledger is still appendable, and a second compaction has nothing to drop.
+    set(&l, "x", Status::Built);
+    assert_eq!(l.state("x").unwrap().status, Status::Built);
+    let again = l.compact().unwrap();
+    assert!(again.backup.is_none() || again.events_after <= again.events_before);
+    assert_eq!(l.state("a").unwrap().used.builds, 30);
+}
+
+#[test]
+fn compacting_a_ledger_with_nothing_to_drop_changes_nothing() {
+    let (_d, l) = project(PLAN);
+    assert_eq!(l.compact().unwrap().events_before, 0, "no file yet");
+    set(&l, "a", Status::Approved);
+    let bytes = std::fs::read(l.path()).unwrap();
+    let c = l.compact().unwrap();
+    assert!(c.backup.is_none());
+    assert_eq!(std::fs::read(l.path()).unwrap(), bytes);
+}

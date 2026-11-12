@@ -20,6 +20,7 @@ const HELP: &str = "usage: crew plan [--root DIR] <command>
   status <id> <status> [--detail TEXT]    planned approved running built landed failed held dropped
   landed <id> <sha> [--batch ID]
   use <id> [--builds N] [--test-ms N] [--harnesses N] [--games N]
+  compact                                 drop superseded status records and sum budget use; the old file is kept
   next [--n N] [--json]                   steps ready to start, in plan order
   may-run <id> <build|test|harness|game>  exit 1 when the step must not start another run
 The project root holds crew.toml (--root, CREW_ROOT, else the nearest parent of the cwd).";
@@ -255,6 +256,21 @@ fn run(mut args: Vec<String>) -> Res<ExitCode> {
             )?
             .remove(0);
             return approve(&ledger, &target, &note, confirmed);
+        }
+        "compact" => {
+            positionals(args, 0, "compact")?;
+            let c = ledger.compact().map_err(e)?;
+            match &c.backup {
+                Some(backup) => println!(
+                    "ledger: {} events ({} bytes) -> {} events ({} bytes); the old file is {}",
+                    c.events_before,
+                    c.bytes_before,
+                    c.events_after,
+                    c.bytes_after,
+                    backup.display()
+                ),
+                None => println!("ledger: {} events, nothing to compact", c.events_before),
+            }
         }
         "owner-token" => {
             positionals(args, 0, "owner-token")?;

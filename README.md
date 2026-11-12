@@ -240,6 +240,7 @@ crew plan show                        # counts per kind, then the steps
 crew plan next                        # steps that are ready, in plan order
 crew plan approve docs                # owner only; `extra` steps cannot start without this
 crew plan status flag running
+crew plan compact                     # drop superseded status records, sum budget use; the old file is kept
 
 crew queue worktree new flag          # a worktree and branch crew/flag; prints its path
 # ... the agent works and commits in that worktree ...
