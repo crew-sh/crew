@@ -180,3 +180,59 @@ fn input_after_a_manual_away_ends_it() {
     u.until("the owner to be back", |m| m.owner_present);
     assert_eq!(u.machine().owner_source, OwnerSource::WaylandIdle as i32);
 }
+
+/// Stops the usher and starts another over the same state directory.
+fn restart(u: &mut Usher, edit: impl FnOnce(&mut Config)) {
+    u.server.take().unwrap().stop();
+    let mut cfg = Config {
+        watched_paths: vec![],
+        min_free_disk_gib: Default::default(),
+        tmp_root: u._dir.path().join("jobtmp").display().to_string(),
+        ..Config::default()
+    };
+    edit(&mut cfg);
+    let paths = Paths::in_state(u._dir.path().join("usher.sock"), u._dir.path());
+    u.server = Some(Server::start(cfg, &paths, IdleSource::Off, false).unwrap());
+}
+
+#[test]
+fn a_manual_away_survives_a_restart() {
+    let mut u = Usher::start(IdleSource::Off, |_| {});
+    u.client.set_owner(OwnerArg::Away).unwrap();
+    restart(&mut u, |_| {});
+    let m = u.machine();
+    assert!(!m.owner_present);
+    assert_eq!(m.owner_source, OwnerSource::Manual as i32);
+}
+
+#[test]
+fn a_manual_here_survives_a_restart_and_auto_clears_it() {
+    let compositor = FakeCompositor::default();
+    compositor.start();
+    let mut u = Usher::start(compositor.source(), |_| {});
+    u.until("the watcher", |m| {
+        m.idle_watcher == IdleWatcher::Watching as i32
+    });
+    compositor.send(IdleEvent::Idle);
+    u.until("the owner to be away", |m| !m.owner_present);
+    u.client.set_owner(OwnerArg::Here).unwrap();
+    restart(&mut u, |_| {});
+    let m = u.machine();
+    assert!(m.owner_present);
+    assert_eq!(m.owner_source, OwnerSource::Manual as i32);
+
+    u.client.set_owner(OwnerArg::Auto).unwrap();
+    restart(&mut u, |_| {});
+    assert_eq!(u.machine().owner_source, OwnerSource::Default as i32);
+}
+
+#[test]
+fn a_manual_away_keeps_its_age_across_a_restart() {
+    let mut u = Usher::start(IdleSource::Off, |c| c.manual_away_max_secs = 2);
+    u.client.set_owner(OwnerArg::Away).unwrap();
+    thread::sleep(Duration::from_millis(2300));
+    restart(&mut u, |c| c.manual_away_max_secs = 2);
+    let m = u.machine();
+    assert!(m.owner_present, "the away ended while the usher was down");
+    assert_eq!(m.owner_source, OwnerSource::Default as i32);
+}

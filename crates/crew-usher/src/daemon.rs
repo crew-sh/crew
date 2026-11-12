@@ -28,6 +28,7 @@ use crate::agents::{self, Agent, Collector, Planner};
 use crate::config::Config;
 use crate::detached::{self, Dirs};
 use crate::log::Log;
+use crate::owner_state::{self, Manual};
 use crate::pool::{self, PoolHold};
 use crate::sizes::{self, Sizes};
 use crate::state_file::Read;
@@ -262,13 +263,6 @@ struct PendingWait {
     deadline_ms: Option<u64>,
 }
 
-/// A `crew owner here|away` override and when it was set.
-#[derive(Clone, Copy)]
-struct Manual {
-    present: bool,
-    since_ms: u64,
-}
-
 struct Owner {
     manual: Option<Manual>,
     idle: Option<bool>,
@@ -350,6 +344,8 @@ impl AgentWatch {
 #[derive(Clone, Debug)]
 pub struct StatePaths {
     pub sizes: PathBuf,
+    /// The manual owner override, kept across restarts.
+    pub owner: PathBuf,
     pub jobs: PathBuf,
     pub job_logs: PathBuf,
 }
@@ -357,6 +353,7 @@ pub struct StatePaths {
 pub struct Daemon {
     cfg: Config,
     sizes_path: PathBuf,
+    owner_path: PathBuf,
     jobs_path: PathBuf,
     dirs: Dirs,
     events: Sender<Msg>,
@@ -488,6 +485,7 @@ impl Daemon {
             }
         };
         let sizes_path = paths.sizes;
+        let owner_path = paths.owner;
         if cfg.adopt.move_ || cfg.adopt.freeze {
             log.line(
                 "WARN adopt.move and adopt.freeze are not implemented yet: dry-run log lines only",
@@ -503,6 +501,7 @@ impl Daemon {
         let mut daemon = Self {
             cfg,
             sizes_path,
+            owner_path,
             jobs_path: paths.jobs.clone(),
             dirs: Dirs {
                 state: paths
@@ -533,6 +532,7 @@ impl Daemon {
             resubmits: BTreeMap::new(),
             legacy_claims: false,
         };
+        daemon.restore_owner();
         daemon.restore();
         daemon.sweep_tmp();
         if let Err(e) = crew_sys::private::create_dir(Path::new(&daemon.cfg.tmp_root)) {
@@ -706,9 +706,47 @@ impl Daemon {
         self.set_owner_with(change, false);
     }
 
+    /// Takes back a manual override an earlier usher kept; an `away` that outlived its maximum meanwhile is dropped.
+    fn restore_owner(&mut self) {
+        let manual = match owner_state::load(&self.owner_path) {
+            Read::Loaded(m) => m,
+            Read::Missing => return,
+            Read::Unusable { why, to } => {
+                self.log.line(&format!(
+                    "ERROR {} is unusable ({why}); the owner is unset; kept as {}",
+                    self.owner_path.display(),
+                    to.map_or("(could not be moved)".into(), |t| t.display().to_string())
+                ));
+                return;
+            }
+        };
+        let max_ms = self.cfg.manual_away_max_secs.saturating_mul(1000);
+        if manual.expired(self.now_ms(), max_ms) {
+            self.log.line("OWNER manual away expired while the usher was down");
+            self.save_owner();
+            return;
+        }
+        self.log.line(&format!(
+            "OWNER restored manual {}",
+            if manual.present { "here" } else { "away" }
+        ));
+        self.owner.manual = Some(manual);
+    }
+
+    fn save_owner(&self) {
+        if let Err(e) = owner_state::store(&self.owner_path, self.owner.manual) {
+            self.log
+                .line(&format!("WARN could not save the owner state: {e}"));
+        }
+    }
+
     fn set_owner_with(&mut self, change: impl FnOnce(&mut Owner), always_log: bool) {
         let before = (self.owner.present(), self.owner.source());
+        let manual_before = self.owner.manual;
         change(&mut self.owner);
+        if self.owner.manual != manual_before {
+            self.save_owner();
+        }
         let now = self.owner.present();
         if always_log || before != (now, self.owner.source()) {
             self.log.line(&format!(

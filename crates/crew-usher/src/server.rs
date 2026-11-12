@@ -36,6 +36,8 @@ pub enum ServerError {
 pub struct Paths {
     pub socket: PathBuf,
     pub sizes: PathBuf,
+    /// The manual owner override.
+    pub owner: PathBuf,
     pub log: PathBuf,
     /// The state file of detached jobs.
     pub jobs: PathBuf,
@@ -51,6 +53,7 @@ impl Paths {
         Self {
             socket,
             sizes: state.join("usher-sizes.pb"),
+            owner: state.join("usher-owner.pb"),
             log: state.join("usher.log"),
             jobs: state.join("usher-jobs.pb"),
             job_logs: state.join("jobs"),
@@ -281,6 +284,7 @@ impl Server {
             cfg,
             StatePaths {
                 sizes: paths.sizes.clone(),
+                owner: paths.owner.clone(),
                 jobs: paths.jobs.clone(),
                 job_logs: paths.job_logs.clone(),
             },

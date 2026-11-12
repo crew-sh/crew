@@ -5,6 +5,7 @@ pub mod daemon;
 pub mod detached;
 pub mod idle_watch;
 pub mod log;
+pub mod owner_state;
 pub mod pool;
 pub mod server;
 pub mod sizes;

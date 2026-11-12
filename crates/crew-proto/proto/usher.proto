@@ -435,3 +435,11 @@ message SizesFile {
   uint32 version = 1;
   repeated SizeEntry entries = 2;
 }
+
+// The owner's manual `crew owner here|away` (usher-owner.pb); the file exists only while an override is in force.
+message OwnerFile {
+  uint32 version = 1;
+  bool present = 2;
+  // When the override was set; a manual `away` ends `manual_away_max_secs` after this, restarts included.
+  uint64 set_at_unix_ms = 3;
+}

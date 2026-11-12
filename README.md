@@ -84,7 +84,7 @@ systemctl --user restart crew-usher
 
 Without it the usher still works. It assumes you are present until you say otherwise with `crew owner here|away`.
 
-The usher never trusts a silent watcher. If the compositor connection ends, or never worked, the owner counts as present until an idle event arrives again, and the usher resubscribes with a growing delay (1 s up to 60 s). `crew top` shows `idle watcher lost, retrying` or `idle watcher unavailable, retrying` next to the owner line. A manual `crew owner away` ends after `manual_away_max_secs` (8 hours), or at the first input after an idle spell, so a forgotten one cannot admit benches forever. The usher logs which process set it.
+The usher never trusts a silent watcher. If the compositor connection ends, or never worked, the owner counts as present until an idle event arrives again, and the usher resubscribes with a growing delay (1 s up to 60 s). `crew top` shows `idle watcher lost, retrying` or `idle watcher unavailable, retrying` next to the owner line. A manual `crew owner away` ends after `manual_away_max_secs` (8 hours), or at the first input after an idle spell, so a forgotten one cannot admit benches forever. The usher logs which process set it. A manual `here` or `away` survives a usher restart: the usher keeps it, with the time it was set, in `usher-owner.pb` in its state directory, and an `away` that outlived its maximum while the usher was down is dropped.
 
 One state directory has one usher: the usher takes an exclusive lock on `usher.lock` there and a second one refuses to start.
 
