@@ -3,20 +3,35 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use crew_git::MergeOutcome;
-use crew_ledger::{Ledger, Status};
+use crew_ledger::{Ledger, Snapshot, Status};
 
 use crate::check::{CheckOutcome, CheckRunner};
 use crate::ctx::Ctx;
 use crate::lock::FileLock;
 use crate::now_ms;
 use crate::store::{Store, Submission};
-use crate::submit::{record_landed, record_status, state_of};
+use crate::submit::{record_landed, record_status};
 
 const POLL: Duration = Duration::from_secs(3);
 /// The longest wait between passes after errors.
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
 /// `crew queue status` takes the runner lock for a moment to see whether a runner lives; a runner starting then waits this long.
 const LOCK_WAIT: Duration = Duration::from_secs(2);
+
+fn ledger_snapshot(ledger: &Ledger) -> Result<Snapshot> {
+    ledger
+        .snapshot()
+        .map_err(|e| anyhow::anyhow!("ledger: {e}"))
+}
+
+/// A step's status in a snapshot already read.
+fn status_in(ledger: &Ledger, snap: &Snapshot, step: &str) -> Result<Status> {
+    let known = ledger
+        .plan()
+        .step(step)
+        .ok_or_else(|| anyhow::anyhow!("ledger: unknown step `{step}`"))?;
+    Ok(snap.state(known).status)
+}
 
 /// Waits after the `failures`th error in a row: the poll interval, doubled each time, up to a minute.
 pub(crate) fn backoff(failures: u32) -> Duration {
@@ -135,7 +150,7 @@ impl<'a> Runner<'a> {
     }
 
     /// The queue's own detached worktree; the integration branch itself is moved with update-ref.
-    fn ensure_integration(&self) -> Result<PathBuf> {
+    pub(crate) fn ensure_integration(&self) -> Result<PathBuf> {
         let repo = &self.ctx.root;
         let cfg = &self.ctx.config;
         if crew_git::branch_tip(repo, &self.integration_ref())?.is_none() {
@@ -166,13 +181,15 @@ impl<'a> Runner<'a> {
     }
 
     /// Drop submissions that are done (landed, failed, merged already, branch gone); return the ready ones.
-    fn sync(&self, ledger: &Ledger, summary: &mut Summary) -> Result<Vec<Submission>> {
+    pub(crate) fn sync(&self, ledger: &Ledger, summary: &mut Summary) -> Result<Vec<Submission>> {
         let store = Store::new(&self.ctx.crew_dir());
         let tip = self.integration_tip()?;
+        // One read of the ledger for the whole pass; it is read again only after the pass wrote to it.
+        let mut snap = ledger_snapshot(ledger)?;
         let mut keep = Vec::new();
         let mut gone = Vec::new();
         for sub in store.load()?.submissions {
-            let state = match state_of(ledger, &sub.step_id) {
+            let state = match status_in(ledger, &snap, &sub.step_id) {
                 Ok(s) => s,
                 Err(e) => {
                     // The ledger could not land it later either, so it must not be merged now.
@@ -203,6 +220,7 @@ impl<'a> Runner<'a> {
                     &format!("branch {} does not exist", sub.branch),
                     summary,
                 )?;
+                snap = ledger_snapshot(ledger)?;
                 gone.push(sub.step_id.clone());
                 continue;
             };
@@ -225,10 +243,11 @@ impl<'a> Runner<'a> {
                 } else {
                     self.land_one(ledger, &sub.step_id, &branch_tip, "already-merged", summary)?;
                 }
+                snap = ledger_snapshot(ledger)?;
                 gone.push(sub.step_id.clone());
                 continue;
             }
-            if self.deps_landed(ledger, &sub.step_id) {
+            if self.deps_landed(ledger, &snap, &sub.step_id) {
                 keep.push(sub);
             }
         }
@@ -238,13 +257,13 @@ impl<'a> Runner<'a> {
         Ok(keep)
     }
 
-    fn deps_landed(&self, ledger: &Ledger, step: &str) -> bool {
+    fn deps_landed(&self, ledger: &Ledger, snap: &Snapshot, step: &str) -> bool {
         let Some(s) = ledger.plan().steps.iter().find(|s| s.id == step) else {
             return false;
         };
         s.deps
             .iter()
-            .all(|d| state_of(ledger, d).is_ok_and(|st| st == Status::Landed))
+            .all(|d| status_in(ledger, snap, d).is_ok_and(|st| st == Status::Landed))
     }
 
     /// Greedy: submission order, at most `max_batch`, no two branches touching the same file.

@@ -904,3 +904,28 @@ fn done_is_refused_for_another_agents_live_worktree_and_allowed_for_its_owner() 
     let _ = other.kill();
     let _ = other.wait();
 }
+
+#[test]
+fn a_pass_reads_the_ledger_once_not_once_per_submission_and_dependency() {
+    let steps: Vec<(String, Vec<&str>)> = (0..8)
+        .map(|i| (format!("s{i}"), if i == 0 { vec![] } else { vec!["s0"] }))
+        .collect();
+    let refs: Vec<(&str, &[&str])> = steps
+        .iter()
+        .map(|(id, d)| (id.as_str(), d.as_slice()))
+        .collect();
+    let fx = Fx::new(&refs, "");
+    for (i, (id, _)) in steps.iter().enumerate() {
+        fx.built(id, &[("a.txt", &format!("{i}\n"))]);
+    }
+    let ledger = fx.ctx.ledger().unwrap();
+    let runner = Runner::new(&fx.ctx, CheckRunner::default());
+    runner.ensure_integration().unwrap();
+    let ready = runner.sync(&ledger, &mut Summary::default()).unwrap();
+    assert_eq!(ready.len(), 1, "only s0 has its deps landed");
+    assert_eq!(
+        ledger.reads(),
+        1,
+        "the pass folded the ledger more than once"
+    );
+}

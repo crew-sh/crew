@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
@@ -354,6 +355,8 @@ pub struct Ledger {
     root: PathBuf,
     path: PathBuf,
     plan: Plan,
+    /// How often the file was read and folded; a tool that asks per step shows up here.
+    reads: AtomicUsize,
 }
 
 impl Ledger {
@@ -364,6 +367,7 @@ impl Ledger {
             root: root.to_path_buf(),
             path,
             plan,
+            reads: AtomicUsize::new(0),
         })
     }
 
@@ -376,7 +380,13 @@ impl Ledger {
                 .unwrap_or_default(),
             path: ledger_path,
             plan,
+            reads: AtomicUsize::new(0),
         }
+    }
+
+    /// How many times the ledger file was read and folded through this handle.
+    pub fn reads(&self) -> usize {
+        self.reads.load(Ordering::Relaxed)
     }
 
     pub fn root(&self) -> &Path {
@@ -393,6 +403,7 @@ impl Ledger {
 
     /// Reads and folds the whole file (shared lock, so a concurrent append is never seen half-written).
     pub fn snapshot(&self) -> Result<Snapshot, Error> {
+        self.reads.fetch_add(1, Ordering::Relaxed);
         let mut file = match File::open(&self.path) {
             Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
