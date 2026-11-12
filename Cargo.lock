@@ -62,6 +62,7 @@ name = "crew-git"
 version = "0.1.0"
 dependencies = [
  "crew-proto",
+ "tempfile",
 ]
 
 [[package]]
@@ -69,6 +70,11 @@ name = "crew-ledger"
 version = "0.1.0"
 dependencies = [
  "crew-proto",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "toml",
 ]
 
 [[package]]

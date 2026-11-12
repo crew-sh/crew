@@ -1,5 +1,64 @@
 syntax = "proto3";
 package crew.ledger;
 
-// Placeholder; T3 defines the ledger records here.
-message Placeholder {}
+// The ledger file is an append-only stream of length-delimited `Event`s; current state is their fold.
+
+enum Status {
+  STATUS_UNSPECIFIED = 0;
+  STATUS_PLANNED = 1;
+  STATUS_APPROVED = 2;
+  STATUS_RUNNING = 3;
+  STATUS_BUILT = 4;
+  STATUS_LANDED = 5;
+  STATUS_FAILED = 6;
+  STATUS_HELD = 7;
+  STATUS_DROPPED = 8;
+}
+
+message StepStatus {
+  string step_id = 1;
+  Status status = 2;
+  uint64 at_ms = 3;
+  string by = 4;
+  string detail = 5;
+}
+
+message Landed {
+  string step_id = 1;
+  string sha = 2;
+  string batch_id = 3;
+  uint64 at_ms = 4;
+}
+
+// Covers every step of kind extra whose review is not owner-before.
+message ScopeAll {}
+
+message Approval {
+  oneof target {
+    string step_id = 1;
+    ScopeAll scope = 2;
+  }
+  string by = 3;
+  uint64 at_ms = 4;
+  string note = 5;
+}
+
+// Amounts are deltas added to the step's running totals.
+message BudgetUse {
+  string step_id = 1;
+  uint32 builds = 2;
+  uint64 test_ms = 3;
+  uint32 harnesses = 4;
+  uint32 games = 5;
+  uint64 at_ms = 6;
+  string by = 7;
+}
+
+message Event {
+  oneof body {
+    StepStatus status = 1;
+    Landed landed = 2;
+    Approval approval = 3;
+    BudgetUse budget_use = 4;
+  }
+}
