@@ -31,6 +31,21 @@ const RULES: &[Rule] = &[
         kind: JobKind::Test,
     },
     Rule {
+        programs: &["cargo"],
+        when: Match::Subcommand(&["bench", "criterion"]),
+        kind: JobKind::Bench,
+    },
+    Rule {
+        programs: &["make"],
+        when: Match::Subcommand(&["bench", "benchmark", "benchmarks"]),
+        kind: JobKind::Bench,
+    },
+    Rule {
+        programs: &["make"],
+        when: Match::Subcommand(&["test", "check"]),
+        kind: JobKind::Test,
+    },
+    Rule {
         programs: &["go"],
         when: Match::Subcommand(&["build", "vet"]),
         kind: JobKind::Build,
@@ -110,6 +125,28 @@ pub struct ProjectRules {
     wrappers: Vec<String>,
 }
 
+/// The checkout directory that holds `.git` for a crew.toml's directory.
+fn found_root(dir: &Path) -> &Path {
+    dir.ancestors()
+        .find(|d| d.join(".git").exists())
+        .unwrap_or(dir)
+}
+
+/// For a linked worktree, the main checkout it belongs to (from the `.git` file, without running git).
+fn main_checkout(dir: &Path) -> Option<std::path::PathBuf> {
+    let checkout = found_root(dir);
+    let dotgit = checkout.join(".git");
+    if !dotgit.is_file() {
+        return None;
+    }
+    let text = fs::read_to_string(&dotgit).ok()?;
+    let gitdir = checkout.join(text.strip_prefix("gitdir:")?.trim());
+    let common = fs::read_to_string(gitdir.join("commondir")).ok()?;
+    let common = gitdir.join(common.trim()).canonicalize().ok()?;
+    let main = common.parent()?.to_path_buf();
+    (main.canonicalize().ok()? != checkout.canonicalize().ok()?).then_some(main)
+}
+
 fn program_name(arg: &str) -> &str {
     Path::new(arg)
         .file_name()
@@ -177,14 +214,25 @@ impl ProjectRules {
         })
     }
 
-    /// Rules of the nearest crew.toml at or above `dir`; none when there is no such file.
+    /// Rules of the nearest crew.toml at or above `dir`; none when there is no such file. Inside a linked git
+    /// worktree the main checkout's file is read instead, so a branch cannot reclassify its own jobs.
     pub fn discover(dir: &Path) -> Result<Self, ProjectRulesError> {
-        let Some(path) = dir
-            .ancestors()
-            .map(|d| d.join("crew.toml"))
-            .find(|p| p.is_file())
-        else {
+        let Some(found) = dir.ancestors().find(|d| d.join("crew.toml").is_file()) else {
             return Ok(Self::default());
+        };
+        let path = match main_checkout(found) {
+            Some(main) => {
+                let relative = found
+                    .strip_prefix(found_root(found))
+                    .unwrap_or(Path::new(""));
+                let theirs = main.join(relative).join("crew.toml");
+                if theirs.is_file() {
+                    theirs
+                } else {
+                    return Ok(Self::default());
+                }
+            }
+            None => found.join("crew.toml"),
         };
         let shown = path.display().to_string();
         let text = fs::read_to_string(&path).map_err(|source| ProjectRulesError::Read {
@@ -220,22 +268,143 @@ impl ProjectRules {
     }
 }
 
+/// Options that come before a cargo subcommand and take a value of their own.
+const CARGO_VALUE_FLAGS: &[&str] = &["--config", "-Z", "-C", "--color"];
+
+/// The subcommand: the first argument that is not a `+toolchain` or a leading option (and its value).
+fn subcommand(args: &[String]) -> Option<&str> {
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if a.starts_with('+') {
+            continue;
+        }
+        if a.starts_with('-') {
+            if CARGO_VALUE_FLAGS.contains(&a.as_str()) {
+                it.next();
+            }
+            continue;
+        }
+        return Some(a);
+    }
+    None
+}
+
 fn builtin_matches(when: &Match, args: &[String]) -> bool {
     match when {
         Match::Always => true,
         Match::Args(want) => args.len() >= want.len() && want.iter().zip(args).all(|(w, a)| w == a),
-        Match::Subcommand(names) => args
-            .iter()
-            .find(|a| !a.starts_with('+'))
-            .is_some_and(|a| names.contains(&a.as_str())),
+        Match::Subcommand(names) => subcommand(args).is_some_and(|a| names.contains(&a)),
     }
 }
 
-/// The repo's rules first, then the built-in table; anything unmatched is `Other`.
-pub fn infer_with(argv: &[String], project: &ProjectRules) -> JobKind {
+/// Programs that run the rest of their command line, and how many leading words besides the program they take.
+fn peel(argv: &[String]) -> Option<Vec<String>> {
+    let program = program_name(argv.first()?);
+    let rest = &argv[1..];
+    let is_assignment = |a: &String| {
+        a.split_once('=').is_some_and(|(k, _)| {
+            !k.is_empty() && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        })
+    };
+    let after = match program {
+        "env" => {
+            let mut it = rest.iter().peekable();
+            while let Some(a) = it.peek() {
+                if a.as_str() == "-u" || a.as_str() == "-C" || a.as_str() == "-S" {
+                    it.next();
+                    it.next();
+                } else if a.starts_with('-') || is_assignment(a) {
+                    it.next();
+                } else {
+                    break;
+                }
+            }
+            it.cloned().collect()
+        }
+        "timeout" => {
+            let mut it = rest.iter().peekable();
+            while let Some(a) = it.peek() {
+                if matches!(a.as_str(), "-s" | "-k" | "--signal" | "--kill-after") {
+                    it.next();
+                    it.next();
+                } else if a.starts_with('-') {
+                    it.next();
+                } else {
+                    break;
+                }
+            }
+            it.next(); // the duration
+            it.cloned().collect()
+        }
+        "nice" | "ionice" | "chrt" | "time" | "nohup" | "setsid" | "stdbuf" => {
+            let mut it = rest.iter().peekable();
+            while let Some(a) = it.peek() {
+                if matches!(a.as_str(), "-n" | "-c" | "-p") {
+                    it.next();
+                    it.next();
+                } else if a.starts_with('-') {
+                    it.next();
+                } else {
+                    break;
+                }
+            }
+            it.cloned().collect()
+        }
+        // mbx takes cargo's own arguments.
+        "mbx" => std::iter::once("cargo".to_string())
+            .chain(rest.iter().cloned())
+            .collect(),
+        _ => return None,
+    };
+    Some(after)
+}
+
+/// How much a kind needs the machine: when a shell line holds several commands, the heaviest decides.
+fn weight(kind: JobKind) -> u8 {
+    match kind {
+        JobKind::Bench => 6,
+        JobKind::Game => 5,
+        JobKind::Harness => 4,
+        JobKind::Build => 3,
+        JobKind::Test => 2,
+        JobKind::Lsp => 1,
+        JobKind::Other | JobKind::Unspecified => 0,
+    }
+}
+
+/// `sh -c "cargo build && ./x"`: the kind of the heaviest command in the string.
+fn shell_line(argv: &[String], project: &ProjectRules, depth: u8) -> Option<JobKind> {
+    let program = program_name(argv.first()?);
+    if !matches!(program, "sh" | "bash" | "zsh" | "dash") {
+        return None;
+    }
+    let script = argv.get(argv.iter().position(|a| a == "-c")? + 1)?;
+    let mut best = JobKind::Other;
+    for segment in script.split(['\n', ';', '&', '|']) {
+        let words: Vec<String> = segment.split_whitespace().map(str::to_string).collect();
+        if words.is_empty() {
+            continue;
+        }
+        let kind = infer_depth(&words, project, depth + 1);
+        if weight(kind) > weight(best) {
+            best = kind;
+        }
+    }
+    Some(best)
+}
+
+fn infer_depth(argv: &[String], project: &ProjectRules, depth: u8) -> JobKind {
     let argv = project.strip_wrappers(argv);
     if let Some(kind) = project.kind_of(argv) {
         return kind;
+    }
+    if depth < 6 {
+        if let Some(inner) = peel(argv) {
+            return infer_depth(&inner, project, depth + 1);
+        }
+        if let Some(kind) = shell_line(argv, project, depth) {
+            return kind;
+        }
     }
     let Some(program) = argv.first().map(|a| program_name(a)) else {
         return JobKind::Other;
@@ -244,6 +413,12 @@ pub fn infer_with(argv: &[String], project: &ProjectRules) -> JobKind {
         .iter()
         .find(|r| r.programs.contains(&program) && builtin_matches(&r.when, &argv[1..]))
         .map_or(JobKind::Other, |r| r.kind)
+}
+
+/// The repo's rules first, then the built-in table (looking through `env`, `timeout`, `nice`, `mbx` and `sh -c`);
+/// anything unmatched is `Other`.
+pub fn infer_with(argv: &[String], project: &ProjectRules) -> JobKind {
+    infer_depth(argv, project, 0)
 }
 
 /// The built-in table alone.
@@ -293,6 +468,104 @@ mod tests {
             assert_eq!(kind(cmd), want, "{cmd}");
         }
         assert_eq!(infer(&[]), JobKind::Other);
+    }
+
+    #[test]
+    fn benches_are_benches_whatever_wraps_them() {
+        for cmd in [
+            "cargo bench",
+            "cargo bench -p crew-usher",
+            "cargo --locked bench",
+            "cargo +nightly bench --bench x",
+            "env RUST_LOG=info cargo bench",
+            "timeout 600 cargo bench",
+            "nice -n 10 cargo bench",
+            "mbx bench",
+            "make bench",
+        ] {
+            assert_eq!(kind(cmd), JobKind::Bench, "{cmd}");
+        }
+        assert_eq!(
+            infer(&["sh".into(), "-c".into(), "cargo bench".into()]),
+            JobKind::Bench
+        );
+    }
+
+    #[test]
+    fn flags_and_wrappers_do_not_hide_builds_and_tests() {
+        for (cmd, want) in [
+            ("cargo --locked build", JobKind::Build),
+            ("cargo -Z unstable-options build", JobKind::Build),
+            ("cargo --config foo=bar test", JobKind::Test),
+            ("env X=1 cargo test", JobKind::Test),
+            ("env -i X=1 cargo build", JobKind::Build),
+            ("timeout 600 cargo test", JobKind::Test),
+            ("timeout -s KILL 5m cargo build", JobKind::Build),
+            ("nice cargo build", JobKind::Build),
+            ("mbx build", JobKind::Build),
+            ("mbx nextest run", JobKind::Test),
+            ("make test", JobKind::Test),
+            ("make -j8", JobKind::Build),
+            ("env X=1 true", JobKind::Other),
+            ("timeout 5", JobKind::Other),
+        ] {
+            assert_eq!(kind(cmd), want, "{cmd}");
+        }
+        assert_eq!(
+            infer(&[
+                "sh".into(),
+                "-c".into(),
+                "cd x && cargo build && echo done".into()
+            ]),
+            JobKind::Build
+        );
+        assert_eq!(
+            infer(&["bash".into(), "-c".into(), "cargo test; cargo bench".into()]),
+            JobKind::Bench,
+            "the heaviest command in the line decides"
+        );
+        assert_eq!(
+            infer(&["sh".into(), "-c".into(), "echo hi".into()]),
+            JobKind::Other
+        );
+    }
+
+    #[test]
+    fn a_linked_worktree_reads_the_main_checkouts_rules_not_its_own() {
+        let t = tempfile::tempdir().unwrap();
+        let main = t.path().join("main");
+        let wt = t.path().join("wt");
+        fs::create_dir_all(main.join(".git/worktrees/wt")).unwrap();
+        fs::create_dir_all(wt.join("sub")).unwrap();
+        fs::write(main.join(".git/worktrees/wt/commondir"), "../..\n").unwrap();
+        fs::write(
+            wt.join(".git"),
+            format!("gitdir: {}\n", main.join(".git/worktrees/wt").display()),
+        )
+        .unwrap();
+        fs::write(
+            main.join("crew.toml"),
+            "[usher.kinds]\nbench = [\"./run-bench\"]\n",
+        )
+        .unwrap();
+        // The branch tries to turn its bench into a harmless job.
+        fs::write(
+            wt.join("crew.toml"),
+            "[usher.kinds]\nother = [\"./run-bench\"]\n",
+        )
+        .unwrap();
+        let rules = ProjectRules::discover(&wt.join("sub")).unwrap();
+        assert_eq!(infer_with(&words("./run-bench"), &rules), JobKind::Bench);
+        // A plain checkout reads its own file.
+        let plain = ProjectRules::discover(&main).unwrap();
+        assert_eq!(infer_with(&words("./run-bench"), &plain), JobKind::Bench);
+        fs::remove_file(main.join("crew.toml")).unwrap();
+        let none = ProjectRules::discover(&wt).unwrap();
+        assert_eq!(
+            infer_with(&words("./run-bench"), &none),
+            JobKind::Other,
+            "the branch's own file is not used"
+        );
     }
 
     #[test]
