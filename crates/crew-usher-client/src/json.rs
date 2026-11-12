@@ -90,7 +90,8 @@ mirror!(
             OverGameCap,
             DisplayForbidden,
             UnknownKind,
-            Cancelled
+            Cancelled,
+            TooLarge
         }
 );
 mirror!(

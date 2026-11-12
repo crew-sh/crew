@@ -19,6 +19,8 @@ pub enum ConfigError {
         path: String,
         source: toml::de::Error,
     },
+    #[error("{path}: {problem}")]
+    Invalid { path: String, problem: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize)]
@@ -140,6 +142,8 @@ pub struct Config {
     pub starve_after_secs: u64,
     /// A manual `crew owner away` ends after this long, so a forgotten one cannot admit benches forever.
     pub manual_away_max_secs: u64,
+    /// Runs shorter than this, and runs that failed, teach the usher nothing about a command's size.
+    pub learn_min_wall_secs: u64,
     pub kinds: Kinds,
     pub adopt: Adopt,
     /// From depot.toml, not usher.toml: the main program loads it beside this file.
@@ -160,6 +164,7 @@ impl Default for Config {
             idle_timeout_secs: 120,
             starve_after_secs: 600,
             manual_away_max_secs: 8 * 3600,
+            learn_min_wall_secs: 5,
             kinds: Kinds::default(),
             adopt: Adopt::default(),
             depot: Depot::default(),
@@ -202,15 +207,45 @@ impl Config {
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
         let shown = path.display().to_string();
         match fs::read_to_string(path) {
-            Ok(text) => toml::from_str(&text).map_err(|source| ConfigError::Parse {
-                path: shown,
-                source,
-            }),
+            Ok(text) => {
+                let mut cfg: Self = toml::from_str(&text).map_err(|source| ConfigError::Parse {
+                    path: shown.clone(),
+                    source,
+                })?;
+                // A threshold the file never wrote is the built-in `/`; it must not break a config that watches other paths.
+                let wrote_thresholds = text
+                    .parse::<toml::Table>()
+                    .is_ok_and(|t| t.contains_key("min_free_disk_gib"));
+                if !wrote_thresholds {
+                    let watched = cfg.watched_paths.clone();
+                    cfg.min_free_disk_gib.retain(|p, _| watched.contains(p));
+                }
+                cfg.validate().map_err(|problem| ConfigError::Invalid {
+                    path: shown,
+                    problem,
+                })?;
+                Ok(cfg)
+            }
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Self::default()),
             Err(source) => Err(ConfigError::Read {
                 path: shown,
                 source,
             }),
+        }
+    }
+
+    /// A disk threshold for a path nobody measures would never be enforced.
+    pub fn validate(&self) -> Result<(), String> {
+        match self
+            .min_free_disk_gib
+            .keys()
+            .find(|p| !self.watched_paths.contains(p))
+        {
+            Some(p) => Err(format!(
+                "min_free_disk_gib names {p}, which is not in watched_paths {:?}; add it there or remove the threshold",
+                self.watched_paths
+            )),
+            None => Ok(()),
         }
     }
 
@@ -357,6 +392,46 @@ mod tests {
         let c: Config = toml::from_str(&readme_block("usher-overrides")).unwrap();
         assert_eq!(c.kind(JobKind::Build).expected_cores, 8.0);
         assert_eq!(c.min_free_disk("/data"), Some(100 * GIB));
+    }
+
+    #[test]
+    fn a_disk_threshold_needs_its_path_in_watched_paths() {
+        let c: Config =
+            toml::from_str("watched_paths = [\"/\"]\n[min_free_disk_gib]\n\"/data\" = 10\n")
+                .unwrap();
+        let why = c.validate().unwrap_err();
+        assert!(
+            why.contains("/data") && why.contains("watched_paths"),
+            "{why}"
+        );
+        let ok: Config = toml::from_str(
+            "watched_paths = [\"/\", \"/data\"]\n[min_free_disk_gib]\n\"/data\" = 10\n",
+        )
+        .unwrap();
+        assert!(ok.validate().is_ok());
+        assert!(Config::default().validate().is_ok());
+    }
+
+    #[test]
+    fn loading_keeps_a_config_that_watches_other_paths_working_but_rejects_a_written_threshold_nobody_measures()
+     {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("usher.toml");
+        fs::write(&path, "watched_paths = [\"/data\"]\n").unwrap();
+        let c = Config::load(&path).unwrap();
+        assert!(
+            c.min_free_disk_gib.is_empty(),
+            "the built-in / threshold names an unwatched path"
+        );
+        fs::write(
+            &path,
+            "watched_paths = [\"/data\"]\n[min_free_disk_gib]\n\"/\" = 20\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            Config::load(&path),
+            Err(ConfigError::Invalid { .. })
+        ));
     }
 
     #[test]

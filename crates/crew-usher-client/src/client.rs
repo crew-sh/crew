@@ -558,9 +558,10 @@ fn run_granted(
         exit_code: code,
         wall_ms: wall.as_millis() as u64,
         cpu_usec: stats.cpu_usec,
-        peak_mem_bytes: stats.mem_peak,
+        peak_mem_bytes: stats.peak_worth_learning(),
         io_read_bytes: stats.io_read,
         io_write_bytes: stats.io_write,
+        working_set: true,
     };
     Ok((code, done))
 }
@@ -606,10 +607,7 @@ fn supervise(mut child: Child, scope_name: &str) -> (std::io::Result<ExitStatus>
         if due {
             last_poll = Some(Instant::now());
             if let Some(s) = scope::stats(scope_name) {
-                last = Stats {
-                    mem_peak: s.mem_peak.max(last.mem_peak),
-                    ..s
-                };
+                last.observe(s);
             }
         }
     }

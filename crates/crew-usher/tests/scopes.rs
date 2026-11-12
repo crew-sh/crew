@@ -245,22 +245,117 @@ fn finished_jobs_leave_nothing_in_top() {
     assert!(top.running.is_empty() && top.queued.is_empty());
 }
 
+fn learned(f: &Fixture, argv: &[&str]) -> Option<u64> {
+    use crew_proto::JobRequest;
+    let req = JobRequest {
+        kind: JobKind::Other as i32,
+        argv: argv.iter().map(|s| (*s).to_string()).collect(),
+        project: crew_sys::paths::project_of(&std::env::current_dir().unwrap()),
+        ..JobRequest::default()
+    };
+    match crew_usher::sizes::Sizes::load(&f.paths.sizes, 0) {
+        crew_usher::state_file::Read::Loaded(s) => s
+            .expected(&crew_usher::sizes::key(&req))
+            .map(|l| l.peak_mem_bytes),
+        _ => None,
+    }
+}
+
 #[test]
 fn learned_sizes_reach_the_state_file() {
-    let Some(f) = Fixture::start(|_| {}) else {
+    let Some(f) = Fixture::start(|c| c.learn_min_wall_secs = 1) else {
         return;
     };
     assert_eq!(
         f.client
-            .run(&opts(JobKind::Other, &["sleep", "1"]))
+            .run(&opts(JobKind::Other, &["sleep", "2"]))
             .unwrap(),
         0
     );
     assert!(
-        f.root().join("usher-sizes.pb").exists(),
+        learned(&f, &["sleep", "2"]).is_some(),
         "no memory sample reached the daemon: {}",
         f.log()
     );
+}
+
+#[test]
+fn page_cache_a_job_writes_is_not_learned_as_its_memory() {
+    let Some(f) = Fixture::start(|c| c.learn_min_wall_secs = 1) else {
+        return;
+    };
+    // 300 MiB of file written to disk is charged to the scope as page cache, and shows in memory.peak.
+    let script =
+        "dd if=/dev/zero of=\"$TMPDIR/blob\" bs=1M count=300 status=none; sleep 2; echo cache-run";
+    assert_eq!(
+        f.client
+            .run(&opts(JobKind::Other, &["sh", "-c", script]))
+            .unwrap(),
+        0
+    );
+    let peak = learned(&f, &["sh", "-c", script]).expect("the run was learned");
+    assert!(
+        peak < 100 << 20,
+        "page cache was learned as memory: {} MiB",
+        peak >> 20
+    );
+}
+
+#[test]
+fn a_failed_run_teaches_the_usher_nothing() {
+    let Some(f) = Fixture::start(|c| c.learn_min_wall_secs = 1) else {
+        return;
+    };
+    assert_eq!(
+        f.client
+            .run(&opts(JobKind::Other, &["sh", "-c", "sleep 2; exit 3"]))
+            .unwrap(),
+        3
+    );
+    assert_eq!(learned(&f, &["sh", "-c", "sleep 2; exit 3"]), None);
+}
+
+#[test]
+fn a_job_larger_than_the_machine_is_refused_at_once_naming_the_numbers() {
+    let Some(f) = Fixture::start(|_| {}) else {
+        return;
+    };
+    let huge = RunOptions {
+        mem_bytes: Some(100 << 40),
+        ..opts(JobKind::Other, &["true"])
+    };
+    match f.client.run(&huge) {
+        Err(ClientError::Refused { reason, detail }) => {
+            assert_eq!(reason, RefusalReason::TooLarge);
+            assert!(
+                detail.contains("102400.0 GiB") && detail.contains("memory"),
+                "{detail}"
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+    // It never blocked the line: the next job runs.
+    assert_eq!(f.client.run(&opts(JobKind::Other, &["true"])).unwrap(), 0);
+}
+
+#[test]
+fn a_watched_path_that_cannot_be_measured_refuses_builds_naming_it() {
+    let Some(f) = Fixture::start(|c| {
+        c.watched_paths = vec!["/nonexistent-mount-for-crew-test".into()];
+        c.min_free_disk_gib = [("/nonexistent-mount-for-crew-test".to_string(), 1)].into();
+    }) else {
+        return;
+    };
+    match f.client.run(&opts(JobKind::Build, &["true"])) {
+        Err(ClientError::Refused { reason, detail }) => {
+            assert_eq!(reason, RefusalReason::DiskLow);
+            assert!(
+                detail.contains("nonexistent-mount-for-crew-test"),
+                "{detail}"
+            );
+        }
+        other => panic!("{other:?}"),
+    }
 }
 
 /// A stand-in mbx that records its arguments and runs the command after `--`.

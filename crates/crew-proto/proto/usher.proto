@@ -67,6 +67,8 @@ enum RefusalReason {
   REFUSAL_REASON_UNKNOWN_KIND = 4;
   // `crew cancel` removed the job while it was queued.
   REFUSAL_REASON_CANCELLED = 5;
+  // The job's memory plus the memory kept free exceeds the machine's total, so it could never start.
+  REFUSAL_REASON_TOO_LARGE = 6;
 }
 
 enum BuildPriority {
@@ -126,9 +128,12 @@ message JobDone {
   int32 exit_code = 2;
   uint64 wall_ms = 3;
   uint64 cpu_usec = 4;
+  // Peak working set (anonymous, shared and kernel memory of the scope), sampled; page cache is not counted.
   uint64 peak_mem_bytes = 5;
   uint64 io_read_bytes = 6;
   uint64 io_write_bytes = 7;
+  // peak_mem_bytes is a working-set peak; clients that predate it report memory.peak, page cache included.
+  bool working_set = 8;
 }
 
 message Ack {

@@ -394,6 +394,24 @@ fn label_of(req: &JobRequest, kind: JobKind) -> String {
     format!("{} {id} ({}: {cmd})", kind.name(), req.project)
 }
 
+/// Memory to reserve: a caller's own figure, else what earlier runs needed, held between half and eight times the kind's default.
+fn expected_mem(kind_default: u64, declared: Option<u64>, learned: Option<u64>) -> u64 {
+    if let Some(declared) = declared {
+        return declared;
+    }
+    match learned.filter(|m| *m > 0) {
+        Some(m) => m.clamp(kind_default / 2, kind_default.saturating_mul(8)),
+        None => kind_default,
+    }
+}
+
+/// A failed run, or one too short to have grown, says nothing about how big its command is.
+fn worth_learning(done: &JobDone, min_wall_secs: u64) -> bool {
+    done.exit_code == 0
+        && done.peak_mem_bytes > 0
+        && done.wall_ms >= min_wall_secs.saturating_mul(1000).max(1)
+}
+
 /// The scope is gone and either was seen before or had time to appear.
 fn scope_over(r: &RunningJob, now_ms: u64) -> bool {
     !scope::alive(&r.scope_name)
@@ -688,14 +706,18 @@ impl Daemon {
         let spec = self.cfg.kind(kind);
         let learned = self.sizes.expected(&sizes::key(req));
         let declared = req.declared.unwrap_or_default();
-        let mem = learned
-            .map(|l| l.peak_mem_bytes)
-            .filter(|m| *m > 0)
-            .or(declared.mem_bytes)
-            .unwrap_or(spec.expected_mem);
-        let cores = learned
-            .map(|l| f64::from(l.cores_milli.max(MIN_LEARNED_CORES_MILLI)) / 1000.0)
-            .or(declared.cpus.map(f64::from))
+        let mem = expected_mem(
+            spec.expected_mem,
+            declared.mem_bytes,
+            learned.map(|l| l.peak_mem_bytes),
+        );
+        // What the caller asked for beats what earlier runs suggested.
+        let cores = declared
+            .cpus
+            .map(f64::from)
+            .or_else(|| {
+                learned.map(|l| f64::from(l.cores_milli.max(MIN_LEARNED_CORES_MILLI)) / 1000.0)
+            })
             .unwrap_or(spec.expected_cores);
         (mem, cores)
     }
@@ -837,13 +859,16 @@ impl Daemon {
 
     fn facts(&self) -> Facts {
         let snap = machine::snapshot(&[]).unwrap_or_default();
-        let free_disk = self
-            .cfg
-            .watched_paths
-            .iter()
-            .filter_map(|p| machine::disk_free(p).ok().map(|f| (p.clone(), f)))
-            .collect();
+        let (mut free_disk, mut unmeasurable_disk) = (Vec::new(), Vec::new());
+        for path in &self.cfg.watched_paths {
+            match machine::disk_free(path) {
+                Ok(free) => free_disk.push((path.clone(), free)),
+                Err(_) => unmeasurable_disk.push(path.clone()),
+            }
+        }
         Facts {
+            mem_total: snap.mem_total,
+            unmeasurable_disk,
             mem_available: snap.mem_available,
             cpu_count: snap.cpu_count.max(1),
             unmanaged_cores: self.load.unmanaged_cores,
@@ -866,7 +891,7 @@ impl Daemon {
                 kind: r.kind,
                 expected_mem: r.expected_mem,
                 expected_cores: r.expected_cores,
-                observed_peak: r.stats.mem_peak,
+                observed_peak: r.stats.peak_worth_learning(),
             })
             .collect();
         let waiting: Vec<Waiting> = self
@@ -1129,7 +1154,7 @@ impl Daemon {
     /// Books a finished job's usage and sizes, and logs it.
     fn note_done(&mut self, job: &RunningJob, done: &JobDone) {
         self.finished_cpu_usec += done.cpu_usec;
-        if done.peak_mem_bytes > 0 && done.wall_ms > 0 {
+        if worth_learning(done, self.cfg.learn_min_wall_secs) {
             let cores_milli = u32::try_from(done.cpu_usec / done.wall_ms).unwrap_or(u32::MAX);
             self.sizes.record(
                 &sizes::key(&job.req),
@@ -1215,7 +1240,7 @@ impl Daemon {
     fn tick(&mut self) {
         for r in &mut self.running {
             if let Some(s) = scope::stats(&r.scope_name) {
-                r.stats = s;
+                r.stats.observe(s);
                 r.scope_seen = true;
             }
         }
@@ -1757,7 +1782,8 @@ impl Daemon {
                 exit_code,
                 wall_ms: self.now_ms().saturating_sub(job.started_ms),
                 cpu_usec: job.stats.cpu_usec,
-                peak_mem_bytes: job.stats.mem_peak,
+                peak_mem_bytes: job.stats.peak_worth_learning(),
+                working_set: true,
                 io_read_bytes: job.stats.io_read,
                 io_write_bytes: job.stats.io_write,
                 ..JobDone::default()
@@ -1934,5 +1960,47 @@ fn source_name(s: OwnerSource) -> &'static str {
         OwnerSource::Default => "default",
         OwnerSource::Auto => "auto",
         OwnerSource::Unspecified => "unknown",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const GIB: u64 = 1 << 30;
+
+    #[test]
+    fn a_declared_size_beats_a_learned_one() {
+        assert_eq!(
+            expected_mem(2 * GIB, Some(40 * GIB), Some(3 * GIB)),
+            40 * GIB
+        );
+        assert_eq!(expected_mem(2 * GIB, None, Some(3 * GIB)), 3 * GIB);
+        assert_eq!(expected_mem(2 * GIB, None, None), 2 * GIB);
+    }
+
+    #[test]
+    fn a_learned_size_stays_near_the_kinds_default() {
+        // 20 no-op builds of 200 MiB must not become the reservation for a cold build.
+        assert_eq!(expected_mem(2 * GIB, None, Some(200 << 20)), GIB);
+        // Cache charged to the job once taught 40 GiB; the cap keeps that from sticking.
+        assert_eq!(expected_mem(2 * GIB, None, Some(40 * GIB)), 16 * GIB);
+    }
+
+    fn done(exit_code: i32, wall_ms: u64, peak: u64) -> JobDone {
+        JobDone {
+            exit_code,
+            wall_ms,
+            peak_mem_bytes: peak,
+            ..JobDone::default()
+        }
+    }
+
+    #[test]
+    fn failed_and_very_short_runs_teach_nothing() {
+        assert!(worth_learning(&done(0, 60_000, GIB), 5));
+        assert!(!worth_learning(&done(101, 60_000, GIB), 5));
+        assert!(!worth_learning(&done(0, 800, GIB), 5));
+        assert!(!worth_learning(&done(0, 60_000, 0), 5));
     }
 }

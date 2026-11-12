@@ -134,6 +134,7 @@ impl RefusalReason {
             Self::DisplayForbidden => "display forbidden",
             Self::UnknownKind => "unknown kind",
             Self::Cancelled => "cancelled",
+            Self::TooLarge => "too large for this machine",
         }
     }
 }

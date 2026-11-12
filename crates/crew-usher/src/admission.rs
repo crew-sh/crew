@@ -6,10 +6,13 @@ use crate::config::{Config, GIB};
 
 #[derive(Clone, Debug)]
 pub struct Facts {
+    pub mem_total: u64,
     pub mem_available: u64,
     pub cpu_count: u32,
     pub unmanaged_cores: f64,
     pub free_disk: Vec<(String, u64)>,
+    /// Watched paths that could not be measured; one with a threshold counts as low.
+    pub unmeasurable_disk: Vec<String>,
     pub owner_present: bool,
     pub now_ms: u64,
 }
@@ -58,16 +61,34 @@ fn gib1(bytes: u64) -> String {
 /// Another waiting job holds this one back, and why that one waits.
 struct Blocker {
     label: String,
+    kind: JobKind,
     reason: WaitingOn,
     detail: String,
     waited_ms: u64,
 }
 
 fn disk_problem(cfg: &Config, facts: &Facts) -> Option<String> {
-    facts.free_disk.iter().find_map(|(path, free)| {
+    let unmeasurable = facts.unmeasurable_disk.iter().find_map(|path| {
         let min = cfg.min_free_disk(path)?;
-        (*free < min).then(|| format!("{path} has {} GiB free, needs {}", gib(*free), gib(min)))
+        Some(format!(
+            "{path} cannot be measured (is it mounted?), and it needs {} GiB free",
+            gib(min)
+        ))
+    });
+    unmeasurable.or_else(|| {
+        facts.free_disk.iter().find_map(|(path, free)| {
+            let min = cfg.min_free_disk(path)?;
+            (*free < min).then(|| format!("{path} has {} GiB free, needs {}", gib(*free), gib(min)))
+        })
     })
+}
+
+/// A waiting job competes with a starved one for what the starved one lacks.
+fn competes(blocked_on: WaitingOn, blocker: JobKind, job: JobKind) -> bool {
+    match blocked_on {
+        WaitingOn::GameCap => blocker == job,
+        _ => true,
+    }
 }
 
 fn refusal(cfg: &Config, facts: &Facts, w: &Waiting) -> Option<(RefusalReason, String)> {
@@ -85,6 +106,18 @@ fn refusal(cfg: &Config, facts: &Facts, w: &Waiting) -> Option<(RefusalReason, S
     }
     if w.kind == JobKind::Game && cfg.max_games == 0 {
         return Some((RefusalReason::OverGameCap, "max_games is 0".into()));
+    }
+    if facts.mem_total > 0 && w.expected_mem + cfg.min_free_mem() > facts.mem_total {
+        return Some((
+            RefusalReason::TooLarge,
+            format!(
+                "needs {} + {} kept free = {}, but this machine has {} of memory; lower --mem or min_free_mem_gib",
+                gib1(w.expected_mem),
+                gib1(cfg.min_free_mem()),
+                gib1(w.expected_mem + cfg.min_free_mem()),
+                gib1(facts.mem_total),
+            ),
+        ));
     }
     if disk_gated(w.kind) {
         return disk_problem(cfg, facts).map(|d| (RefusalReason::DiskLow, d));
@@ -123,7 +156,10 @@ pub fn schedule(
         }
         let spec = cfg.kind(w.kind);
         let free = facts.mem_available.saturating_sub(reserved);
-        let wait = if let Some(b) = &starved {
+        let wait = if let Some(b) = starved
+            .as_ref()
+            .filter(|b| competes(b.reason, b.kind, w.kind))
+        {
             Some((
                 b.reason,
                 format!(
@@ -200,6 +236,7 @@ pub fn schedule(
             Some((reason, detail)) => {
                 let blocker = || Blocker {
                     label: w.label.clone(),
+                    kind: w.kind,
                     reason,
                     detail: detail.clone(),
                     waited_ms: facts.now_ms.saturating_sub(w.queued_at_ms),
@@ -227,6 +264,8 @@ mod tests {
 
     fn facts() -> Facts {
         Facts {
+            mem_total: 128 * GIB,
+            unmeasurable_disk: vec![],
             mem_available: 64 * GIB,
             cpu_count: 24,
             unmanaged_cores: 0.0,
@@ -360,6 +399,82 @@ mod tests {
             )[1],
             Verdict::Grant
         );
+    }
+
+    #[test]
+    fn a_job_that_can_never_fit_is_refused_with_the_numbers() {
+        let cfg = Config::default();
+        let mut f = facts();
+        f.mem_total = 64 * GIB;
+        // 64 total - 16 kept free = 48: a 48 GiB job fits the machine, a 49 GiB one never will.
+        let v = verdicts(
+            &cfg,
+            &f,
+            &[],
+            &[
+                job("fits", JobKind::Test, 48),
+                job("never", JobKind::Test, 49),
+            ],
+        );
+        assert_eq!(v[0], Verdict::Grant);
+        match &v[1] {
+            Verdict::Refuse(RefusalReason::TooLarge, d) => {
+                assert!(d.contains("49.0 GiB") && d.contains("64.0 GiB"), "{d}")
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_starved_game_waiting_on_the_game_cap_does_not_block_other_kinds() {
+        let cfg = Config {
+            max_games: 1,
+            ..Config::default()
+        };
+        let mut f = facts();
+        f.now_ms = 11 * 60 * 1000;
+        let v = verdicts(
+            &cfg,
+            &f,
+            &[run(JobKind::Game, 1)],
+            &[
+                job("g", JobKind::Game, 1),
+                job("t", JobKind::Test, 1),
+                job("g2", JobKind::Game, 1),
+            ],
+        );
+        assert_eq!(wait_reason(&v[0]), Some(WaitingOn::GameCap));
+        assert_eq!(
+            v[1],
+            Verdict::Grant,
+            "a test does not compete for the game cap"
+        );
+        assert_eq!(wait_reason(&v[2]), Some(WaitingOn::GameCap));
+    }
+
+    #[test]
+    fn an_unmeasurable_watched_path_counts_as_low_disk() {
+        let cfg = Config {
+            min_free_disk_gib: [("/data".to_string(), 50)].into(),
+            ..Config::default()
+        };
+        let mut f = facts();
+        f.free_disk = vec![("/".into(), 100 * GIB)];
+        f.unmeasurable_disk = vec!["/data".into()];
+        let v = verdicts(
+            &cfg,
+            &f,
+            &[],
+            &[job("b", JobKind::Build, 1), job("g", JobKind::Game, 1)],
+        );
+        match &v[0] {
+            Verdict::Refuse(RefusalReason::DiskLow, d) => assert!(
+                d.contains("/data") && d.contains("cannot be measured"),
+                "{d}"
+            ),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(v[1], Verdict::Grant, "games are not disk gated");
     }
 
     fn detail(v: &Verdict) -> &str {

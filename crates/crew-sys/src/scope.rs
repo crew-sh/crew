@@ -16,9 +16,32 @@ pub struct ScopeLimits {
 pub struct Stats {
     pub mem_peak: u64,
     pub mem_current: u64,
+    /// Anonymous, shared and kernel memory: what the job holds, without the page cache it only read or wrote.
+    /// One sample from `stats`; `observe` keeps the highest.
+    pub mem_work: u64,
     pub cpu_usec: u64,
     pub io_read: u64,
     pub io_write: u64,
+}
+
+impl Stats {
+    /// Takes `newer` as the current reading while remembering the highest memory seen so far.
+    pub fn observe(&mut self, newer: Self) {
+        *self = Self {
+            mem_peak: newer.mem_peak.max(self.mem_peak),
+            mem_work: newer.mem_work.max(self.mem_work),
+            ..newer
+        };
+    }
+
+    /// The peak worth reserving for: the working set, or the cgroup peak when `memory.stat` was unreadable.
+    pub fn peak_worth_learning(&self) -> u64 {
+        if self.mem_work > 0 {
+            self.mem_work
+        } else {
+            self.mem_peak
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -187,6 +210,22 @@ pub fn parse_io_stat(text: &str) -> (u64, u64) {
     (read, write)
 }
 
+/// `anon + shmem + kernel` of a `memory.stat`; older kernels without `kernel` get its parts.
+pub fn parse_working_set(text: &str) -> u64 {
+    let field = |name: &str| -> Option<u64> {
+        text.lines()
+            .find_map(|l| l.strip_prefix(name)?.strip_prefix(' '))
+            .and_then(|v| v.trim().parse().ok())
+    };
+    let kernel = field("kernel").unwrap_or_else(|| {
+        ["slab", "kernel_stack", "pagetables", "percpu"]
+            .iter()
+            .filter_map(|k| field(k))
+            .sum()
+    });
+    field("anon").unwrap_or(0) + field("shmem").unwrap_or(0) + kernel
+}
+
 fn read_u64(path: &Path) -> u64 {
     fs::read_to_string(path)
         .ok()
@@ -207,6 +246,7 @@ pub fn stats_at(dir: &Path) -> Option<Stats> {
     Some(Stats {
         mem_peak: read_u64(&dir.join("memory.peak")),
         mem_current: read_u64(&dir.join("memory.current")),
+        mem_work: fs::read_to_string(dir.join("memory.stat")).map_or(0, |t| parse_working_set(&t)),
         cpu_usec: parse_cpu_usage_usec(&cpu),
         io_read,
         io_write,
@@ -245,6 +285,16 @@ mod tests {
         assert_eq!(parse_cpu_usage_usec(""), 0);
         let io = "259:0 rbytes=100 wbytes=50 rios=1 wios=1\n8:0 rbytes=1 wbytes=2 rios=0 wios=0\n";
         assert_eq!(parse_io_stat(io), (101, 52));
+    }
+
+    #[test]
+    fn the_working_set_leaves_out_page_cache() {
+        let stat = "anon 1000\nfile 90000\nkernel 50\nshmem 200\nfile_mapped 5\n";
+        assert_eq!(parse_working_set(stat), 1250);
+        // Without a `kernel` line its parts are summed.
+        let old = "anon 1000\nfile 90000\nslab 7\nkernel_stack 3\npagetables 2\npercpu 1\n";
+        assert_eq!(parse_working_set(old), 1013);
+        assert_eq!(parse_working_set(""), 0);
     }
 
     #[test]
