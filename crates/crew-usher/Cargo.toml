@@ -1,0 +1,29 @@
+[package]
+name = "crew-usher"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lib]
+name = "crew_usher"
+
+[[bin]]
+name = "crew-usher"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+crew-proto.workspace = true
+crew-sys = { workspace = true, features = ["idle-wayland"] }
+libc.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+toml.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+crew-usher-client.workspace = true
+
+[lints]
+workspace = true

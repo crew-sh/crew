@@ -1,0 +1,189 @@
+syntax = "proto3";
+package crew.usher;
+
+enum JobKind {
+  JOB_KIND_UNSPECIFIED = 0;
+  JOB_KIND_BUILD = 1;
+  JOB_KIND_TEST = 2;
+  JOB_KIND_HARNESS = 3;
+  JOB_KIND_GAME = 4;
+  JOB_KIND_BENCH = 5;
+  JOB_KIND_LSP = 6;
+  JOB_KIND_OTHER = 7;
+}
+
+// Zero weights mean "use the kind's default".
+message Limits {
+  optional uint64 mem_bytes = 1;
+  uint32 cpu_weight = 2;
+  uint32 io_weight = 3;
+  optional uint32 cpus = 4;
+}
+
+message JobRequest {
+  string id = 1;
+  JobKind kind = 2;
+  repeated string argv = 3;
+  string cwd = 4;
+  string project = 5;
+  string agent = 6;
+  Limits declared = 7;
+  bool needs_display = 8;
+  bool hz_desktop = 9;
+  // WAYLAND_DISPLAY, WAYLAND_SOCKET and DISPLAY as the client sees them.
+  map<string, string> display_env = 10;
+}
+
+enum Decision {
+  DECISION_UNSPECIFIED = 0;
+  DECISION_GRANTED = 1;
+  DECISION_QUEUED = 2;
+  DECISION_REFUSED = 3;
+}
+
+enum WaitingOn {
+  WAITING_ON_UNSPECIFIED = 0;
+  WAITING_ON_MEMORY = 1;
+  WAITING_ON_CPU = 2;
+  WAITING_ON_GAME_CAP = 3;
+  WAITING_ON_OWNER_PRESENT = 4;
+  WAITING_ON_DISK = 5;
+  WAITING_ON_EXCLUSIVE = 6;
+}
+
+enum RefusalReason {
+  REFUSAL_REASON_UNSPECIFIED = 0;
+  REFUSAL_REASON_DISK_LOW = 1;
+  REFUSAL_REASON_OVER_GAME_CAP = 2;
+  REFUSAL_REASON_DISPLAY_FORBIDDEN = 3;
+  REFUSAL_REASON_UNKNOWN_KIND = 4;
+}
+
+message Grant {
+  string job_id = 1;
+  Limits limits = 2;
+  string scope_name = 3;
+  map<string, string> env_set = 4;
+  repeated string env_unset = 5;
+}
+
+message Refusal {
+  RefusalReason reason = 1;
+  string detail = 2;
+}
+
+message Queued {
+  WaitingOn waiting_on = 1;
+  uint32 position = 2;
+  uint64 queued_ms = 3;
+  string detail = 4;
+}
+
+message Reply {
+  Decision decision = 1;
+  oneof outcome {
+    Grant grant = 2;
+    Refusal refusal = 3;
+    Queued queued = 4;
+  }
+}
+
+message JobDone {
+  string job_id = 1;
+  int32 exit_code = 2;
+  uint64 wall_ms = 3;
+  uint64 cpu_usec = 4;
+  uint64 peak_mem_bytes = 5;
+  uint64 io_read_bytes = 6;
+  uint64 io_write_bytes = 7;
+}
+
+message Ack {
+  bool ok = 1;
+  string message = 2;
+}
+
+message TopRequest {}
+
+message JobView {
+  string id = 1;
+  JobKind kind = 2;
+  string agent = 3;
+  string project = 4;
+  string command = 5;
+  uint64 expected_mem_bytes = 6;
+  uint32 expected_cores_milli = 7;
+  uint64 age_ms = 8;
+  uint64 cpu_usec = 9;
+  uint64 mem_bytes = 10;
+  uint64 io_bytes = 11;
+  WaitingOn waiting_on = 12;
+}
+
+message DiskView {
+  string path = 1;
+  uint64 free_bytes = 2;
+  uint64 min_free_bytes = 3;
+}
+
+enum OwnerSource {
+  OWNER_SOURCE_UNSPECIFIED = 0;
+  OWNER_SOURCE_MANUAL = 1;
+  OWNER_SOURCE_WAYLAND_IDLE = 2;
+  // In OwnerSet: drop the manual override and follow idle detection.
+  OWNER_SOURCE_AUTO = 3;
+  // In MachineView: no idle detection and no manual override, owner assumed present.
+  OWNER_SOURCE_DEFAULT = 4;
+}
+
+message MachineView {
+  uint64 mem_total = 1;
+  uint64 mem_available = 2;
+  uint32 cpu_count = 3;
+  double load1 = 4;
+  double psi_cpu_some_avg10 = 5;
+  double psi_mem_some_avg10 = 6;
+  double psi_io_some_avg10 = 7;
+  repeated DiskView disk = 8;
+  bool owner_present = 9;
+  OwnerSource owner_source = 10;
+  double unmanaged_cpu_pct = 11;
+}
+
+message TopReply {
+  repeated JobView running = 1;
+  repeated JobView queued = 2;
+  MachineView machine = 3;
+}
+
+message OwnerSet {
+  bool present = 1;
+  OwnerSource source = 2;
+}
+
+message Envelope {
+  oneof body {
+    JobRequest job_request = 1;
+    Reply reply = 2;
+    JobDone job_done = 3;
+    TopRequest top_request = 4;
+    TopReply top_reply = 5;
+    OwnerSet owner_set = 6;
+    Ack ack = 7;
+  }
+}
+
+message SizeSample {
+  uint64 peak_mem_bytes = 1;
+  uint32 cores_milli = 2;
+}
+
+message SizeEntry {
+  string key = 1;
+  repeated SizeSample samples = 2;
+}
+
+message SizesFile {
+  uint32 version = 1;
+  repeated SizeEntry entries = 2;
+}
