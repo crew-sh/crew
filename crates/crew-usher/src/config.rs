@@ -321,6 +321,36 @@ mod tests {
         assert_eq!(c.min_free_disk("/data"), Some(50 * GIB));
     }
 
+    /// The first ```toml fence after `<!-- test:NAME -->` in the README.
+    fn readme_block(name: &str) -> String {
+        let readme = include_str!("../../../README.md");
+        let after = readme
+            .split(&format!("<!-- test:{name} -->"))
+            .nth(1)
+            .unwrap();
+        let body = after.split("```toml\n").nth(1).unwrap();
+        body.split("```").next().unwrap().to_string()
+    }
+
+    #[test]
+    fn the_readme_defaults_are_the_defaults() {
+        let documented: Config = toml::from_str(&readme_block("usher-defaults")).unwrap();
+        let actual = Config::default();
+        let same_apart_from_machine_paths = Config {
+            watched_paths: actual.watched_paths.clone(),
+            tmp_root: actual.tmp_root.clone(),
+            ..documented
+        };
+        assert_eq!(same_apart_from_machine_paths, actual);
+    }
+
+    #[test]
+    fn the_readme_override_example_loads() {
+        let c: Config = toml::from_str(&readme_block("usher-overrides")).unwrap();
+        assert_eq!(c.kind(JobKind::Build).expected_cores, 8.0);
+        assert_eq!(c.min_free_disk("/data"), Some(100 * GIB));
+    }
+
     #[test]
     fn unknown_keys_are_errors() {
         assert!(toml::from_str::<Config>("max_gamez = 2\n").is_err());

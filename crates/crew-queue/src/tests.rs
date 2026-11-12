@@ -515,3 +515,40 @@ fn queue_file_round_trips_and_survives_concurrent_style_updates() {
         .collect();
     assert_eq!(ids, ["a", "c"]);
 }
+
+/// The first ```toml fence after `<!-- test:NAME -->` in the README.
+fn readme_block(name: &str) -> String {
+    let readme = include_str!("../../../README.md");
+    let after = readme
+        .split(&format!("<!-- test:{name} -->"))
+        .nth(1)
+        .unwrap();
+    let body = after.split("```toml\n").nth(1).unwrap();
+    body.split("```").next().unwrap().to_string()
+}
+
+#[test]
+fn the_readme_quickstart_files_are_valid() {
+    let t = tempdir("crew-readme-");
+    let crew_toml = format!(
+        "{}\n{}",
+        readme_block("crew-toml"),
+        readme_block("usher-table")
+    );
+    fs::write(t.path().join("crew.toml"), &crew_toml).unwrap();
+    fs::write(t.path().join("plan.toml"), readme_block("plan-toml")).unwrap();
+    let q = crate::config::load(t.path()).unwrap();
+    assert_eq!(
+        (q.integration_branch.as_str(), q.base.as_str()),
+        ("crew/integration", "main")
+    );
+    let ledger = crew_ledger::Ledger::open(t.path()).unwrap();
+    assert_eq!(ledger.plan().steps.len(), 2);
+    assert!(crew_ledger::check(&ledger).unwrap().is_empty());
+    let rules = crew_usher_client::kind::ProjectRules::parse(&crew_toml, "crew.toml").unwrap();
+    let argv = |c: &str| c.split(' ').map(str::to_string).collect::<Vec<_>>();
+    assert_eq!(
+        crew_usher_client::kind::infer_with(&argv("my-ctl launch --world W"), &rules),
+        crew_proto::JobKind::Game
+    );
+}
