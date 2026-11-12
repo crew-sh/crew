@@ -18,8 +18,8 @@ const EXIT_NOTHING_TO_CANCEL: u8 = 1;
 const USAGE: &str = "\
 usage: crew <command> [args]
 
-  run [--kind build|test|harness|game|bench|lsp|other] [--mem 8G] [--cpus N] [--display] -- CMD...
-                       run CMD under the usher's admission control
+  run [--kind build|test|harness|game|bench|lsp|other] [--mem 8G] [--cpus N] [--display] [--exclusive] -- CMD...
+                       run CMD under the usher's admission control; --exclusive runs it alone (timing benchmarks)
   run --detach [--log FILE] ... -- CMD...
                        the usher queues and runs CMD itself, so it outlives you; prints the job id and exits
   jobs [--json]        queued, running and recently finished jobs, with exit codes and log paths

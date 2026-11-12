@@ -369,6 +369,10 @@ pub struct Daemon {
     finished: Vec<DetachedJob>,
     running: Vec<RunningJob>,
     owner: Owner,
+    /// When the owner was last seen to leave; the drain clock of exclusive jobs starts there.
+    owner_away_since_ms: Option<u64>,
+    /// The exclusive job the last pass drained for, so the log notes when a drain starts.
+    draining_for: Option<String>,
     load: CpuLoad,
     finished_cpu_usec: u64,
     waits: Vec<PendingWait>,
@@ -517,6 +521,8 @@ impl Daemon {
             finished: Vec::new(),
             running: Vec::new(),
             owner: Owner::default(),
+            owner_away_since_ms: None,
+            draining_for: None,
             load: CpuLoad::default(),
             finished_cpu_usec: 0,
             waits: Vec::new(),
@@ -904,16 +910,29 @@ impl Daemon {
             unmanaged_cores: self.load.unmanaged_cores,
             free_disk,
             owner_present: self.owner.present(),
+            owner_away_since_ms: (!self.owner.present())
+                .then(|| self.owner_away_since_ms.unwrap_or_else(|| self.now_ms())),
             now_ms: self.now_ms(),
         }
     }
 
-    fn reschedule(&mut self) {
-        if self.queue.is_empty() {
-            return;
+    fn track_owner(&mut self) {
+        if self.owner.present() {
+            self.owner_away_since_ms = None;
+        } else if self.owner_away_since_ms.is_none() {
+            self.owner_away_since_ms = Some(self.now_ms());
         }
-        let facts = self.facts();
-        let running: Vec<Running> = self
+    }
+
+    fn learned_wall(&self, req: &JobRequest) -> Option<u64> {
+        self.sizes
+            .expected(&sizes::key(req))
+            .and_then(|l| l.wall_ms)
+    }
+
+    /// The running jobs and the queue as admission sees them.
+    fn admission_inputs(&self) -> (Vec<Running>, Vec<Waiting>) {
+        let running = self
             .running
             .iter()
             .map(|r| Running {
@@ -922,9 +941,11 @@ impl Daemon {
                 expected_mem: r.expected_mem,
                 expected_cores: r.expected_cores,
                 observed_peak: r.stats.peak_worth_learning(),
+                exclusive: r.req.exclusive,
+                ends_at_ms: self.learned_wall(&r.req).map(|w| r.started_ms + w),
             })
             .collect();
-        let waiting: Vec<Waiting> = self
+        let waiting = self
             .queue
             .iter()
             .map(|q| Waiting {
@@ -935,9 +956,43 @@ impl Daemon {
                 expected_cores: q.expected_cores,
                 needs_display: q.req.needs_display,
                 queued_at_ms: q.queued_at_ms,
+                exclusive: q.req.exclusive,
+                expected_wall_ms: self.learned_wall(&q.req),
             })
             .collect();
-        let verdicts = admission::schedule(&self.cfg, &facts, &running, &waiting);
+        (running, waiting)
+    }
+
+    /// When each queued job should start, in ms from now, and the exclusive job the machine drains for.
+    fn outlook(&self) -> (BTreeMap<String, u64>, Option<String>) {
+        if self.queue.is_empty() {
+            return (BTreeMap::new(), None);
+        }
+        let facts = self.facts();
+        let (running, waiting) = self.admission_inputs();
+        let draining_for = admission::schedule(&self.cfg, &facts, &running, &waiting).draining_for;
+        (
+            admission::starts(&self.cfg, &facts, &running, &waiting),
+            draining_for,
+        )
+    }
+
+    fn reschedule(&mut self) {
+        self.track_owner();
+        if self.queue.is_empty() {
+            return;
+        }
+        let facts = self.facts();
+        let (running, waiting) = self.admission_inputs();
+        let plan = admission::schedule(&self.cfg, &facts, &running, &waiting);
+        if plan.draining_for.is_some() && plan.draining_for != self.draining_for {
+            self.log.line(&format!(
+                "DRAIN for {}",
+                plan.draining_for.as_deref().unwrap_or_default()
+            ));
+        }
+        self.draining_for = plan.draining_for;
+        let verdicts = plan.verdicts;
         let mut position = 0u32;
         for (id, verdict) in verdicts {
             let Some(at) = self.queue.iter().position(|q| q.req.id == id) else {
@@ -1188,8 +1243,11 @@ impl Daemon {
             let cores_milli = u32::try_from(done.cpu_usec / done.wall_ms).unwrap_or(u32::MAX);
             self.sizes.record(
                 &sizes::key(&job.req),
-                done.peak_mem_bytes,
-                cores_milli,
+                sizes::Learned {
+                    peak_mem_bytes: done.peak_mem_bytes,
+                    cores_milli,
+                    wall_ms: Some(done.wall_ms),
+                },
                 self.boot_unix_ms + self.started.elapsed().as_millis() as u64,
             );
             if let Err(e) = self.sizes.save(&self.sizes_path) {
@@ -1510,6 +1568,7 @@ impl Daemon {
 
     fn top(&self) -> TopReply {
         let now = self.now_ms();
+        let (starts, draining_for) = self.outlook();
         let snap = machine::snapshot(&[]).unwrap_or_default();
         let view = |req: &JobRequest,
                     kind: JobKind,
@@ -1530,6 +1589,7 @@ impl Daemon {
             mem_bytes: s.mem_current,
             io_bytes: s.io_read + s.io_write,
             waiting_on: waiting as i32,
+            ..JobView::default()
         };
         let running = self
             .running
@@ -1549,8 +1609,10 @@ impl Daemon {
         let queued = self
             .queue
             .iter()
-            .map(|q| {
-                view(
+            .map(|q| JobView {
+                starts_in_ms: starts.get(&q.req.id).copied(),
+                detail: q.detail.clone(),
+                ..view(
                     &q.req,
                     q.kind,
                     q.expected_mem,
@@ -1605,6 +1667,7 @@ impl Daemon {
                 idle_watcher: self.owner.watcher as i32,
                 unmanaged_cpu_pct: self.load.unmanaged_cores / f64::from(snap.cpu_count.max(1))
                     * 100.0,
+                draining_for: draining_for.unwrap_or_default(),
             }),
         }
     }
@@ -1991,6 +2054,7 @@ impl Daemon {
     }
 
     fn jobs(&self) -> JobsReply {
+        let (starts, _) = self.outlook();
         let queued = self.queue.iter().map(|q| {
             let (detached, log_path) = match &q.origin {
                 Origin::Attached(_) | Origin::Adopted => (false, String::new()),
@@ -2012,6 +2076,7 @@ impl Daemon {
                 queued_at_unix_ms: q.queued_at_ms,
                 started_at_unix_ms: 0,
                 finished_at_unix_ms: 0,
+                starts_in_ms: starts.get(&q.req.id).copied(),
             }
         });
         let running = self.running.iter().map(|r| {
@@ -2035,6 +2100,7 @@ impl Daemon {
                 queued_at_unix_ms: r.queued_at_ms,
                 started_at_unix_ms: r.started_ms,
                 finished_at_unix_ms: 0,
+                starts_in_ms: None,
             }
         });
         let finished = self.finished.iter().rev().map(detached::summary);

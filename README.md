@@ -102,7 +102,10 @@ It guesses the job kind from the command: `cargo build` is a build, `cargo test`
 
 ```sh
 crew run --kind bench --mem 8G -- ./run-benchmarks.sh
+crew run --kind bench --exclusive -- ./time-it.sh
 ```
+
+A `bench` is heavy work that waits until you are away; it runs beside other jobs when memory, cores and disk allow. `--exclusive` asks for the machine to itself, for timing benchmarks: nothing else runs beside the job, and it too waits until you are away. Memory measurements and builds never need it.
 
 If the usher is not running when `crew run` starts, it prints a note and runs the command unmanaged. Set `CREW_STRICT=1` to make that an error.
 
@@ -110,7 +113,12 @@ A job whose memory can never fit is refused at once (exit 75) with the numbers: 
 
 A job that is already queued never does that. If the usher restarts while `crew run` waits in its queue, `crew run` keeps the job id and its original queue time, retries the connection with a growing delay for up to five minutes, and queues the job again. It never runs the command on its own, so a bench that waits for you to be away still waits. Only when the usher stays gone for the whole five minutes does it fail (exit 125).
 
-The queued message names its cause. A job that waits on memory prints the rule and the numbers, for example `needs 16.0 GiB + 16.0 GiB kept free = 32.0 GiB; 28.1 GiB available (31.0 GiB free - 2.9 GiB reserved by other jobs); queue position is not the cause`. A job held back by another waiting job names it, for example `queue order: behind test 1a2b3c4d (myrepo: cargo test), which has waited 11m on memory: ...`.
+The queued message names its cause. A job that waits on memory prints the rule and the numbers, for example `needs 16.0 GiB + 16.0 GiB kept free = 32.0 GiB; 28.1 GiB available (31.0 GiB free - 2.9 GiB reserved by other jobs); queue position is not the cause`.
+
+Every wait is on a resource: memory, cores, the game cap, disk, your presence, or a running exclusive job. Queue position alone never holds a job back, with two exceptions that say so:
+
+- A job that has waited `starve_after_secs` (10 minutes) on memory or cores holds what it lacks. A later job still starts if it should end before the held job can start (by its learned duration), or if it fits in what the held job leaves spare once everything now running has ended. Otherwise it waits with the reason, for example `memory is held for test 1a2b3c4d (myrepo: cargo test), which has waited 11m on memory: ...`.
+- An exclusive job lets others start beside the running ones while it cannot start anyway. Once it has waited `exclusive_drain_after_secs` (10 minutes) while you were away, the usher drains: no new job starts, the running ones finish, and it runs alone. Those jobs wait on `drain`, and `crew top` shows `draining for <job>`. An exclusive job therefore waits at most that long plus the longest job running when the drain began.
 
 #### Detached jobs
 
@@ -134,9 +142,9 @@ crew cancel <id>           # remove a queued job, or SIGTERM a running one (SIGK
 
 The usher writes its queued and running jobs, and the finished detached ones it keeps, to `$XDG_STATE_HOME/crew/usher-jobs.pb`, replacing the file in one step (synced to disk). A file that is cut off, damaged or from a newer usher is never read as an empty queue: it is moved to `usher-jobs.pb.corrupt-<time>` and the log says so. The same holds for `usher-sizes.pb`. A restarted usher reads the state back:
 
-- A `crew run` job that was running keeps its place: its live scope is counted as a running job (reservations, bench exclusivity) until the scope ends, and the usher stops that scope if its `crew run` process has died meanwhile. A `crew run` client that was queued keeps its queue time when it comes back; a client's own claim of a queue time is not believed.
+- A `crew run` job that was running keeps its place: its live scope is counted as a running job (reservations, exclusivity) until the scope ends, and the usher stops that scope if its `crew run` process has died meanwhile. A `crew run` client that was queued keeps its queue time when it comes back; a client's own claim of a queue time is not believed.
 
-- Queued jobs return with their original queue time, so the order, and the 10-minute starvation rule, carry on as if nothing happened.
+- Queued jobs return with their original queue time, so the order, and the 10-minute starvation rule, carry on as if nothing happened. The drain clock of an exclusive job starts again. A job queued before `--exclusive` existed is not exclusive.
 - A running job whose scope is still alive is watched again, and its exit status comes from a file the job's wrapper writes (`<state dir>/jobs/<id>.status`).
 - A running job whose scope is gone is marked finished if the status file is there, and failed otherwise. `crew jobs` shows the reason.
 
@@ -274,6 +282,7 @@ Other agents run on this machine. Use crew so we do not starve each other.
 - Run heavy commands as `crew run -- <command>`: builds, test suites, benchmarks, anything that uses many cores or much memory. Build Rust with `crew cargo <args>`; it goes through the same admission.
 - A job that will wait for hours, or that must keep waiting after you are gone, goes in as `crew run --detach -- <command>`. The usher keeps it, even across its own restarts. Follow it with `crew wait job <id>`, look at `crew jobs`, read the log it names.
 - Run `crew top` to see what is running and what you are waiting on. Do not start a second copy of a job that is already queued.
+- Pass `--exclusive` only when a measurement needs the machine to itself (timings). Memory measurements, builds and tests never do; `--kind bench` alone already waits until the owner is away.
 - Never run `crew plan approve`, and never read `~/.config/crew/owner-token`. Approvals come from the owner. If a step is gated, report it and wait.
 - `crew run` exits 75 when it refuses a job (low disk, no display while the owner is here). Do not retry in a loop. Report it.
 - Do not open windows. crew removes DISPLAY and WAYLAND_DISPLAY from your jobs on purpose.
@@ -297,6 +306,7 @@ max_games = 4
 cpu_oversub = 1.5
 idle_timeout_secs = 120
 starve_after_secs = 600
+exclusive_drain_after_secs = 600
 min_free_disk_gib = { "/" = 20 }
 
 [owner_present_weights]
@@ -321,7 +331,8 @@ freeze_psi_cpu = 40.0
 | `tmp_root` | Each job gets `TMPDIR=<tmp_root>/<job id>`, a directory only you can enter. Default: `$XDG_RUNTIME_DIR/crew/tmp`, else `<system temp dir>/crew`. A root owned by another user is refused (the job runs without a private `TMPDIR`). At start the usher removes job directories (UUID-named, older than 5 minutes) that no scope or known job holds. |
 | `owner_present_weights` | While you are present, running jobs get at most this cgroup `cpu.weight` and `io.weight` (the normal weight is 100). |
 | `idle_timeout_secs` | Seconds without input before the compositor calls you idle. |
-| `starve_after_secs` | A job that waited this long stops later jobs from jumping ahead of it. A starved job that waits for the game cap holds back other games only. |
+| `starve_after_secs` | A job that waited this long on memory or cores holds what it lacks: later jobs start only where they would not delay it. |
+| `exclusive_drain_after_secs` | An exclusive job that waited this long while you were away stops new jobs from starting, so the running ones finish and it can run. |
 | `manual_away_max_secs` | A manual `crew owner away` ends after this long. Default 8 hours. |
 | `learn_min_wall_secs` | Runs shorter than this, and runs that failed, teach the usher nothing about a command's size. Default 5. |
 | `max_connections` | Open client connections beyond this are turned away. Every queued `crew run` and every waiter holds one. Default 512. |
@@ -351,9 +362,10 @@ mem_cap_gib = 8
 | `expected_mem_gib` | Memory the usher reserves for the job. |
 | `expected_cores` | Cores the usher reserves for the job. |
 | `cpu_weight`, `io_weight` | cgroup weights. |
-| `exclusive` | The job runs alone, and only while you are away. |
+| `exclusive` | Every job of the kind runs alone, and only while you are away, as with `--exclusive`. |
+| `away_only` | Jobs of the kind run only while you are away. |
 
-Built-in values: every kind expects 2 GiB, 1 core and weight 100. Exceptions: `build` expects 4 cores. `game` is capped at 6 GiB and expects 6. `bench` is exclusive. `lsp` has `cpu_weight` 20.
+Built-in values: every kind expects 2 GiB, 1 core and weight 100. Exceptions: `build` expects 4 cores. `game` is capped at 6 GiB and expects 6. `bench` runs only while you are away (it is not exclusive; `--exclusive` asks for that). `lsp` has `cpu_weight` 20.
 
 Once the usher has seen a command run, it reserves the median of its last 20 successful runs instead of these numbers, held between half and eight times the kind's expectation. A size you give with `--mem` always wins. The figure is the job's working set (anonymous, shared and kernel memory), sampled while it runs: page cache a build writes is not counted. Commands unseen for 28 days are forgotten. It keeps them in `$XDG_STATE_HOME/crew/usher-sizes.pb`. The log is `usher.log` in the same directory. Detached jobs keep `usher-jobs.pb` and a `jobs/` folder there too.
 

@@ -40,6 +40,8 @@ message JobRequest {
   map<string, string> env = 13;
   // Where a detached job's stdout and stderr go; empty means a file under the usher's state directory.
   string log_path = 14;
+  // Run alone (timing benchmarks): no other job runs beside it, and it runs only while the owner is away.
+  bool exclusive = 15;
 }
 
 enum Decision {
@@ -57,6 +59,8 @@ enum WaitingOn {
   WAITING_ON_OWNER_PRESENT = 4;
   WAITING_ON_DISK = 5;
   WAITING_ON_EXCLUSIVE = 6;
+  // An exclusive job has waited long enough: no new job starts until the running ones end and it has run.
+  WAITING_ON_DRAIN = 7;
 }
 
 enum RefusalReason {
@@ -156,6 +160,10 @@ message JobView {
   uint64 mem_bytes = 10;
   uint64 io_bytes = 11;
   WaitingOn waiting_on = 12;
+  // Queued jobs: when the job is expected to start, from learned durations; unset when that is unknown.
+  optional uint64 starts_in_ms = 13;
+  // Queued jobs: what the wait is, with the numbers.
+  string detail = 14;
 }
 
 message DiskView {
@@ -187,6 +195,8 @@ message MachineView {
   OwnerSource owner_source = 10;
   double unmanaged_cpu_pct = 11;
   IdleWatcher idle_watcher = 12;
+  // The exclusive job the usher drains the machine for; empty when it drains for none.
+  string draining_for = 13;
 }
 
 // How the usher's idle detection is doing; anything but WATCHING means the owner counts as present.
@@ -365,6 +375,8 @@ message JobSummary {
   uint64 queued_at_unix_ms = 13;
   uint64 started_at_unix_ms = 14;
   uint64 finished_at_unix_ms = 15;
+  // Queued jobs: when the job is expected to start, from learned durations; unset when that is unknown.
+  optional uint64 starts_in_ms = 16;
 }
 
 message JobsReply {
@@ -408,6 +420,8 @@ message JobsFile {
 message SizeSample {
   uint64 peak_mem_bytes = 1;
   uint32 cores_milli = 2;
+  // How long the run took; zero in files from before durations were learned.
+  uint64 wall_ms = 3;
 }
 
 message SizeEntry {

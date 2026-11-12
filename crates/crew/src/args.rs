@@ -127,6 +127,7 @@ fn parse_run(args: &[String]) -> Result<Sub, String> {
                 opts.cpus = Some(v.parse().map_err(|_| format!("bad --cpus `{v}`"))?);
             }
             "--display" => opts.display = true,
+            "--exclusive" => opts.exclusive = true,
             "--json" => opts.json = true,
             "--detach" => detach = true,
             "--log" => opts.log = Some(value(&mut it, "--log")?.into()),
@@ -254,9 +255,11 @@ mod tests {
     fn run_flags_and_command() {
         let o = run("run --kind test --mem 8G --cpus 4 --display -- cargo test -p x");
         assert_eq!(
-            (o.kind, o.mem_bytes, o.cpus, o.display),
-            (Some(JobKind::Test), Some(8 << 30), Some(4), true)
+            (o.kind, o.mem_bytes, o.cpus, o.display, o.exclusive),
+            (Some(JobKind::Test), Some(8 << 30), Some(4), true, false)
         );
+        assert!(run("run --exclusive -- ./time.sh").exclusive);
+        assert!(detach("run --detach --exclusive --kind bench -- ./time.sh").exclusive);
         assert_eq!(o.argv, ["cargo", "test", "-p", "x"]);
         assert_eq!(run("run -- sh -c exit").argv, ["sh", "-c", "exit"]);
         assert_eq!(run("run true --kind").argv, ["true", "--kind"]);

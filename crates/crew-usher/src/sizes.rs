@@ -17,6 +17,8 @@ const KEEP_KEY_MS: u64 = 28 * 24 * 3600 * 1000;
 pub struct Learned {
     pub peak_mem_bytes: u64,
     pub cores_milli: u32,
+    /// Median run time; `None` until a run with a known duration was recorded.
+    pub wall_ms: Option<u64>,
 }
 
 #[derive(Debug, Default, PartialEq)]
@@ -128,11 +130,12 @@ impl Sizes {
         state_file::write_atomic(path, &file.encode_to_vec())
     }
 
-    pub fn record(&mut self, key: &str, peak_mem_bytes: u64, cores_milli: u32, now_ms: u64) {
+    pub fn record(&mut self, key: &str, run: Learned, now_ms: u64) {
         let list = self.samples.entry(key.to_string()).or_default();
         list.push(SizeSample {
-            peak_mem_bytes,
-            cores_milli,
+            peak_mem_bytes: run.peak_mem_bytes,
+            cores_milli: run.cores_milli,
+            wall_ms: run.wall_ms.unwrap_or(0),
         });
         if list.len() > KEEP_SAMPLES {
             list.remove(0);
@@ -167,6 +170,7 @@ impl Sizes {
         Some(Learned {
             peak_mem_bytes: median(list.iter().map(|s| s.peak_mem_bytes).collect())?,
             cores_milli: median(list.iter().map(|s| s.cores_milli).collect())?,
+            wall_ms: median(list.iter().map(|s| s.wall_ms).filter(|w| *w > 0).collect()),
         })
     }
 }
@@ -174,6 +178,14 @@ impl Sizes {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn run(peak_mem_bytes: u64, cores_milli: u32) -> Learned {
+        Learned {
+            peak_mem_bytes,
+            cores_milli,
+            wall_ms: None,
+        }
+    }
 
     fn req(argv: &[&str]) -> JobRequest {
         JobRequest {
@@ -236,7 +248,17 @@ mod tests {
         let mut s = Sizes::default();
         assert_eq!(s.expected("k"), None);
         for peak in [3, 100, 5, 7, 9] {
-            s.record("k", peak, 1000 + peak as u32, 1);
+            // A sample from before durations were kept says nothing about the duration.
+            let wall_ms = (peak != 100).then_some(peak * 1000);
+            s.record(
+                "k",
+                Learned {
+                    peak_mem_bytes: peak,
+                    cores_milli: 1000 + peak as u32,
+                    wall_ms,
+                },
+                1,
+            );
         }
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("sizes.pb");
@@ -248,7 +270,8 @@ mod tests {
             loaded.expected("k"),
             Some(Learned {
                 peak_mem_bytes: 7,
-                cores_milli: 1007
+                cores_milli: 1007,
+                wall_ms: Some(7000),
             })
         );
         assert_eq!(Sizes::load(&dir.path().join("missing"), 1), Read::Missing);
@@ -258,10 +281,10 @@ mod tests {
     fn only_recent_samples_count() {
         let mut s = Sizes::default();
         for _ in 0..KEEP_SAMPLES {
-            s.record("k", 1, 1, 1);
+            s.record("k", run(1, 1), 1);
         }
         for _ in 0..KEEP_SAMPLES {
-            s.record("k", 50, 1, 1);
+            s.record("k", run(50, 1), 1);
         }
         assert_eq!(s.expected("k").unwrap().peak_mem_bytes, 50);
     }
@@ -269,9 +292,9 @@ mod tests {
     #[test]
     fn a_command_not_run_for_weeks_is_forgotten() {
         let mut s = Sizes::default();
-        s.record("old", 5, 5, 1_000);
-        s.record("fresh", 5, 5, KEEP_KEY_MS);
-        s.record("fresh", 6, 6, KEEP_KEY_MS + 1_000);
+        s.record("old", run(5, 5), 1_000);
+        s.record("fresh", run(5, 5), KEEP_KEY_MS);
+        s.record("fresh", run(6, 6), KEEP_KEY_MS + 1_000);
         assert_eq!(s.expected("old"), None);
         assert!(s.expected("fresh").is_some());
         assert_eq!(s.len(), 1);
@@ -294,6 +317,7 @@ mod tests {
                 samples: vec![SizeSample {
                     peak_mem_bytes: 9,
                     cores_milli: 1,
+                    wall_ms: 0,
                 }],
                 last_seen_unix_ms: 0,
             }],
@@ -302,7 +326,7 @@ mod tests {
         let Read::Loaded(mut s) = Sizes::load(&path, KEEP_KEY_MS * 2) else {
             panic!("an old-format file loads");
         };
-        s.record("other", 1, 1, KEEP_KEY_MS * 2 + 5);
+        s.record("other", run(1, 1), KEEP_KEY_MS * 2 + 5);
         assert!(
             s.expected("k").is_some(),
             "an undated key is not expired at once"

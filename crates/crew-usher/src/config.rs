@@ -72,6 +72,7 @@ pub struct KindOverride {
     pub cpu_weight: Option<u32>,
     pub io_weight: Option<u32>,
     pub exclusive: Option<bool>,
+    pub away_only: Option<bool>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Deserialize)]
@@ -93,7 +94,10 @@ pub struct KindSpec {
     pub expected_cores: f64,
     pub cpu_weight: u32,
     pub io_weight: u32,
+    /// Every job of the kind runs alone, as if it asked for `--exclusive`.
     pub exclusive: bool,
+    /// The kind runs only while the owner is away.
+    pub away_only: bool,
 }
 
 fn watched_paths_for(home: Option<&Path>) -> Vec<String> {
@@ -140,6 +144,8 @@ pub struct Config {
     pub tmp_root: String,
     pub idle_timeout_secs: u64,
     pub starve_after_secs: u64,
+    /// An exclusive job that waited this long on other jobs stops new ones from starting, so the machine drains for it.
+    pub exclusive_drain_after_secs: u64,
     /// A manual `crew owner away` ends after this long, so a forgotten one cannot admit benches forever.
     pub manual_away_max_secs: u64,
     /// Runs shorter than this, and runs that failed, teach the usher nothing about a command's size.
@@ -165,6 +171,7 @@ impl Default for Config {
             tmp_root: default_tmp_root(),
             idle_timeout_secs: 120,
             starve_after_secs: 600,
+            exclusive_drain_after_secs: 600,
             manual_away_max_secs: 8 * 3600,
             learn_min_wall_secs: 5,
             max_connections: 512,
@@ -183,6 +190,7 @@ fn builtin(kind: JobKind) -> KindSpec {
         cpu_weight: 100,
         io_weight: 100,
         exclusive: false,
+        away_only: false,
     };
     match kind {
         JobKind::Build => KindSpec {
@@ -195,7 +203,7 @@ fn builtin(kind: JobKind) -> KindSpec {
             ..base
         },
         JobKind::Bench => KindSpec {
-            exclusive: true,
+            away_only: true,
             ..base
         },
         JobKind::Lsp => KindSpec {
@@ -270,6 +278,7 @@ impl Config {
             cpu_weight: o.cpu_weight.unwrap_or(b.cpu_weight),
             io_weight: o.io_weight.unwrap_or(b.io_weight),
             exclusive: o.exclusive.unwrap_or(b.exclusive),
+            away_only: o.away_only.unwrap_or(b.away_only),
         }
     }
 
@@ -299,7 +308,7 @@ mod tests {
         assert_eq!(c.watched_paths[0], "/");
         assert_eq!(c.kind(JobKind::Game).mem_cap, Some(6 * GIB));
         assert_eq!(c.kind(JobKind::Lsp).cpu_weight, 20);
-        assert!(c.kind(JobKind::Bench).exclusive);
+        assert!(c.kind(JobKind::Bench).away_only && !c.kind(JobKind::Bench).exclusive);
         assert_eq!(c.kind(JobKind::Build).expected_cores, 4.0);
     }
 

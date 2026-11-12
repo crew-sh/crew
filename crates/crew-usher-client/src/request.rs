@@ -43,6 +43,7 @@ pub struct Inputs<'a> {
     pub mem_bytes: Option<u64>,
     pub cpus: Option<u32>,
     pub display: bool,
+    pub exclusive: bool,
 }
 
 pub fn build(i: &Inputs<'_>) -> JobRequest {
@@ -60,6 +61,7 @@ pub fn build(i: &Inputs<'_>) -> JobRequest {
         agent: i.env.get("CREW_AGENT").cloned().unwrap_or_default(),
         declared,
         needs_display: i.display,
+        exclusive: i.exclusive,
         desktop: i.env.get("CREW_DESKTOP").is_some_and(|v| v == "1"),
         display_env: DISPLAY_VARS
             .iter()
@@ -113,10 +115,11 @@ mod tests {
             mem_bytes: Some(1),
             cpus: None,
             display: true,
+            exclusive: true,
         });
         assert_eq!(
-            (r.agent.as_str(), r.desktop, r.needs_display),
-            ("a1", true, true)
+            (r.agent.as_str(), r.desktop, r.needs_display, r.exclusive),
+            ("a1", true, true, true)
         );
         assert_eq!(r.display_env.len(), 1);
         assert_eq!(r.declared.unwrap().mem_bytes, Some(1));

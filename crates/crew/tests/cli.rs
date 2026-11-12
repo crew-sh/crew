@@ -297,11 +297,11 @@ fn a_crew_job_variable_that_does_not_match_the_callers_scope_is_ignored() {
 }
 
 #[test]
-fn a_claimed_job_does_not_bypass_a_running_bench() {
+fn a_claimed_job_does_not_bypass_a_running_exclusive_bench() {
     let Some(d) = Daemon::start() else { return };
     assert!(d.crew(&["owner", "away"]).status.success());
     let mut bench = Command::new(CREW)
-        .args(["run", "--kind", "bench", "--", "sleep", "3"])
+        .args(["run", "--kind", "bench", "--exclusive", "--", "sleep", "3"])
         .env("CREW_SOCKET", &d.socket)
         .env_remove("CREW_JOB")
         .spawn()
@@ -478,7 +478,10 @@ fn run_json_reports_granted_and_done_on_stderr_and_leaves_stdout_alone() {
 fn wait_blocks_on_the_usher_and_returns_when_the_condition_holds() {
     let Some(d) = Daemon::start() else { return };
     assert!(d.crew(&["owner", "away"]).status.success());
-    let mut first = spawn_crew(&d, &["run", "--kind", "bench", "--", "sleep", "2"]);
+    let mut first = spawn_crew(
+        &d,
+        &["run", "--kind", "bench", "--exclusive", "--", "sleep", "2"],
+    );
     until("the first bench to run", || {
         (top_json(&d).running.len() == 1).then_some(())
     });
@@ -646,6 +649,29 @@ fn agent_sessions_are_observed_per_project_and_never_touched() {
         "{state}"
     );
     drop(guarded);
+}
+
+#[test]
+fn benches_without_exclusive_run_side_by_side_with_each_other_and_a_build() {
+    let Some(d) = Daemon::start() else { return };
+    assert!(d.crew(&["owner", "away"]).status.success());
+    let mut jobs = [
+        spawn_crew(&d, &["run", "--kind", "bench", "--", "sleep", "5"]),
+        spawn_crew(&d, &["run", "--kind", "bench", "--", "sleep", "5"]),
+        spawn_crew(&d, &["run", "--kind", "build", "--", "sleep", "5"]),
+    ];
+    let kinds = until("all three to run at once", || {
+        let t = top_json(&d);
+        (t.running.len() == 3).then(|| {
+            let mut k: Vec<String> = t.running.into_iter().map(|j| j.kind).collect();
+            k.sort();
+            k
+        })
+    });
+    assert_eq!(kinds, ["bench", "bench", "build"]);
+    for j in &mut jobs {
+        assert!(j.wait().unwrap().success());
+    }
 }
 
 #[test]

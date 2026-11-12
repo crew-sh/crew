@@ -46,6 +46,8 @@ pub struct RunOptions {
     pub claimed_job: Option<String>,
     /// With `Client::detach`: where the job's output goes; default is a file in the usher's state directory.
     pub log: Option<PathBuf>,
+    /// Run alone (`--exclusive`): nothing else runs beside the job, and it waits for the owner to be away.
+    pub exclusive: bool,
 }
 
 /// A job the usher now owns.
@@ -234,6 +236,7 @@ impl Client {
             mem_bytes: opts.mem_bytes,
             cpus: opts.cpus,
             display: opts.display,
+            exclusive: opts.exclusive,
         });
         req.detach = true;
         req.env = env.into_iter().collect();
@@ -362,6 +365,7 @@ impl Client {
             mem_bytes: opts.mem_bytes,
             cpus: opts.cpus,
             display: opts.display,
+            exclusive: opts.exclusive,
         });
 
         // A command already inside a granted job runs within that job's scope and grant; asking again could deadlock on the parent's reservation.

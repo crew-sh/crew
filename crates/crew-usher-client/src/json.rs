@@ -43,7 +43,8 @@ mirror!(
             GameCap,
             OwnerPresent,
             Disk,
-            Exclusive
+            Exclusive,
+            Drain
         }
 );
 mirror!(

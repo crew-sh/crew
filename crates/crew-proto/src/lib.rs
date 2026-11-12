@@ -121,6 +121,7 @@ impl WaitingOn {
             Self::OwnerPresent => "owner present",
             Self::Disk => "disk",
             Self::Exclusive => "exclusive job",
+            Self::Drain => "drain",
         }
     }
 }

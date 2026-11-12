@@ -870,11 +870,14 @@ fn a_restarted_usher_still_counts_the_crew_run_jobs_that_are_running() {
         "{}",
         f.log()
     );
-    // A bench needs the machine to itself, so it must wait for the job the old usher granted.
+    // An exclusive bench needs the machine to itself, so it must wait for the job the old usher granted.
     f.client.set_owner(OwnerArg::Away).unwrap();
     let bench = f
         .client
-        .detach(&detach_opts(JobKind::Bench, &["true"], None))
+        .detach(&RunOptions {
+            exclusive: true,
+            ..detach_opts(JobKind::Bench, &["true"], None)
+        })
         .unwrap();
     thread::sleep(Duration::from_millis(1500));
     assert_eq!(
