@@ -2,7 +2,7 @@
 
 Tools for running many AI coding agents on one Linux machine.
 
-- **usher** is a small daemon that decides when each heavy job may start. `crew run`, `crew top`, `crew owner` and `crew wait` talk to it.
+- **usher** is a small daemon that decides when each heavy job may start. `crew run`, `crew jobs`, `crew cancel`, `crew top`, `crew owner` and `crew wait` talk to it.
 - **crew queue** is a merge queue. Agents submit branches. It lands them in batches and bisects a red batch.
 - **crew plan** is a typed plan ledger. It records what was asked, what was added on top, who approved it, and how much each step used.
 - **crew cargo** runs cargo through the [mbx](https://github.com/jdx/mr-boxington) build cache under an usher grant, and `crew build` shows what the cache did.
@@ -100,7 +100,39 @@ It guesses the job kind from the command: `cargo build` is a build, `cargo test`
 crew run --kind bench --mem 8G -- ./run-benchmarks.sh
 ```
 
-If the usher is not running, `crew run` prints a note and runs the command unmanaged. Set `CREW_STRICT=1` to make that an error.
+If the usher is not running when `crew run` starts, it prints a note and runs the command unmanaged. Set `CREW_STRICT=1` to make that an error.
+
+A job that is already queued never does that. If the usher restarts while `crew run` waits in its queue, `crew run` keeps the job id and its original queue time, retries the connection with a growing delay for up to five minutes, and queues the job again. It never runs the command on its own, so a bench that waits for you to be away still waits. Only when the usher stays gone for the whole five minutes does it fail (exit 125).
+
+The queued message names its cause. A job that waits on memory prints the rule and the numbers, for example `needs 16.0 GiB + 16.0 GiB kept free = 32.0 GiB; 28.1 GiB available (31.0 GiB free - 2.9 GiB reserved by other jobs); queue position is not the cause`. A job held back by another waiting job names it, for example `queue order: behind test 1a2b3c4d (myrepo: cargo test), which has waited 11m on memory: ...`.
+
+#### Detached jobs
+
+A queued `crew run` lives only as long as its client. For a job that waits hours, or must outlive the agent that submitted it, hand it to the usher:
+
+```sh
+crew run --detach --kind bench -- ./run-benchmarks.sh
+crew run --detach --log /tmp/bench.log -- ./run-benchmarks.sh
+```
+
+The usher takes the command, its working directory, the environment of the client and the limits. It then owns the job. It prints the job id on stdout, writes where the output goes on stderr, and exits 0 at once. `--json` also prints a `detached` event on stderr. The usher queues the job like any other, starts it in its own scope when it is granted, and appends its stdout and stderr to the log. The default log is `<state dir>/jobs/<id>.log` (the state dir is `$XDG_STATE_HOME/crew`). The client may exit, or its agent may end; nothing stops the job but `crew cancel`. Without a usher, `--detach` fails with exit 125, since there is nobody to own the job.
+
+```sh
+crew jobs                  # queued, running and recently finished jobs, with exit codes and log paths
+crew jobs --json
+crew wait job <id>         # blocks until a detached job finishes, then exits with its exit code
+crew cancel <id>           # remove a queued job, or SIGTERM a running one (SIGKILL after 10 s)
+```
+
+`crew jobs` shows detached jobs and the jobs that `crew run` clients hold; it keeps the last 100 detached jobs that finished in the past 7 days. Their records, and the default logs the usher made for them, go after that. A log you chose with `--log` is never removed.
+
+The usher writes its queued and running detached jobs, and the finished ones it keeps, to `$XDG_STATE_HOME/crew/usher-jobs.pb`, replacing the file in one step. A restarted usher reads it back:
+
+- Queued jobs return with their original queue time, so the order, and the 10-minute starvation rule, carry on as if nothing happened.
+- A running job whose scope is still alive is watched again, and its exit status comes from a file the job's wrapper writes (`<state dir>/jobs/<id>.status`).
+- A running job whose scope is gone is marked finished if the status file is there, and failed otherwise. `crew jobs` shows the reason.
+
+The job's environment is the client's, minus `CREW_JOB`, and the usher applies the same rules as for any granted job: it removes your display variables, sets `TMPDIR` to a private directory and sets `CREW_JOB`. The usher keeps the environment in `usher-jobs.pb` (mode 0600, since environments hold secrets) until the job finishes, and drops it then.
 
 ### 3. Look at the machine
 
@@ -137,6 +169,8 @@ crew wait job <id>
 ```
 
 `wait` blocks until the usher reports the condition. It exits 0 when the condition holds, 124 on timeout, and 2 if the job never ran. The usher notifies. Nothing polls.
+
+`crew wait job <id>` on a detached job waits until it finishes and exits with the job's exit code (the low 8 bits). It exits 2 if the job never ran (cancelled while queued, refused, could not start) and 125 if it ran and was lost with no exit status. A job's own exit code can be 2, 124 or 125 too; `--json` has an `outcome` and an `exit_code` to tell them apart. For a job that a `crew run` client holds, `crew wait job <id>` returns as soon as the job is running or has finished, because that client has the exit code. `crew wait job-granted <id>` means that for any job, a detached one included.
 
 Set the owner by hand with `crew owner here`, `crew owner away` or `crew owner auto`.
 
@@ -220,6 +254,7 @@ Paste this into `AGENTS.md`, `CLAUDE.md` or your agent's system prompt:
 Other agents run on this machine. Use crew so we do not starve each other.
 
 - Run heavy commands as `crew run -- <command>`: builds, test suites, benchmarks, anything that uses many cores or much memory. Build Rust with `crew cargo <args>`; it goes through the same admission.
+- A job that will wait for hours, or that must keep waiting after you are gone, goes in as `crew run --detach -- <command>`. The usher keeps it, even across its own restarts. Follow it with `crew wait job <id>`, look at `crew jobs`, read the log it names.
 - Run `crew top` to see what is running and what you are waiting on. Do not start a second copy of a job that is already queued.
 - `crew run` exits 75 when it refuses a job (low disk, no display while the owner is here). Do not retry in a loop. Report it.
 - Do not open windows. crew removes DISPLAY and WAYLAND_DISPLAY from your jobs on purpose.
@@ -298,7 +333,7 @@ mem_cap_gib = 8
 
 Built-in values: every kind expects 2 GiB, 1 core and weight 100. Exceptions: `build` expects 4 cores. `game` is capped at 6 GiB and expects 6. `bench` is exclusive. `lsp` has `cpu_weight` 20.
 
-Once the usher has seen a command run, it reserves the median of its last 20 runs instead of these numbers. It keeps them in `$XDG_STATE_HOME/crew/usher-sizes.pb`. The log is `usher.log` in the same directory.
+Once the usher has seen a command run, it reserves the median of its last 20 runs instead of these numbers. It keeps them in `$XDG_STATE_HOME/crew/usher-sizes.pb`. The log is `usher.log` in the same directory. Detached jobs keep `usher-jobs.pb` and a `jobs/` folder there too.
 
 ### `depot.toml` and `[depot]`
 
@@ -401,7 +436,7 @@ A broken `[usher]` table, a `crew.toml` that is not valid TOML, or an unreadable
 |---|---|---|
 | `CREW_AGENT` | all | Your agent name. `crew plan` falls back to `$USER`. |
 | `CREW_SOCKET` | `crew`, `crew-usher` | The usher socket. Default `$XDG_RUNTIME_DIR/crew/usher.sock`. |
-| `CREW_STRICT` | `crew run`, `crew cargo` | `1`: fail when the usher is down instead of running unmanaged. |
+| `CREW_STRICT` | `crew run`, `crew cargo` | `1`: fail when the usher is down instead of running unmanaged. (A job already queued never runs unmanaged, with or without it.) |
 | `CREW_JOB` | set by `crew run` | Set inside a granted job. A nested `crew run` runs in that job instead of queueing behind it. |
 | `CREW_DESKTOP` | `crew run` | `1`: keep the owner's display variables in the job (never for `bench`). |
 | `CREW_ROOT` | `crew plan` | The project root, instead of searching upward. |
@@ -433,7 +468,7 @@ Why separate programs:
 ## Safety
 
 - crew never opens a window or takes over a display. The usher reads idle time from the Wayland compositor and does nothing else with it. It removes `DISPLAY`, `WAYLAND_DISPLAY` and `WAYLAND_SOCKET` from job environments, so a test cannot open a window on your desktop. A private X display such as `:99` is kept. `--display` jobs are refused while you are present. `CREW_DESKTOP=1` is the one opt-out.
-- The usher kills only its own scopes: a job's scope when its `crew run` goes away or receives SIGTERM. It never signals other processes.
+- The usher kills only its own scopes: a job's scope when its `crew run` goes away or receives SIGTERM, and a detached job's scope on `crew cancel`. It never signals other processes.
 - Agent sessions (processes named `claude` or `codex`) are observed, not managed. `[adopt]` can move a session into a crew cgroup and freeze the busiest one under CPU pressure. Neither is implemented yet. `move` and `freeze` default to `false`, and when set they only write "would do" lines to the log. Sessions with a terminal, without `CREW_AGENT`, or listed in `protect` are never candidates.
 - The usher runs as you and listens on a socket in a `0700` directory. There is no authentication beyond that.
 - `crew queue` runs your `check` commands with your permissions, in worktrees under `.crew/`.
