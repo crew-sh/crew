@@ -388,11 +388,7 @@ fn an_usher_build_grant_sets_the_job_count_and_the_priority_by_owner_presence() 
         tmp_root: f.dir.path().join("jobtmp").display().to_string(),
         ..Config::default()
     };
-    let paths = Paths {
-        socket: f.dir.path().join("usher.sock"),
-        sizes: f.dir.path().join("sizes.pb"),
-        log: f.dir.path().join("usher.log"),
-    };
+    let paths = Paths::in_state(f.dir.path().join("usher.sock"), f.dir.path());
     let server = Server::start(cfg, &paths, IdleSource::Off, false).unwrap();
     let granted = |args: &[&str]| {
         let out = f

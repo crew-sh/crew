@@ -59,14 +59,13 @@ fn property_args(limits: &ScopeLimits) -> Vec<String> {
     args
 }
 
-/// Runs `argv` in a transient user scope; systemd-run execs the command itself, so the child is the command.
-pub fn spawn(
+fn command(
     argv: &[String],
     cwd: &Path,
     env: &BTreeMap<String, String>,
     limits: &ScopeLimits,
     name: &str,
-) -> io::Result<Child> {
+) -> Command {
     let mut cmd = Command::new("systemd-run");
     cmd.args(["--user", "--scope", "--quiet"])
         .arg(format!("--unit={name}"))
@@ -75,11 +74,66 @@ pub fn spawn(
         .args(argv)
         .current_dir(cwd)
         .env_clear()
-        .envs(env)
-        .stdin(Stdio::inherit())
+        .envs(env);
+    cmd
+}
+
+/// Runs `argv` in a transient user scope; systemd-run execs the command itself, so the child is the command.
+pub fn spawn(
+    argv: &[String],
+    cwd: &Path,
+    env: &BTreeMap<String, String>,
+    limits: &ScopeLimits,
+    name: &str,
+) -> io::Result<Child> {
+    let mut cmd = command(argv, cwd, env, limits, name);
+    cmd.stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
     cmd.spawn()
+}
+
+// Runs the command, then writes its exit status (128+signal when killed) to the file named by $1 through a rename.
+const STATUS_SCRIPT: &str =
+    r#"s=$1; shift; "$@"; c=$?; printf '%s\n' "$c" >"$s.tmp" && mv -f "$s.tmp" "$s"; exit "$c""#;
+
+/// `argv` behind a wrapper that leaves its exit status in `status`, for a job whose parent may not live to wait for it.
+pub fn status_wrapped(argv: &[String], status: &Path) -> Vec<String> {
+    let mut out = vec![
+        "sh".to_string(),
+        "-c".to_string(),
+        STATUS_SCRIPT.to_string(),
+        "crew-job".to_string(),
+        status.display().to_string(),
+    ];
+    out.extend_from_slice(argv);
+    out
+}
+
+/// The exit status a `status_wrapped` job left behind; `None` while there is none.
+pub fn read_status(status: &Path) -> Option<i32> {
+    fs::read_to_string(status).ok()?.trim().parse().ok()
+}
+
+/// Like `spawn`, with no stdin and stdout and stderr appended to `log`.
+pub fn spawn_logged(
+    argv: &[String],
+    cwd: &Path,
+    env: &BTreeMap<String, String>,
+    limits: &ScopeLimits,
+    name: &str,
+    log: fs::File,
+) -> io::Result<Child> {
+    let mut cmd = command(argv, cwd, env, limits, name);
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::from(log.try_clone()?))
+        .stderr(Stdio::from(log));
+    cmd.spawn()
+}
+
+/// Whether the scope's cgroup still exists, that is, whether anything in it still runs.
+pub fn alive(name: &str) -> bool {
+    cgroup_dir(name).is_dir()
 }
 
 pub fn kill(name: &str, signal: KillSignal) {
@@ -184,6 +238,23 @@ mod tests {
         assert_eq!(parse_cpu_usage_usec(""), 0);
         let io = "259:0 rbytes=100 wbytes=50 rios=1 wios=1\n8:0 rbytes=1 wbytes=2 rios=0 wios=0\n";
         assert_eq!(parse_io_stat(io), (101, 52));
+    }
+
+    #[test]
+    fn a_wrapped_command_leaves_its_exit_status_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        for (script, want) in [("exit 0", 0), ("exit 7", 7), ("kill -9 $$", 137)] {
+            let status = dir.path().join("status");
+            let argv = ["sh".to_string(), "-c".to_string(), script.to_string()];
+            let out = Command::new("env")
+                .args(status_wrapped(&argv, &status))
+                .status()
+                .unwrap();
+            assert_eq!(read_status(&status), Some(want), "{script}");
+            assert_eq!(out.code().or(Some(137)), Some(want), "{script}");
+            std::fs::remove_file(&status).unwrap();
+        }
+        assert_eq!(read_status(&dir.path().join("none")), None);
     }
 
     #[test]

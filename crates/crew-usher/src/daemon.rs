@@ -1,25 +1,30 @@
 use std::collections::{BTreeMap, VecDeque};
+use std::fs::{self, OpenOptions};
 use std::io;
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::os::unix::process::ExitStatusExt;
+use std::path::{Path, PathBuf};
+use std::process::ExitStatus;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crew_proto::{
-    Ack, Decision, DiskView, Envelope, Grant, JobDone, JobKind, JobRequest, JobView, Limits,
-    MachineView, OwnerSet, OwnerSource, Queued, Refusal, Reply, TopReply, WaitCondition,
-    WaitOutcome, WaitReply, WaitRequest, WaitingOn, envelope, reply,
+    Ack, Decision, DetachedAccepted, DetachedJob, DiskView, Envelope, Grant, JobDone, JobKind,
+    JobPhase, JobRequest, JobSummary, JobView, JobsReply, Limits, MachineView, OwnerSet,
+    OwnerSource, Queued, Refusal, RefusalReason, Reply, TopReply, WaitCondition, WaitOutcome,
+    WaitReply, WaitRequest, WaitingOn, envelope, reply,
 };
 use crew_sys::display::{self, Desktop};
 use crew_sys::idle::IdleEvent;
 use crew_sys::machine;
-use crew_sys::scope::{self, KillSignal};
+use crew_sys::scope::{self, KillSignal, ScopeLimits};
 
 use crate::admission::{self, Facts, Running, Verdict, Waiting};
 use crate::agents::{self, Agent, Collector, Planner};
 use crate::config::Config;
+use crate::detached::{self, Dirs};
 use crate::log::Log;
 use crate::pool::{self, PoolHold};
 use crate::sizes::{self, Sizes};
@@ -29,6 +34,12 @@ const TICK: Duration = Duration::from_secs(2);
 const RENOTIFY_MS: u64 = 30_000;
 const MIN_LEARNED_CORES_MILLI: u32 = 100;
 const FATE_HISTORY: usize = 1024;
+/// A client that lost the usher may claim its old queue time from a daemon that started this recently.
+const RESUBMIT_GRACE: Duration = Duration::from_secs(10 * 60);
+/// A job started this recently may not have its scope yet, so a missing scope proves nothing.
+const SCOPE_START_GRACE_MS: u64 = 10_000;
+/// A cancelled job gets SIGTERM, then SIGKILL after this long.
+const CANCEL_GRACE_MS: u64 = 10_000;
 
 #[derive(Clone)]
 pub struct Conn(Arc<Mutex<UnixStream>>);
@@ -53,38 +64,105 @@ impl Conn {
 }
 
 pub enum Msg {
-    Job { req: JobRequest, conn: Conn },
-    Done { done: JobDone },
-    Gone { job_id: String },
-    Top { conn: Conn },
-    Owner { set: OwnerSet, conn: Conn },
-    Wait { req: WaitRequest, conn: Conn },
-    Hangup { conn: Conn },
+    Job {
+        req: Box<JobRequest>,
+        conn: Conn,
+    },
+    Done {
+        done: JobDone,
+    },
+    /// The connection that carried `job_id` closed.
+    Gone {
+        job_id: String,
+        conn: Conn,
+    },
+    /// A detached job's process ended; `code` is `None` when it could not be waited for.
+    Exited {
+        job_id: String,
+        code: Option<i32>,
+    },
+    Jobs {
+        conn: Conn,
+    },
+    Cancel {
+        job_id: String,
+        conn: Conn,
+    },
+    Top {
+        conn: Conn,
+    },
+    Owner {
+        set: OwnerSet,
+        conn: Conn,
+    },
+    Wait {
+        req: WaitRequest,
+        conn: Conn,
+    },
+    Hangup {
+        conn: Conn,
+    },
     Idle(IdleEvent),
     Stop,
+}
+
+/// Who owns a job: a `crew run` client on a connection, or the usher itself.
+#[derive(Clone)]
+enum Origin {
+    Attached(Conn),
+    Detached(Files),
+}
+
+#[derive(Clone)]
+struct Files {
+    log: PathBuf,
+    status: PathBuf,
+}
+
+/// How the usher learns that a running detached job ended.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Watch {
+    /// A thread of this usher waits for the process.
+    Child,
+    /// The job outlived an earlier usher; its scope is polled and the wrapper's status file read.
+    Scope,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Cancel {
+    No,
+    Terminated { at_ms: u64 },
+    Killed,
 }
 
 struct QueuedJob {
     req: JobRequest,
     kind: JobKind,
-    conn: Conn,
+    origin: Origin,
+    /// Unix ms of the first time this job was queued, kept across usher restarts.
     queued_at_ms: u64,
     expected_mem: u64,
     expected_cores: f64,
     waiting: WaitingOn,
     last_notice_ms: Option<u64>,
+    position: u32,
+    detail: String,
 }
 
 struct RunningJob {
     req: JobRequest,
     kind: JobKind,
-    conn: Conn,
+    origin: Origin,
     scope_name: String,
+    queued_at_ms: u64,
     started_ms: u64,
     expected_mem: u64,
     expected_cores: f64,
     base_limits: Limits,
     stats: scope::Stats,
+    watch: Watch,
+    cancel: Cancel,
+    tmpdir: Option<PathBuf>,
 }
 
 struct PendingWait {
@@ -161,13 +239,27 @@ impl AgentWatch {
     }
 }
 
+/// Where the daemon keeps what must outlive it.
+#[derive(Clone, Debug)]
+pub struct StatePaths {
+    pub sizes: PathBuf,
+    pub jobs: PathBuf,
+    pub job_logs: PathBuf,
+}
+
 pub struct Daemon {
     cfg: Config,
     sizes_path: PathBuf,
+    jobs_path: PathBuf,
+    dirs: Dirs,
+    events: Sender<Msg>,
     sizes: Sizes,
     log: Arc<Log>,
     started: Instant,
+    /// Unix ms when `started` was taken; the daemon clock is this plus the time since.
+    boot_unix_ms: u64,
     queue: Vec<QueuedJob>,
+    finished: Vec<DetachedJob>,
     running: Vec<RunningJob>,
     owner: Owner,
     load: CpuLoad,
@@ -190,13 +282,37 @@ fn command_of(req: &JobRequest) -> String {
     req.argv.join(" ")
 }
 
+/// How other jobs' messages name this one: `bench 1a2b3c4d (horizon: ./m.sh)`.
+fn label_of(req: &JobRequest, kind: JobKind) -> String {
+    let id: String = req.id.chars().take(8).collect();
+    let mut cmd: String = command_of(req).chars().take(40).collect();
+    if command_of(req).chars().count() > 40 {
+        cmd.push('…');
+    }
+    format!("{} {id} ({}: {cmd})", kind.name(), req.project)
+}
+
+fn exit_code_of(status: ExitStatus) -> i32 {
+    status
+        .code()
+        .unwrap_or_else(|| 128 + status.signal().unwrap_or(0))
+}
+
+fn unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
 fn nonzero(v: u32, fallback: u32) -> u32 {
     if v == 0 { fallback } else { v }
 }
 
 impl Daemon {
-    pub fn new(cfg: Config, sizes_path: PathBuf, log: Arc<Log>) -> Self {
-        let sizes = Sizes::load(&sizes_path);
+    pub fn new(cfg: Config, paths: StatePaths, log: Arc<Log>, events: Sender<Msg>) -> Self {
+        let sizes = Sizes::load(&paths.sizes);
+        let sizes_path = paths.sizes;
         if cfg.adopt.move_ || cfg.adopt.freeze {
             log.line(
                 "WARN adopt.move and adopt.freeze are not implemented yet: dry-run log lines only",
@@ -209,13 +325,25 @@ impl Daemon {
                 cfg.adopt.protect.clone(),
             ))
         });
-        Self {
+        let mut daemon = Self {
             cfg,
             sizes_path,
+            jobs_path: paths.jobs.clone(),
+            dirs: Dirs {
+                state: paths
+                    .jobs
+                    .parent()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_default(),
+                logs: paths.job_logs,
+            },
+            events,
             sizes,
             log,
             started: Instant::now(),
+            boot_unix_ms: unix_ms(),
             queue: Vec::new(),
+            finished: Vec::new(),
             running: Vec::new(),
             owner: Owner::default(),
             load: CpuLoad::default(),
@@ -225,7 +353,9 @@ impl Daemon {
             agents,
             planner: Planner::default(),
             pool: PoolHold::default(),
-        }
+        };
+        daemon.restore();
+        daemon
     }
 
     fn sync_pool(&mut self) {
@@ -235,8 +365,9 @@ impl Daemon {
         }
     }
 
+    /// Unix ms, steady across wall-clock steps; queue times are on this clock so they survive a restart.
     fn now_ms(&self) -> u64 {
-        self.started.elapsed().as_millis() as u64
+        self.boot_unix_ms + self.started.elapsed().as_millis() as u64
     }
 
     pub fn run(mut self, rx: &Receiver<Msg>) {
@@ -256,9 +387,18 @@ impl Daemon {
 
     fn handle(&mut self, msg: Msg) {
         match msg {
-            Msg::Job { req, conn } => self.enqueue(req, conn),
+            Msg::Job { req, conn } => self.enqueue(*req, conn),
             Msg::Done { done } => self.finish(&done),
-            Msg::Gone { job_id } => self.lose(&job_id),
+            Msg::Gone { job_id, conn } => self.lose(&job_id, &conn),
+            Msg::Exited { job_id, code } => self.end_detached(&job_id, code),
+            Msg::Jobs { conn } => {
+                let reply = self.jobs();
+                conn.send(envelope::Body::JobsReply(reply));
+            }
+            Msg::Cancel { job_id, conn } => {
+                let ack = self.cancel(&job_id);
+                conn.send(envelope::Body::Ack(ack));
+            }
             Msg::Top { conn } => {
                 let reply = self.top();
                 conn.send(envelope::Body::TopReply(reply));
@@ -337,19 +477,116 @@ impl Daemon {
         (mem, cores)
     }
 
-    fn enqueue(&mut self, req: JobRequest, conn: Conn) {
+    fn insert_queued(&mut self, job: QueuedJob) {
+        let at = self
+            .queue
+            .partition_point(|q| q.queued_at_ms <= job.queued_at_ms);
+        self.queue.insert(at, job);
+    }
+
+    fn queued_job(&self, req: JobRequest, origin: Origin, queued_at_ms: u64) -> QueuedJob {
         let kind = JobKind::try_from(req.kind).unwrap_or(JobKind::Unspecified);
         let (expected_mem, expected_cores) = self.expectations(&req, kind);
-        self.queue.push(QueuedJob {
+        QueuedJob {
             req,
             kind,
-            conn,
-            queued_at_ms: self.now_ms(),
+            origin,
+            queued_at_ms,
             expected_mem,
             expected_cores,
             waiting: WaitingOn::Unspecified,
             last_notice_ms: None,
-        });
+            position: 0,
+            detail: String::new(),
+        }
+    }
+
+    fn enqueue(&mut self, req: JobRequest, conn: Conn) {
+        if req.detach {
+            return self.enqueue_detached(req, &conn);
+        }
+        if self.running.iter().any(|r| r.req.id == req.id) {
+            conn.send(envelope::Body::Ack(Ack {
+                ok: false,
+                message: format!("job {} is already running", req.id),
+            }));
+            return;
+        }
+        // The same client coming back after losing its connection keeps its place; the stale entry just gets the new connection.
+        if let Some(q) = self.queue.iter_mut().find(|q| q.req.id == req.id) {
+            q.origin = Origin::Attached(conn);
+            q.last_notice_ms = None;
+            return;
+        }
+        let now = self.now_ms();
+        let claimed = req.queued_at_unix_ms;
+        let at = if claimed > 0 && self.started.elapsed() < RESUBMIT_GRACE {
+            claimed.min(now)
+        } else {
+            now
+        };
+        if at < now {
+            self.log.line(&format!(
+                "RESUBMIT id={} queued {}s ago",
+                req.id,
+                (now - at) / 1000
+            ));
+        }
+        let job = self.queued_job(req, Origin::Attached(conn), at);
+        self.insert_queued(job);
+    }
+
+    fn reject(conn: &Conn, message: String) {
+        conn.send(envelope::Body::Ack(Ack { ok: false, message }));
+    }
+
+    fn enqueue_detached(&mut self, mut req: JobRequest, conn: &Conn) {
+        let id_ok = !req.id.is_empty()
+            && req
+                .id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-');
+        if !id_ok || req.argv.is_empty() {
+            return Self::reject(conn, "a detached job needs an id and a command".into());
+        }
+        let log = if req.log_path.is_empty() {
+            self.dirs.default_log(&req.id)
+        } else {
+            PathBuf::from(&req.log_path)
+        };
+        let files = Files {
+            log: log.clone(),
+            status: self.dirs.status(&req.id),
+        };
+        if self.job_state(&req.id) != JobState::Unknown {
+            // A retried submit finds its job already here.
+            conn.send(envelope::Body::DetachedAccepted(DetachedAccepted {
+                job_id: req.id.clone(),
+                log_path: log.display().to_string(),
+            }));
+            return;
+        }
+        if let Err(e) = fs::create_dir_all(&self.dirs.logs).and_then(|()| open_log(&log)) {
+            return Self::reject(conn, format!("cannot write the log {}: {e}", log.display()));
+        }
+        req.log_path = log.display().to_string();
+        let now = self.now_ms();
+        let job = self.queued_job(req.clone(), Origin::Detached(files), now);
+        self.log.line(&format!(
+            "DETACH id={} kind={} project={} agent={} log={} cmd={:?}",
+            req.id,
+            job.kind.name(),
+            req.project,
+            req.agent,
+            log.display(),
+            command_of(&req),
+        ));
+        self.insert_queued(job);
+        self.persist();
+        conn.send(envelope::Body::DetachedAccepted(DetachedAccepted {
+            job_id: req.id,
+            log_path: log.display().to_string(),
+        }));
     }
 
     fn facts(&self) -> Facts {
@@ -379,6 +616,7 @@ impl Daemon {
             .running
             .iter()
             .map(|r| Running {
+                label: label_of(&r.req, r.kind),
                 kind: r.kind,
                 expected_mem: r.expected_mem,
                 expected_cores: r.expected_cores,
@@ -390,6 +628,7 @@ impl Daemon {
             .iter()
             .map(|q| Waiting {
                 id: q.req.id.clone(),
+                label: label_of(&q.req, q.kind),
                 kind: q.kind,
                 expected_mem: q.expected_mem,
                 expected_cores: q.expected_cores,
@@ -417,13 +656,21 @@ impl Daemon {
                         job.kind.name(),
                         reason.name()
                     ));
-                    job.conn.send(envelope::Body::Reply(Reply {
-                        decision: Decision::Refused as i32,
-                        outcome: Some(reply::Outcome::Refusal(Refusal {
-                            reason: reason as i32,
-                            detail,
+                    match &job.origin {
+                        Origin::Attached(conn) => conn.send(envelope::Body::Reply(Reply {
+                            decision: Decision::Refused as i32,
+                            outcome: Some(reply::Outcome::Refusal(Refusal {
+                                reason: reason as i32,
+                                detail,
+                            })),
                         })),
-                    }));
+                        Origin::Detached(files) => self.conclude_unstarted(
+                            &job,
+                            files,
+                            JobPhase::Failed,
+                            format!("refused ({}): {detail}", reason.name()),
+                        ),
+                    }
                 }
                 Verdict::Wait(reason, detail) => {
                     position += 1;
@@ -442,6 +689,8 @@ impl Daemon {
         now_ms: u64,
     ) {
         let job = &mut self.queue[at];
+        job.position = position;
+        job.detail = detail.to_string();
         let changed = job.waiting != reason;
         let due = job
             .last_notice_ms
@@ -460,15 +709,17 @@ impl Daemon {
             ));
         }
         job.last_notice_ms = Some(now_ms);
-        job.conn.send(envelope::Body::Reply(Reply {
-            decision: Decision::Queued as i32,
-            outcome: Some(reply::Outcome::Queued(Queued {
-                waiting_on: reason as i32,
-                position,
-                queued_ms: now_ms.saturating_sub(job.queued_at_ms),
-                detail: detail.to_string(),
-            })),
-        }));
+        if let Origin::Attached(conn) = &job.origin {
+            conn.send(envelope::Body::Reply(Reply {
+                decision: Decision::Queued as i32,
+                outcome: Some(reply::Outcome::Queued(Queued {
+                    waiting_on: reason as i32,
+                    position,
+                    queued_ms: now_ms.saturating_sub(job.queued_at_ms),
+                    detail: detail.to_string(),
+                })),
+            }));
+        }
     }
 
     fn grant(&mut self, job: QueuedJob, owner_present: bool) {
@@ -532,28 +783,91 @@ impl Daemon {
             job.expected_cores,
             command_of(&job.req),
         ));
-        job.conn.send(envelope::Body::Reply(Reply {
-            decision: Decision::Granted as i32,
-            outcome: Some(reply::Outcome::Grant(grant)),
-        }));
+        let origin = job.origin.clone();
         self.running.push(RunningJob {
             req: job.req,
             kind: job.kind,
-            conn: job.conn,
+            origin: job.origin,
             scope_name,
-            started_ms: self.started.elapsed().as_millis() as u64,
+            queued_at_ms: job.queued_at_ms,
+            started_ms: self.now_ms(),
             expected_mem: job.expected_mem,
             expected_cores: job.expected_cores,
             base_limits,
             stats: scope::Stats::default(),
+            watch: Watch::Child,
+            cancel: Cancel::No,
+            tmpdir: None,
         });
+        let at = self.running.len() - 1;
+        match origin {
+            Origin::Attached(conn) => conn.send(envelope::Body::Reply(Reply {
+                decision: Decision::Granted as i32,
+                outcome: Some(reply::Outcome::Grant(grant)),
+            })),
+            Origin::Detached(files) => match self.launch(&self.running[at], &grant, &files) {
+                Ok(tmpdir) => {
+                    self.running[at].tmpdir = tmpdir;
+                    self.persist();
+                }
+                Err(e) => {
+                    let job = self.running.remove(at);
+                    self.log
+                        .line(&format!("FAIL id={} could not start: {e}", job.req.id));
+                    let rec = self.running_record(&job, &files);
+                    self.conclude(rec, JobPhase::Failed, None, format!("could not start: {e}"));
+                }
+            },
+        }
     }
 
-    fn finish(&mut self, done: &JobDone) {
-        let Some(at) = self.running.iter().position(|r| r.req.id == done.job_id) else {
-            return;
-        };
-        let job = self.running.remove(at);
+    /// Starts a detached job in its scope with its output going to the log; returns the job's private temp dir.
+    fn launch(
+        &self,
+        job: &RunningJob,
+        grant: &Grant,
+        files: &Files,
+    ) -> io::Result<Option<PathBuf>> {
+        let mut env: BTreeMap<String, String> = job.req.env.clone().into_iter().collect();
+        for key in &grant.env_unset {
+            env.remove(key);
+        }
+        let mut env_set = grant.env_set.clone();
+        let tmpdir = env_set.get("TMPDIR").map(PathBuf::from);
+        let tmpdir = tmpdir.filter(|dir| fs::create_dir_all(dir).is_ok());
+        if tmpdir.is_none() {
+            env_set.remove("TMPDIR");
+        }
+        env.extend(env_set);
+        let _ = fs::remove_file(&files.status);
+        let argv = scope::status_wrapped(&grant.reserved_argv(&job.req.argv), &files.status);
+        let limits = grant.limits.unwrap_or_default();
+        let child = scope::spawn_logged(
+            &argv,
+            Path::new(&job.req.cwd),
+            &env,
+            &ScopeLimits {
+                mem_bytes: limits.mem_bytes,
+                cpu_weight: limits.cpu_weight,
+                io_weight: limits.io_weight,
+                cpus: limits.cpus,
+            },
+            &grant.scope_name,
+            open_log(&files.log)?,
+        )?;
+        let (tx, id) = (self.events.clone(), job.req.id.clone());
+        thread::Builder::new()
+            .name("job-wait".into())
+            .spawn(move || {
+                let mut child = child;
+                let code = child.wait().ok().map(exit_code_of);
+                let _ = tx.send(Msg::Exited { job_id: id, code });
+            })?;
+        Ok(tmpdir)
+    }
+
+    /// Books a finished job's usage and sizes, and logs it.
+    fn note_done(&mut self, job: &RunningJob, done: &JobDone) {
         self.finished_cpu_usec += done.cpu_usec;
         if done.peak_mem_bytes > 0 && done.wall_ms > 0 {
             let cores_milli = u32::try_from(done.cpu_usec / done.wall_ms).unwrap_or(u32::MAX);
@@ -574,18 +888,41 @@ impl Daemon {
             done.io_read_bytes >> 20,
             done.io_write_bytes >> 20,
         ));
-        job.conn.send(envelope::Body::Ack(Ack {
-            ok: true,
-            message: String::new(),
-        }));
     }
 
-    fn lose(&mut self, job_id: &str) {
-        if let Some(at) = self.queue.iter().position(|q| q.req.id == job_id) {
+    fn finish(&mut self, done: &JobDone) {
+        let Some(at) = self
+            .running
+            .iter()
+            .position(|r| r.req.id == done.job_id && matches!(r.origin, Origin::Attached(_)))
+        else {
+            return;
+        };
+        let job = self.running.remove(at);
+        self.note_done(&job, done);
+        if let Origin::Attached(conn) = &job.origin {
+            conn.send(envelope::Body::Ack(Ack {
+                ok: true,
+                message: String::new(),
+            }));
+        }
+    }
+
+    fn lose(&mut self, job_id: &str, from: &Conn) {
+        let ours = |o: &Origin| matches!(o, Origin::Attached(c) if c.same(from));
+        if let Some(at) = self
+            .queue
+            .iter()
+            .position(|q| q.req.id == job_id && ours(&q.origin))
+        {
             self.queue.remove(at);
             self.remember(job_id, Fate::Gone);
             self.log.line(&format!("GONE id={job_id} while queued"));
-        } else if let Some(at) = self.running.iter().position(|r| r.req.id == job_id) {
+        } else if let Some(at) = self
+            .running
+            .iter()
+            .position(|r| r.req.id == job_id && ours(&r.origin))
+        {
             let job = self.running.remove(at);
             scope::kill(&job.scope_name, KillSignal::Kill);
             self.log
@@ -603,6 +940,7 @@ impl Daemon {
             self.log.line(&line);
         }
         self.update_load();
+        self.watch_detached();
         self.reschedule();
         self.adopt_dry_run();
         self.settle_waits();
@@ -626,8 +964,32 @@ impl Daemon {
     }
 
     fn job_state(&self, id: &str) -> JobState {
-        if self.queue.iter().any(|q| q.req.id == id) {
-            return JobState::Queued;
+        if let Some(q) = self.queue.iter().find(|q| q.req.id == id) {
+            return match q.origin {
+                Origin::Attached(_) => JobState::Queued,
+                Origin::Detached(_) => JobState::DetachedQueued,
+            };
+        }
+        if self
+            .running
+            .iter()
+            .any(|r| r.req.id == id && matches!(r.origin, Origin::Detached(_)))
+        {
+            return JobState::DetachedRunning;
+        }
+        if let Some(f) = self
+            .finished
+            .iter()
+            .rev()
+            .find(|f| f.request.as_ref().is_some_and(|r| r.id == id))
+        {
+            return match (detached::phase(f), f.exit_code) {
+                (JobPhase::Exited, Some(code)) => JobState::DetachedExited(code),
+                _ => JobState::DetachedEnded {
+                    ran: f.started_at_unix_ms > 0,
+                    reason: f.reason.clone(),
+                },
+            };
         }
         match self.fates.iter().rev().find(|(f, _)| f == id) {
             Some((_, Fate::Granted)) => JobState::Granted,
@@ -665,24 +1027,31 @@ impl Daemon {
         let mut answers = Vec::new();
         for (at, w) in self.waits.iter().enumerate() {
             let verdict = match waits::evaluate(w.condition, &w.job_id, &facts) {
-                Err(detail) => Some((WaitOutcome::Rejected, detail)),
+                Err(detail) => Some(waits::Verdict {
+                    outcome: WaitOutcome::Rejected,
+                    detail,
+                    exit_code: None,
+                }),
                 Ok(Some(v)) => Some(v),
-                Ok(None) if w.deadline_ms.is_some_and(|d| now >= d) => {
-                    Some((WaitOutcome::TimedOut, "timed out".to_string()))
-                }
+                Ok(None) if w.deadline_ms.is_some_and(|d| now >= d) => Some(waits::Verdict {
+                    outcome: WaitOutcome::TimedOut,
+                    detail: "timed out".to_string(),
+                    exit_code: None,
+                }),
                 Ok(None) => None,
             };
             if let Some(v) = verdict {
                 answers.push((at, v));
             }
         }
-        for (at, (outcome, detail)) in answers.into_iter().rev() {
+        for (at, v) in answers.into_iter().rev() {
             let w = self.waits.remove(at);
             w.conn.send(envelope::Body::WaitReply(WaitReply {
-                outcome: outcome as i32,
+                outcome: v.outcome as i32,
                 condition: w.condition as i32,
-                detail,
+                detail: v.detail,
                 waited_ms: now.saturating_sub(w.since_ms),
+                exit_code: v.exit_code,
             }));
         }
     }
@@ -817,6 +1186,358 @@ impl Daemon {
                 unmanaged_cpu_pct: self.load.unmanaged_cores / f64::from(snap.cpu_count.max(1))
                     * 100.0,
             }),
+        }
+    }
+}
+
+fn open_log(path: &Path) -> io::Result<fs::File> {
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    OpenOptions::new().create(true).append(true).open(path)
+}
+
+impl Daemon {
+    fn base_record(
+        &self,
+        req: &JobRequest,
+        files: &Files,
+        queued_at_ms: u64,
+        phase: JobPhase,
+    ) -> DetachedJob {
+        DetachedJob {
+            request: Some(req.clone()),
+            phase: phase as i32,
+            queued_at_unix_ms: queued_at_ms,
+            log_path: files.log.display().to_string(),
+            status_path: files.status.display().to_string(),
+            ..DetachedJob::default()
+        }
+    }
+
+    fn queued_record(&self, q: &QueuedJob, files: &Files) -> DetachedJob {
+        DetachedJob {
+            expected_mem_bytes: q.expected_mem,
+            expected_cores_milli: (q.expected_cores * 1000.0) as u32,
+            ..self.base_record(&q.req, files, q.queued_at_ms, JobPhase::Queued)
+        }
+    }
+
+    fn running_record(&self, r: &RunningJob, files: &Files) -> DetachedJob {
+        DetachedJob {
+            started_at_unix_ms: r.started_ms,
+            scope_name: r.scope_name.clone(),
+            base_limits: Some(r.base_limits),
+            expected_mem_bytes: r.expected_mem,
+            expected_cores_milli: (r.expected_cores * 1000.0) as u32,
+            tmpdir: r
+                .tmpdir
+                .as_ref()
+                .map(|d| d.display().to_string())
+                .unwrap_or_default(),
+            ..self.base_record(&r.req, files, r.queued_at_ms, JobPhase::Running)
+        }
+    }
+
+    /// Writes the queued and running detached jobs and the recently finished ones to the state file.
+    fn persist(&self) {
+        let mut jobs = self.finished.clone();
+        for r in &self.running {
+            if let Origin::Detached(f) = &r.origin {
+                jobs.push(self.running_record(r, f));
+            }
+        }
+        for q in &self.queue {
+            if let Origin::Detached(f) = &q.origin {
+                jobs.push(self.queued_record(q, f));
+            }
+        }
+        if let Err(e) = detached::save(&self.jobs_path, jobs) {
+            self.log
+                .line(&format!("WARN could not save the job state: {e}"));
+        }
+    }
+
+    /// Moves a detached job's record to the finished list.
+    fn conclude(
+        &mut self,
+        mut rec: DetachedJob,
+        phase: JobPhase,
+        exit_code: Option<i32>,
+        reason: String,
+    ) {
+        rec.phase = phase as i32;
+        rec.exit_code = exit_code;
+        rec.reason = reason;
+        rec.finished_at_unix_ms = self.now_ms();
+        if !rec.tmpdir.is_empty() {
+            let _ = fs::remove_dir_all(&rec.tmpdir);
+        }
+        if let Some(req) = rec.request.as_mut() {
+            req.env.clear();
+        }
+        self.log.line(&format!(
+            "END id={} phase={phase:?} exit={exit_code:?} reason={:?}",
+            rec.request.as_ref().map_or("", |r| r.id.as_str()),
+            rec.reason
+        ));
+        self.finished.push(rec);
+        let now = self.now_ms();
+        detached::prune(&mut self.finished, now, &self.dirs);
+        self.persist();
+    }
+
+    /// A queued detached job that was removed from the queue without ever running.
+    fn conclude_unstarted(
+        &mut self,
+        job: &QueuedJob,
+        files: &Files,
+        phase: JobPhase,
+        reason: String,
+    ) {
+        let rec = self.queued_record(job, files);
+        self.conclude(rec, phase, None, reason);
+    }
+
+    /// Takes back the jobs an earlier usher left: queued ones keep their time, running ones are watched again.
+    fn restore(&mut self) {
+        let records = detached::load(&self.jobs_path);
+        if records.is_empty() {
+            return;
+        }
+        let (mut queued, mut adopted, mut ended) = (0, 0, 0);
+        for rec in records {
+            let Some(req) = rec.request.clone() else {
+                continue;
+            };
+            let files = Files {
+                log: PathBuf::from(&rec.log_path),
+                status: PathBuf::from(&rec.status_path),
+            };
+            match detached::phase(&rec) {
+                JobPhase::Queued => {
+                    let job = self.queued_job(req, Origin::Detached(files), rec.queued_at_unix_ms);
+                    self.queue.push(job);
+                    queued += 1;
+                }
+                JobPhase::Running
+                    if scope::alive(&rec.scope_name)
+                        || (self.now_ms().saturating_sub(rec.started_at_unix_ms)
+                            < SCOPE_START_GRACE_MS
+                            && scope::read_status(&files.status).is_none()) =>
+                {
+                    self.running.push(RunningJob {
+                        req,
+                        kind: JobKind::try_from(rec.request.as_ref().map_or(0, |r| r.kind))
+                            .unwrap_or(JobKind::Unspecified),
+                        origin: Origin::Detached(files),
+                        scope_name: rec.scope_name.clone(),
+                        queued_at_ms: rec.queued_at_unix_ms,
+                        started_ms: rec.started_at_unix_ms,
+                        expected_mem: rec.expected_mem_bytes,
+                        expected_cores: f64::from(rec.expected_cores_milli) / 1000.0,
+                        base_limits: rec.base_limits.unwrap_or_default(),
+                        stats: scope::Stats::default(),
+                        watch: Watch::Scope,
+                        cancel: Cancel::No,
+                        tmpdir: (!rec.tmpdir.is_empty()).then(|| PathBuf::from(&rec.tmpdir)),
+                    });
+                    adopted += 1;
+                }
+                JobPhase::Running => {
+                    // The job ended while no usher was watching: its wrapper's status file still says how.
+                    let code = scope::read_status(&files.status);
+                    let (phase, reason) = match code {
+                        Some(_) => (JobPhase::Exited, String::new()),
+                        None => (
+                            JobPhase::Failed,
+                            "the usher restarted and the job's scope was gone with no exit status"
+                                .to_string(),
+                        ),
+                    };
+                    self.conclude(rec, phase, code, reason);
+                    ended += 1;
+                }
+                JobPhase::Exited | JobPhase::Failed | JobPhase::Cancelled => {
+                    self.finished.push(rec);
+                }
+                JobPhase::Unspecified => {}
+            }
+        }
+        self.queue.sort_by_key(|q| q.queued_at_ms);
+        self.finished.sort_by_key(|f| f.finished_at_unix_ms);
+        self.log.line(&format!(
+            "RESTORE queued={queued} adopted={adopted} ended_while_down={ended} finished={}",
+            self.finished.len()
+        ));
+        self.persist();
+    }
+
+    /// A detached job's process ended: record how, free its slot, and learn its size.
+    fn end_detached(&mut self, id: &str, code: Option<i32>) {
+        let Some(at) = self
+            .running
+            .iter()
+            .position(|r| r.req.id == id && matches!(r.origin, Origin::Detached(_)))
+        else {
+            return;
+        };
+        let job = self.running.remove(at);
+        let Origin::Detached(files) = &job.origin else {
+            return;
+        };
+        let reported = code.or_else(|| scope::read_status(&files.status));
+        if let Some(exit_code) = reported {
+            let done = JobDone {
+                job_id: id.to_string(),
+                exit_code,
+                wall_ms: self.now_ms().saturating_sub(job.started_ms),
+                cpu_usec: job.stats.cpu_usec,
+                peak_mem_bytes: job.stats.mem_peak,
+                io_read_bytes: job.stats.io_read,
+                io_write_bytes: job.stats.io_write,
+            };
+            self.note_done(&job, &done);
+        }
+        let (phase, reason) = match (job.cancel, reported) {
+            (Cancel::No, Some(_)) => (JobPhase::Exited, String::new()),
+            (Cancel::No, None) => (
+                JobPhase::Failed,
+                "the job's scope ended without an exit status (killed outside crew, or lost with the machine)"
+                    .to_string(),
+            ),
+            (_, _) => (JobPhase::Cancelled, "cancelled by `crew cancel`".to_string()),
+        };
+        let rec = self.running_record(&job, files);
+        self.conclude(rec, phase, reported, reason);
+    }
+
+    /// Polls adopted jobs' scopes and escalates cancellations that SIGTERM did not end.
+    fn watch_detached(&mut self) {
+        let now = self.now_ms();
+        for r in &mut self.running {
+            match r.cancel {
+                Cancel::Terminated { at_ms } if now.saturating_sub(at_ms) >= CANCEL_GRACE_MS => {
+                    scope::kill(&r.scope_name, KillSignal::Kill);
+                    r.cancel = Cancel::Killed;
+                }
+                // A cancel right after the start can beat the scope into existence, and then the signal went nowhere.
+                Cancel::Terminated { .. } if !scope::alive(&r.scope_name) => {
+                    scope::kill(&r.scope_name, KillSignal::Term);
+                }
+                _ => {}
+            }
+        }
+        let gone: Vec<String> = self
+            .running
+            .iter()
+            .filter(|r| {
+                let Origin::Detached(files) = &r.origin else {
+                    return false;
+                };
+                r.watch == Watch::Scope
+                    && !scope::alive(&r.scope_name)
+                    && (now.saturating_sub(r.started_ms) >= SCOPE_START_GRACE_MS
+                        || scope::read_status(&files.status).is_some())
+            })
+            .map(|r| r.req.id.clone())
+            .collect();
+        for id in gone {
+            self.end_detached(&id, None);
+        }
+    }
+
+    fn cancel(&mut self, id: &str) -> Ack {
+        let ack = |ok: bool, message: String| Ack { ok, message };
+        if let Some(at) = self.queue.iter().position(|q| q.req.id == id) {
+            let job = self.queue.remove(at);
+            self.log.line(&format!("CANCEL id={id} while queued"));
+            match &job.origin {
+                Origin::Attached(conn) => {
+                    self.remember(id, Fate::Refused);
+                    conn.send(envelope::Body::Reply(Reply {
+                        decision: Decision::Refused as i32,
+                        outcome: Some(reply::Outcome::Refusal(Refusal {
+                            reason: RefusalReason::Cancelled as i32,
+                            detail: "cancelled with `crew cancel`".into(),
+                        })),
+                    }));
+                }
+                Origin::Detached(files) => self.conclude_unstarted(
+                    &job,
+                    files,
+                    JobPhase::Cancelled,
+                    "cancelled by `crew cancel` while queued".into(),
+                ),
+            }
+            return ack(true, "cancelled while queued".into());
+        }
+        let now = self.now_ms();
+        if let Some(r) = self.running.iter_mut().find(|r| r.req.id == id) {
+            if r.cancel == Cancel::No {
+                r.cancel = Cancel::Terminated { at_ms: now };
+                scope::kill(&r.scope_name, KillSignal::Term);
+                self.log
+                    .line(&format!("CANCEL id={id} while running; SIGTERM sent"));
+            }
+            return ack(
+                true,
+                "cancelling: SIGTERM sent to the job's scope, SIGKILL follows in 10s".into(),
+            );
+        }
+        ack(false, format!("no queued or running job {id}"))
+    }
+
+    fn jobs(&self) -> JobsReply {
+        let queued = self.queue.iter().map(|q| {
+            let (detached, log_path) = match &q.origin {
+                Origin::Attached(_) => (false, String::new()),
+                Origin::Detached(f) => (true, f.log.display().to_string()),
+            };
+            JobSummary {
+                id: q.req.id.clone(),
+                kind: q.kind as i32,
+                agent: q.req.agent.clone(),
+                project: q.req.project.clone(),
+                command: command_of(&q.req),
+                phase: JobPhase::Queued as i32,
+                detached,
+                exit_code: None,
+                log_path,
+                reason: q.detail.clone(),
+                waiting_on: q.waiting as i32,
+                position: q.position,
+                queued_at_unix_ms: q.queued_at_ms,
+                started_at_unix_ms: 0,
+                finished_at_unix_ms: 0,
+            }
+        });
+        let running = self.running.iter().map(|r| {
+            let (detached, log_path) = match &r.origin {
+                Origin::Attached(_) => (false, String::new()),
+                Origin::Detached(f) => (true, f.log.display().to_string()),
+            };
+            JobSummary {
+                id: r.req.id.clone(),
+                kind: r.kind as i32,
+                agent: r.req.agent.clone(),
+                project: r.req.project.clone(),
+                command: command_of(&r.req),
+                phase: JobPhase::Running as i32,
+                detached,
+                exit_code: None,
+                log_path,
+                reason: String::new(),
+                waiting_on: 0,
+                position: 0,
+                queued_at_unix_ms: r.queued_at_ms,
+                started_at_unix_ms: r.started_ms,
+                finished_at_unix_ms: 0,
+            }
+        });
+        let finished = self.finished.iter().rev().map(detached::summary);
+        JobsReply {
+            jobs: queued.chain(running).chain(finished).collect(),
         }
     }
 }

@@ -1,7 +1,8 @@
 //! Typed JSON for every client-visible record: mirrors of the socket messages, enums as snake_case names.
 use crew_proto::{
-    AccountingSource, AgentKind, AgentView, DiskView, JobKind, JobView, MachineView, OwnerSource,
-    ProjectView, RefusalReason, TopReply, WaitCondition, WaitOutcome, WaitReply, WaitingOn,
+    AccountingSource, AgentKind, AgentView, DiskView, JobKind, JobPhase, JobSummary, JobView,
+    JobsReply, MachineView, OwnerSource, ProjectView, RefusalReason, TopReply, WaitCondition,
+    WaitOutcome, WaitReply, WaitingOn,
 };
 use serde::Serialize;
 
@@ -78,7 +79,8 @@ mirror!(
             DiskLow,
             OverGameCap,
             DisplayForbidden,
-            UnknownKind
+            UnknownKind,
+            Cancelled
         }
 );
 mirror!(
@@ -87,7 +89,8 @@ mirror!(
             Unspecified,
             QueueEmpty,
             JobGranted,
-            OwnerAway
+            OwnerAway,
+            JobExit
         }
 );
 mirror!(
@@ -97,7 +100,19 @@ mirror!(
             Satisfied,
             TimedOut,
             Rejected,
-            NeverGranted
+            NeverGranted,
+            JobLost
+        }
+);
+mirror!(
+    Phase
+        <= JobPhase {
+            Unspecified,
+            Queued,
+            Running,
+            Exited,
+            Failed,
+            Cancelled
         }
 );
 
@@ -291,6 +306,9 @@ pub struct Wait {
     pub condition: Condition,
     pub detail: String,
     pub waited_ms: u64,
+    /// The finished detached job's exit status.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
 }
 
 impl From<&WaitReply> for Wait {
@@ -300,6 +318,54 @@ impl From<&WaitReply> for Wait {
             condition: w.condition.into(),
             detail: w.detail.clone(),
             waited_ms: w.waited_ms,
+            exit_code: w.exit_code,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct Jobs {
+    pub jobs: Vec<JobRecord>,
+}
+
+/// One job of `crew jobs`: queued, running or recently finished.
+#[derive(Debug, Serialize)]
+pub struct JobRecord {
+    pub id: String,
+    pub kind: Kind,
+    pub agent: String,
+    pub project: String,
+    pub command: String,
+    pub phase: Phase,
+    pub detached: bool,
+    pub exit_code: Option<i32>,
+    pub log_path: String,
+    pub reason: String,
+    pub waiting_on: Waiting,
+    pub position: u32,
+    pub queued_at_unix_ms: u64,
+    pub started_at_unix_ms: u64,
+    pub finished_at_unix_ms: u64,
+}
+
+impl From<&JobSummary> for JobRecord {
+    fn from(j: &JobSummary) -> Self {
+        Self {
+            id: j.id.clone(),
+            kind: j.kind.into(),
+            agent: j.agent.clone(),
+            project: j.project.clone(),
+            command: j.command.clone(),
+            phase: j.phase.into(),
+            detached: j.detached,
+            exit_code: j.exit_code,
+            log_path: j.log_path.clone(),
+            reason: j.reason.clone(),
+            waiting_on: j.waiting_on.into(),
+            position: j.position,
+            queued_at_unix_ms: j.queued_at_unix_ms,
+            started_at_unix_ms: j.started_at_unix_ms,
+            finished_at_unix_ms: j.finished_at_unix_ms,
         }
     }
 }
@@ -337,6 +403,19 @@ pub enum RunEvent {
     Unmanaged {
         reason: UnmanagedReason,
     },
+    /// `--detach`: the usher owns the job now, and the client is done.
+    Detached {
+        job_id: String,
+        log_path: String,
+    },
+    /// The usher went away while the job was queued; the client is waiting for it to return.
+    UsherLost {
+        job_id: String,
+    },
+    /// The usher is back and the job is queued again under its old id and time.
+    Requeued {
+        job_id: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -357,6 +436,7 @@ pub enum ErrorKind {
     Usage,
     Io,
     ProjectConfig,
+    Rejected,
 }
 
 #[derive(Debug, Serialize)]
@@ -379,6 +459,19 @@ pub fn wait(w: &WaitReply) -> String {
     line(&Wait::from(w))
 }
 
+pub fn jobs(r: &JobsReply) -> String {
+    line(&Jobs {
+        jobs: r.jobs.iter().map(JobRecord::from).collect(),
+    })
+}
+
+pub fn ack(a: &crew_proto::Ack) -> String {
+    line(&Owned {
+        ok: a.ok,
+        message: a.message.clone(),
+    })
+}
+
 pub fn owner(message: &str) -> String {
     line(&Owned {
         ok: true,
@@ -393,7 +486,8 @@ pub fn event(e: &RunEvent) -> String {
 pub fn failure(e: &crate::ClientError) -> String {
     use crate::ClientError as E;
     let (kind, refusal) = match e {
-        E::DaemonDown { .. } => (ErrorKind::UsherDown, None),
+        E::DaemonDown { .. } | E::UsherLost { .. } => (ErrorKind::UsherDown, None),
+        E::Rejected(_) => (ErrorKind::Rejected, None),
         E::Refused { reason, .. } => (ErrorKind::Refused, Some(Refusal::from(*reason as i32))),
         E::Closed => (ErrorKind::Closed, None),
         E::Protocol | E::Frame(_) => (ErrorKind::Protocol, None),
@@ -583,10 +677,22 @@ mod tests {
             condition: WaitCondition::QueueEmpty as i32,
             detail: "timed out".into(),
             waited_ms: 5,
+            exit_code: None,
         });
         assert_eq!(
             w,
             r#"{"outcome":"timed_out","condition":"queue_empty","detail":"timed out","waited_ms":5}"#
+        );
+        let exited = wait(&WaitReply {
+            outcome: WaitOutcome::Satisfied as i32,
+            condition: WaitCondition::JobExit as i32,
+            detail: "job exited with status 3".into(),
+            waited_ms: 7,
+            exit_code: Some(3),
+        });
+        assert!(
+            exited.contains(r#""condition":"job_exit""#) && exited.ends_with(r#""exit_code":3}"#),
+            "{exited}"
         );
         assert_eq!(
             owner("owner away (manual)"),

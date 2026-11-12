@@ -65,6 +65,7 @@ pub fn build(i: &Inputs<'_>) -> JobRequest {
             .iter()
             .filter_map(|k| i.env.get(*k).map(|v| ((*k).to_string(), v.clone())))
             .collect(),
+        ..JobRequest::default()
     }
 }
 

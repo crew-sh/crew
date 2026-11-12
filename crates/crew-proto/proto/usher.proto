@@ -32,6 +32,14 @@ message JobRequest {
   bool desktop = 9;
   // WAYLAND_DISPLAY, WAYLAND_SOCKET and DISPLAY as the client sees them.
   map<string, string> display_env = 10;
+  // A re-submit after the usher went away: when the client first queued this id (unix ms). Zero for a first submit.
+  uint64 queued_at_unix_ms = 11;
+  // The usher owns the job: it keeps it queued and runs it itself, whether or not the client stays.
+  bool detach = 12;
+  // The client's environment (detached jobs only); the usher applies the grant on top of it.
+  map<string, string> env = 13;
+  // Where a detached job's stdout and stderr go; empty means a file under the usher's state directory.
+  string log_path = 14;
 }
 
 enum Decision {
@@ -57,6 +65,8 @@ enum RefusalReason {
   REFUSAL_REASON_OVER_GAME_CAP = 2;
   REFUSAL_REASON_DISPLAY_FORBIDDEN = 3;
   REFUSAL_REASON_UNKNOWN_KIND = 4;
+  // `crew cancel` removed the job while it was queued.
+  REFUSAL_REASON_CANCELLED = 5;
 }
 
 enum BuildPriority {
@@ -240,6 +250,8 @@ enum WaitCondition {
   // The job with WaitRequest.job_id is running or has finished.
   WAIT_CONDITION_JOB_GRANTED = 2;
   WAIT_CONDITION_OWNER_AWAY = 3;
+  // A detached job has finished (WaitReply.exit_code is its status); any other job counts as soon as it was granted.
+  WAIT_CONDITION_JOB_EXIT = 4;
 }
 
 message WaitRequest {
@@ -256,6 +268,8 @@ enum WaitOutcome {
   WAIT_OUTCOME_REJECTED = 3;
   // The job was refused or its client left before it was granted.
   WAIT_OUTCOME_NEVER_GRANTED = 4;
+  // A detached job started but ended without an exit status (cancelled while running, or its scope vanished).
+  WAIT_OUTCOME_JOB_LOST = 5;
 }
 
 message WaitReply {
@@ -263,6 +277,8 @@ message WaitReply {
   WaitCondition condition = 2;
   string detail = 3;
   uint64 waited_ms = 4;
+  // Set for WAIT_CONDITION_JOB_EXIT on a finished detached job.
+  optional int32 exit_code = 5;
 }
 
 message OwnerSet {
@@ -281,7 +297,83 @@ message Envelope {
     Ack ack = 7;
     WaitRequest wait_request = 8;
     WaitReply wait_reply = 9;
+    DetachedAccepted detached_accepted = 10;
+    JobsRequest jobs_request = 11;
+    JobsReply jobs_reply = 12;
+    CancelRequest cancel_request = 13;
   }
+}
+
+// The usher took a detached job: it is queued (or already running) and no longer needs the client.
+message DetachedAccepted {
+  string job_id = 1;
+  string log_path = 2;
+}
+
+message JobsRequest {}
+
+enum JobPhase {
+  JOB_PHASE_UNSPECIFIED = 0;
+  JOB_PHASE_QUEUED = 1;
+  JOB_PHASE_RUNNING = 2;
+  // Ran and reported an exit status.
+  JOB_PHASE_EXITED = 3;
+  // Never ran, or ran and was lost without a status; `reason` says why.
+  JOB_PHASE_FAILED = 4;
+  JOB_PHASE_CANCELLED = 5;
+}
+
+message JobSummary {
+  string id = 1;
+  JobKind kind = 2;
+  string agent = 3;
+  string project = 4;
+  string command = 5;
+  JobPhase phase = 6;
+  // The usher owns this job (crew run --detach); otherwise a `crew run` client does.
+  bool detached = 7;
+  optional int32 exit_code = 8;
+  string log_path = 9;
+  // Why a failed or cancelled job ended, or what a queued one waits on.
+  string reason = 10;
+  WaitingOn waiting_on = 11;
+  uint32 position = 12;
+  uint64 queued_at_unix_ms = 13;
+  uint64 started_at_unix_ms = 14;
+  uint64 finished_at_unix_ms = 15;
+}
+
+message JobsReply {
+  repeated JobSummary jobs = 1;
+}
+
+message CancelRequest {
+  string job_id = 1;
+}
+
+// The state file of detached jobs (usher-jobs.pb): queued and running ones, then the recently finished.
+message DetachedJob {
+  JobRequest request = 1;
+  JobPhase phase = 2;
+  // First queued, in unix ms; the queue order and starvation clock of a restored job.
+  uint64 queued_at_unix_ms = 3;
+  uint64 started_at_unix_ms = 4;
+  uint64 finished_at_unix_ms = 5;
+  string scope_name = 6;
+  Limits base_limits = 7;
+  uint64 expected_mem_bytes = 8;
+  uint32 expected_cores_milli = 9;
+  string log_path = 10;
+  // Where the job's wrapper writes the exit status.
+  string status_path = 11;
+  string tmpdir = 12;
+  optional int32 exit_code = 13;
+  string reason = 14;
+}
+
+message JobsFile {
+  uint32 version = 1;
+  repeated DetachedJob jobs = 2;
 }
 
 message SizeSample {

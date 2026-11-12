@@ -2,6 +2,7 @@ pub mod admission;
 pub mod agents;
 pub mod config;
 pub mod daemon;
+pub mod detached;
 pub mod log;
 pub mod pool;
 pub mod server;

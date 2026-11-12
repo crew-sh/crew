@@ -133,7 +133,32 @@ impl RefusalReason {
             Self::OverGameCap => "game cap is zero",
             Self::DisplayForbidden => "display forbidden",
             Self::UnknownKind => "unknown kind",
+            Self::Cancelled => "cancelled",
         }
+    }
+}
+
+impl Grant {
+    /// `argv`, wrapped in `mbx reserve` when the grant asks for pool capacity and mbx is where the usher said.
+    pub fn reserved_argv(&self, argv: &[String]) -> Vec<String> {
+        let Some(r) = self
+            .reserve
+            .as_ref()
+            .filter(|r| std::path::Path::new(&r.mbx_path).is_file())
+        else {
+            return argv.to_vec();
+        };
+        let mut out = vec![
+            r.mbx_path.clone(),
+            "reserve".into(),
+            "--cpus".into(),
+            r.cpus.max(1).to_string(),
+            "--memory".into(),
+            format!("{}MiB", r.mem_bytes.div_ceil(1 << 20).max(1)),
+            "--".into(),
+        ];
+        out.extend_from_slice(argv);
+        out
     }
 }
 
@@ -164,6 +189,7 @@ mod tests {
             needs_display: true,
             desktop: false,
             display_env: [("DISPLAY".to_string(), ":0".to_string())].into(),
+            ..JobRequest::default()
         }))
     }
 

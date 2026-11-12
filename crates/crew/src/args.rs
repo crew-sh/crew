@@ -7,10 +7,31 @@ use crew_usher_client::{OwnerArg, RunOptions, WaitSpec};
 pub enum Sub {
     Help,
     Run(RunOptions),
-    Top { watch: bool, json: bool },
-    Owner { arg: OwnerArg, json: bool },
-    Wait { spec: WaitSpec, json: bool },
-    Plugin { name: String, rest: Vec<String> },
+    /// `run --detach`: the usher owns the job; `opts.log` says where its output goes.
+    Detach(RunOptions),
+    Jobs {
+        json: bool,
+    },
+    Cancel {
+        job_id: String,
+        json: bool,
+    },
+    Top {
+        watch: bool,
+        json: bool,
+    },
+    Owner {
+        arg: OwnerArg,
+        json: bool,
+    },
+    Wait {
+        spec: WaitSpec,
+        json: bool,
+    },
+    Plugin {
+        name: String,
+        rest: Vec<String>,
+    },
 }
 
 /// "90", "90s", "500ms", "5m", "2h".
@@ -32,8 +53,7 @@ pub fn parse_duration(s: &str) -> Result<Duration, String> {
 }
 
 fn parse_wait(args: &[String]) -> Result<Sub, String> {
-    const USAGE: &str =
-        "usage: crew wait queue-empty|owner-away|job <id> [--timeout 30s|5m] [--json]";
+    const USAGE: &str = "usage: crew wait queue-empty|owner-away|job <id>|job-granted <id> [--timeout 30s|5m] [--json]";
     let mut json = false;
     let mut timeout = None;
     let mut words = Vec::new();
@@ -49,7 +69,8 @@ fn parse_wait(args: &[String]) -> Result<Sub, String> {
     let (condition, job_id) = match words.as_slice() {
         ["queue-empty"] => (WaitCondition::QueueEmpty, String::new()),
         ["owner-away"] => (WaitCondition::OwnerAway, String::new()),
-        ["job", id] | ["job-granted", id] => (WaitCondition::JobGranted, (*id).to_string()),
+        ["job", id] => (WaitCondition::JobExit, (*id).to_string()),
+        ["job-granted", id] => (WaitCondition::JobGranted, (*id).to_string()),
         _ => return Err(USAGE.into()),
     };
     Ok(Sub::Wait {
@@ -85,8 +106,9 @@ fn value<'a>(it: &mut std::slice::Iter<'a, String>, flag: &str) -> Result<&'a St
     it.next().ok_or_else(|| format!("{flag} needs a value"))
 }
 
-fn parse_run(args: &[String]) -> Result<RunOptions, String> {
+fn parse_run(args: &[String]) -> Result<Sub, String> {
     let mut opts = RunOptions::default();
+    let mut detach = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -106,6 +128,8 @@ fn parse_run(args: &[String]) -> Result<RunOptions, String> {
             }
             "--display" => opts.display = true,
             "--json" => opts.json = true,
+            "--detach" => detach = true,
+            "--log" => opts.log = Some(value(&mut it, "--log")?.into()),
             s if s.starts_with('-') => {
                 return Err(format!("unknown option `{s}` (put the command after `--`)"));
             }
@@ -119,13 +143,36 @@ fn parse_run(args: &[String]) -> Result<RunOptions, String> {
     if opts.argv.is_empty() {
         return Err("run needs a command after `--`".into());
     }
-    Ok(opts)
+    if opts.log.is_some() && !detach {
+        return Err("--log only goes with --detach".into());
+    }
+    Ok(if detach {
+        Sub::Detach(opts)
+    } else {
+        Sub::Run(opts)
+    })
 }
 
 pub fn parse(argv: &[String]) -> Result<Sub, String> {
     Ok(match argv.first().map(String::as_str) {
         None | Some("-h" | "--help" | "help") => Sub::Help,
-        Some("run") => Sub::Run(parse_run(&argv[1..])?),
+        Some("run") => parse_run(&argv[1..])?,
+        Some("jobs") => match &argv[1..] {
+            [] => Sub::Jobs { json: false },
+            [f] if f == "--json" => Sub::Jobs { json: true },
+            _ => return Err("usage: crew jobs [--json]".into()),
+        },
+        Some("cancel") => {
+            let json = argv[1..].iter().any(|f| f == "--json");
+            let ids: Vec<&String> = argv[1..].iter().filter(|f| *f != "--json").collect();
+            match ids.as_slice() {
+                [id] if !id.starts_with('-') => Sub::Cancel {
+                    job_id: (*id).clone(),
+                    json,
+                },
+                _ => return Err("usage: crew cancel <job id> [--json]".into()),
+            }
+        }
         Some("top") => {
             let flags = &argv[1..];
             let json = flags.iter().any(|f| f == "--json");
@@ -183,6 +230,13 @@ mod tests {
     fn run(cmd: &str) -> RunOptions {
         match parse(cmd).unwrap() {
             Sub::Run(o) => o,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    fn detach(cmd: &str) -> RunOptions {
+        match parse(cmd).unwrap() {
+            Sub::Detach(o) => o,
             other => panic!("{other:?}"),
         }
     }
@@ -250,7 +304,11 @@ mod tests {
         let (s, _) = wait("wait job abc-123");
         assert_eq!(
             (s.condition, s.job_id.as_str(), s.timeout),
-            (WaitCondition::JobGranted, "abc-123", None)
+            (WaitCondition::JobExit, "abc-123", None)
+        );
+        assert_eq!(
+            wait("wait job-granted abc-123").0.condition,
+            WaitCondition::JobGranted
         );
         assert!(
             parse("wait").is_err() && parse("wait job").is_err() && parse("wait sometime").is_err()
@@ -259,6 +317,38 @@ mod tests {
             parse("wait queue-empty --timeout").is_err()
                 && parse("wait queue-empty --nope").is_err()
         );
+    }
+
+    #[test]
+    fn detach_takes_a_log_and_the_usual_run_flags() {
+        let o = detach("run --detach --log out.txt --kind bench --mem 8G -- ./m.sh --fast");
+        assert_eq!(
+            (o.kind, o.mem_bytes, o.log.as_deref()),
+            (
+                Some(JobKind::Bench),
+                Some(8 << 30),
+                Some(std::path::Path::new("out.txt"))
+            )
+        );
+        assert_eq!(o.argv, ["./m.sh", "--fast"]);
+        assert_eq!(run("run -- sh --detach").argv, ["sh", "--detach"]);
+        assert!(parse("run --log x -- true").is_err());
+        assert!(parse("run --detach --log").is_err());
+    }
+
+    #[test]
+    fn jobs_and_cancel() {
+        assert_eq!(parse("jobs").unwrap(), Sub::Jobs { json: false });
+        assert_eq!(parse("jobs --json").unwrap(), Sub::Jobs { json: true });
+        assert!(parse("jobs now").is_err());
+        assert_eq!(
+            parse("cancel --json abc").unwrap(),
+            Sub::Cancel {
+                job_id: "abc".into(),
+                json: true
+            }
+        );
+        assert!(parse("cancel").is_err() && parse("cancel a b").is_err());
     }
 
     #[test]

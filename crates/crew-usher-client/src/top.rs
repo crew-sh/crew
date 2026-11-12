@@ -11,7 +11,7 @@ fn gib(bytes: u64) -> String {
     format!("{:.1}", bytes as f64 / GIB)
 }
 
-fn duration(ms: u64) -> String {
+pub(crate) fn duration(ms: u64) -> String {
     let s = ms / 1000;
     if s >= 3600 {
         format!("{}h{:02}m", s / 3600, s % 3600 / 60)
@@ -22,7 +22,7 @@ fn duration(ms: u64) -> String {
     }
 }
 
-fn truncate(s: &str, max: usize) -> String {
+pub(crate) fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_string()
     } else {

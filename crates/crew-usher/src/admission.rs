@@ -16,6 +16,8 @@ pub struct Facts {
 
 #[derive(Clone, Debug)]
 pub struct Running {
+    /// How messages name this job, e.g. `bench 1a2b3c4d (horizon: ./m.sh)`.
+    pub label: String,
     pub kind: JobKind,
     pub expected_mem: u64,
     pub expected_cores: f64,
@@ -25,6 +27,8 @@ pub struct Running {
 #[derive(Clone, Debug)]
 pub struct Waiting {
     pub id: String,
+    /// How messages name this job, e.g. `bench 1a2b3c4d (horizon: ./m.sh)`.
+    pub label: String,
     pub kind: JobKind,
     pub expected_mem: u64,
     pub expected_cores: f64,
@@ -45,6 +49,18 @@ fn disk_gated(kind: JobKind) -> bool {
 
 fn gib(bytes: u64) -> u64 {
     bytes / GIB
+}
+
+fn gib1(bytes: u64) -> String {
+    format!("{:.1} GiB", bytes as f64 / GIB as f64)
+}
+
+/// Another waiting job holds this one back, and why that one waits.
+struct Blocker {
+    label: String,
+    reason: WaitingOn,
+    detail: String,
+    waited_ms: u64,
 }
 
 fn disk_problem(cfg: &Config, facts: &Facts) -> Option<String> {
@@ -90,10 +106,13 @@ pub fn schedule(
     let mut cores: f64 = running.iter().map(|r| r.expected_cores).sum();
     let mut games = running.iter().filter(|r| r.kind == JobKind::Game).count() as u32;
     let mut active = running.len();
-    let mut exclusive_running = running.iter().any(|r| cfg.kind(r.kind).exclusive);
+    let mut exclusive_running = running
+        .iter()
+        .find(|r| cfg.kind(r.kind).exclusive)
+        .map(|r| r.label.clone());
     let cap = (f64::from(facts.cpu_count) * cfg.cpu_oversub - facts.unmanaged_cores).max(0.0);
-    let mut starved: Option<WaitingOn> = None;
-    let mut kind_blocked: BTreeMap<i32, WaitingOn> = BTreeMap::new();
+    let mut starved: Option<Blocker> = None;
+    let mut kind_blocked: BTreeMap<i32, Blocker> = BTreeMap::new();
     let starve_ms = cfg.starve_after_secs * 1000;
     let mut out = Vec::with_capacity(queue.len());
 
@@ -103,17 +122,32 @@ pub fn schedule(
             continue;
         }
         let spec = cfg.kind(w.kind);
-        let wait = if let Some(reason) = starved {
-            Some((reason, "behind a job that has waited too long".to_string()))
-        } else if exclusive_running {
+        let free = facts.mem_available.saturating_sub(reserved);
+        let wait = if let Some(b) = &starved {
+            Some((
+                b.reason,
+                format!(
+                    "queue order: behind {}, which has waited {}m on {}: {}",
+                    b.label,
+                    b.waited_ms / 60_000,
+                    b.reason.name(),
+                    b.detail
+                ),
+            ))
+        } else if let Some(label) = &exclusive_running {
             Some((
                 WaitingOn::Exclusive,
-                "an exclusive job is running".to_string(),
+                format!("exclusive {label} is running"),
             ))
-        } else if let Some(reason) = kind_blocked.get(&(w.kind as i32)) {
+        } else if let Some(b) = kind_blocked.get(&(w.kind as i32)) {
             Some((
-                *reason,
-                "behind an earlier job of the same kind".to_string(),
+                b.reason,
+                format!(
+                    "queue order: behind {} (same kind), which waits on {}: {}",
+                    b.label,
+                    b.reason.name(),
+                    b.detail
+                ),
             ))
         } else if spec.exclusive && facts.owner_present {
             Some((
@@ -130,16 +164,17 @@ pub fn schedule(
                 WaitingOn::GameCap,
                 format!("{games} of {} games running", cfg.max_games),
             ))
-        } else if facts.mem_available.saturating_sub(reserved) < cfg.min_free_mem() + w.expected_mem
-        {
-            let free = facts.mem_available.saturating_sub(reserved);
+        } else if free < cfg.min_free_mem() + w.expected_mem {
             Some((
                 WaitingOn::Memory,
                 format!(
-                    "{} GiB free after reservations, needs {} + {} kept free",
-                    gib(free),
-                    gib(w.expected_mem),
-                    cfg.min_free_mem_gib
+                    "needs {} + {} kept free = {}; {} available ({} free - {} reserved by other jobs); queue position is not the cause",
+                    gib1(w.expected_mem),
+                    gib1(cfg.min_free_mem()),
+                    gib1(cfg.min_free_mem() + w.expected_mem),
+                    gib1(free),
+                    gib1(facts.mem_available),
+                    gib1(reserved),
                 ),
             ))
         } else if active > 0 && cores + w.expected_cores > cap {
@@ -157,18 +192,27 @@ pub fn schedule(
                 cores += w.expected_cores;
                 games += u32::from(w.kind == JobKind::Game);
                 active += 1;
-                exclusive_running |= spec.exclusive;
+                if spec.exclusive {
+                    exclusive_running = Some(w.label.clone());
+                }
                 out.push((w.id.clone(), Verdict::Grant));
             }
             Some((reason, detail)) => {
+                let blocker = || Blocker {
+                    label: w.label.clone(),
+                    reason,
+                    detail: detail.clone(),
+                    waited_ms: facts.now_ms.saturating_sub(w.queued_at_ms),
+                };
                 // Owner presence is not something a queue can wait out, so it never blocks the line.
                 if reason != WaitingOn::OwnerPresent
                     && facts.now_ms.saturating_sub(w.queued_at_ms) >= starve_ms
+                    && starved.is_none()
                 {
-                    starved.get_or_insert(reason);
+                    starved = Some(blocker());
                 }
                 if reason != WaitingOn::Memory {
-                    kind_blocked.entry(w.kind as i32).or_insert(reason);
+                    kind_blocked.entry(w.kind as i32).or_insert_with(blocker);
                 }
                 out.push((w.id.clone(), Verdict::Wait(reason, detail)));
             }
@@ -195,6 +239,7 @@ mod tests {
     fn job(id: &str, kind: JobKind, mem_gib: u64) -> Waiting {
         Waiting {
             id: id.into(),
+            label: format!("job {id}"),
             kind,
             expected_mem: mem_gib * GIB,
             expected_cores: 1.0,
@@ -205,6 +250,7 @@ mod tests {
 
     fn run(kind: JobKind, mem_gib: u64) -> Running {
         Running {
+            label: "running job".into(),
             kind,
             expected_mem: mem_gib * GIB,
             expected_cores: 1.0,
@@ -314,6 +360,71 @@ mod tests {
             )[1],
             Verdict::Grant
         );
+    }
+
+    fn detail(v: &Verdict) -> &str {
+        match v {
+            Verdict::Wait(_, d) => d,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_memory_wait_states_the_rule_with_the_numbers() {
+        let cfg = Config::default();
+        let mut f = facts();
+        f.mem_available = 30 * GIB;
+        let running = Running {
+            label: "test r".into(),
+            kind: JobKind::Test,
+            expected_mem: 2 * GIB,
+            expected_cores: 1.0,
+            observed_peak: 0,
+        };
+        let v = verdicts(&cfg, &f, &[running], &[job("big", JobKind::Test, 16)]);
+        let d = detail(&v[0]);
+        for part in [
+            "16.0 GiB + 16.0 GiB kept free = 32.0 GiB",
+            "28.0 GiB available",
+            "30.0 GiB free - 2.0 GiB reserved",
+            "queue position is not the cause",
+        ] {
+            assert!(d.contains(part), "{part} missing from {d}");
+        }
+    }
+
+    #[test]
+    fn a_job_held_by_a_starved_one_names_it_and_why_it_waits() {
+        let cfg = Config::default();
+        let mut f = facts();
+        f.mem_available = 30 * GIB;
+        f.now_ms = 11 * 60 * 1000;
+        let v = verdicts(
+            &cfg,
+            &f,
+            &[],
+            &[
+                job("big", JobKind::Test, 20),
+                job("small", JobKind::Test, 2),
+            ],
+        );
+        let d = detail(&v[1]);
+        assert!(
+            d.contains("job big") && d.contains("waited 11m on memory"),
+            "{d}"
+        );
+        assert!(d.contains("20.0 GiB + 16.0 GiB kept free"), "{d}");
+    }
+
+    #[test]
+    fn a_job_behind_a_running_exclusive_one_names_it() {
+        let cfg = Config::default();
+        let running = Running {
+            label: "bench abc".into(),
+            ..run(JobKind::Bench, 1)
+        };
+        let v = verdicts(&cfg, &facts(), &[running], &[job("t", JobKind::Test, 1)]);
+        assert!(detail(&v[0]).contains("bench abc"), "{}", detail(&v[0]));
     }
 
     #[test]

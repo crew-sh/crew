@@ -9,8 +9,9 @@ use std::time::{Duration, Instant};
 
 use crew_proto::envelope::Body;
 use crew_proto::{
-    Envelope, Grant, JobDone, JobKind, OwnerSet, OwnerSource, Reply, TopReply, TopRequest,
-    WaitCondition, WaitReply, WaitRequest, WaitingOn, reply,
+    Ack, CancelRequest, Envelope, FrameError, Grant, JobDone, JobKind, JobRequest, JobsReply,
+    JobsRequest, OwnerSet, OwnerSource, Reply, TopReply, TopRequest, WaitCondition, WaitReply,
+    WaitRequest, WaitingOn, reply,
 };
 use crew_sys::display::{self, Desktop};
 use crew_sys::scope::{self, KillSignal, ScopeLimits, Stats};
@@ -25,6 +26,10 @@ const FIRST_POLL: Duration = Duration::from_millis(20);
 const MAX_TICK: Duration = Duration::from_millis(100);
 const STATS_EVERY: Duration = Duration::from_millis(500);
 const FAST_POLL_WINDOW: Duration = Duration::from_secs(2);
+/// How long a queued client waits for a lost usher to return before it gives up (never by running unmanaged).
+pub const RECONNECT_BUDGET: Duration = Duration::from_secs(5 * 60);
+const RECONNECT_FIRST: Duration = Duration::from_millis(200);
+const RECONNECT_MAX: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct RunOptions {
@@ -39,6 +44,15 @@ pub struct RunOptions {
     pub json: bool,
     /// The caller already runs inside a granted job (CREW_JOB): run in its scope instead of asking again.
     pub inside_job: bool,
+    /// With `Client::detach`: where the job's output goes; default is a file in the usher's state directory.
+    pub log: Option<PathBuf>,
+}
+
+/// A job the usher now owns.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Detached {
+    pub job_id: String,
+    pub log_path: PathBuf,
 }
 
 /// What a caller changes about the command once it knows whether it holds a grant.
@@ -182,6 +196,127 @@ impl Client {
         }
     }
 
+    pub fn jobs(&self) -> Result<JobsReply, ClientError> {
+        match self.ask(Body::JobsRequest(JobsRequest {}))?.body {
+            Some(Body::JobsReply(r)) => Ok(r),
+            _ => Err(ClientError::Protocol),
+        }
+    }
+
+    pub fn cancel(&self, job_id: &str) -> Result<Ack, ClientError> {
+        let req = CancelRequest {
+            job_id: job_id.to_string(),
+        };
+        match self.ask(Body::CancelRequest(req))?.body {
+            Some(Body::Ack(a)) => Ok(a),
+            _ => Err(ClientError::Protocol),
+        }
+    }
+
+    /// Hands the command to the usher, which queues it, runs it itself and keeps its output in a log; the caller can exit.
+    pub fn detach(&self, opts: &RunOptions) -> Result<Detached, ClientError> {
+        if opts.argv.is_empty() {
+            return Err(ClientError::EmptyCommand);
+        }
+        let mut env: BTreeMap<String, String> = std::env::vars().collect();
+        // The job gets its own CREW_JOB from the usher.
+        env.remove("CREW_JOB");
+        let cwd = std::env::current_dir()?;
+        let kind = match opts.kind {
+            Some(k) => k,
+            None => kind::infer_with(&opts.argv, &kind::ProjectRules::discover(&cwd)?),
+        };
+        let mut req = request::build(&Inputs {
+            kind,
+            argv: &opts.argv,
+            cwd: &cwd,
+            env: &env,
+            mem_bytes: opts.mem_bytes,
+            cpus: opts.cpus,
+            display: opts.display,
+        });
+        req.detach = true;
+        req.env = env.into_iter().collect();
+        req.log_path = opts
+            .log
+            .as_ref()
+            .map(|p| cwd.join(p).display().to_string())
+            .unwrap_or_default();
+        let mut stream = self.connect()?;
+        crew_proto::write_frame(&mut stream, &Envelope::of(Body::JobRequest(req)))?;
+        match crew_proto::read_frame(&mut stream)?
+            .ok_or(ClientError::Closed)?
+            .body
+        {
+            Some(Body::DetachedAccepted(a)) => Ok(Detached {
+                job_id: a.job_id,
+                log_path: PathBuf::from(a.log_path),
+            }),
+            Some(Body::Ack(a)) if !a.ok => Err(ClientError::Rejected(a.message)),
+            _ => Err(ClientError::Protocol),
+        }
+    }
+
+    /// Waits for a lost usher to come back and queues `req` again under its old id and time.
+    fn requeue(
+        &self,
+        req: &JobRequest,
+        queued_at_unix_ms: u64,
+        opts: &RunOptions,
+    ) -> Result<UnixStream, ClientError> {
+        if opts.json {
+            progress(
+                opts,
+                &RunEvent::UsherLost {
+                    job_id: req.id.clone(),
+                },
+            );
+        } else {
+            eprintln!(
+                "crew: lost the usher; job {} stays queued, waiting for it to come back",
+                req.id
+            );
+        }
+        let started = Instant::now();
+        let mut delay = RECONNECT_FIRST;
+        loop {
+            thread::sleep(delay);
+            delay = (delay * 2).min(RECONNECT_MAX);
+            let source = match UnixStream::connect(&self.socket) {
+                Ok(mut s) => {
+                    let again = JobRequest {
+                        queued_at_unix_ms,
+                        ..req.clone()
+                    };
+                    match crew_proto::write_frame(&mut s, &Envelope::of(Body::JobRequest(again))) {
+                        Ok(()) => {
+                            if opts.json {
+                                progress(
+                                    opts,
+                                    &RunEvent::Requeued {
+                                        job_id: req.id.clone(),
+                                    },
+                                );
+                            } else {
+                                eprintln!("crew: usher is back; job {} is queued again", req.id);
+                            }
+                            return Ok(s);
+                        }
+                        Err(e) => std::io::Error::other(e.to_string()),
+                    }
+                }
+                Err(e) => e,
+            };
+            if started.elapsed() >= RECONNECT_BUDGET {
+                return Err(ClientError::UsherLost {
+                    job_id: req.id.clone(),
+                    secs: RECONNECT_BUDGET.as_secs(),
+                    source,
+                });
+            }
+        }
+    }
+
     /// Runs the command under an admission grant and returns its exit code.
     pub fn run(&self, opts: &RunOptions) -> Result<i32, ClientError> {
         self.run_with(opts, |_| Launch::default())
@@ -242,13 +377,26 @@ impl Client {
             }
         };
         let job_id = req.id.clone();
-        crew_proto::write_frame(&mut stream, &Envelope::of(Body::JobRequest(req)))?;
+        let queued_at = unix_ms();
+        let mut lost =
+            crew_proto::write_frame(&mut stream, &Envelope::of(Body::JobRequest(req.clone())))
+                .is_err();
 
+        // A queued job never falls back to an unmanaged run: if the usher goes away, wait for it and queue again.
         let grant = loop {
-            let Some(Body::Reply(Reply { outcome, .. })) = crew_proto::read_frame(&mut stream)?
-                .ok_or(ClientError::Closed)?
-                .body
-            else {
+            if lost {
+                stream = self.requeue(&req, queued_at, opts)?;
+                lost = false;
+            }
+            let frame = match crew_proto::read_frame(&mut stream) {
+                Ok(Some(frame)) => frame,
+                Ok(None) | Err(FrameError::Io(_)) => {
+                    lost = true;
+                    continue;
+                }
+                Err(e) => return Err(e.into()),
+            };
+            let Some(Body::Reply(Reply { outcome, .. })) = frame.body else {
                 return Err(ClientError::Protocol);
             };
             match outcome {
@@ -319,6 +467,13 @@ impl Client {
         let _ = crew_proto::read_frame(&mut stream);
         Ok(code)
     }
+}
+
+fn unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 fn progress(opts: &RunOptions, event: &RunEvent) {
@@ -412,24 +567,7 @@ fn run_granted(
 
 /// Wraps the command in `mbx reserve` when the usher asks for pool capacity and mbx is where it said.
 pub fn with_reserve(argv: &[String], grant: &Grant) -> Vec<String> {
-    let Some(r) = grant
-        .reserve
-        .as_ref()
-        .filter(|r| Path::new(&r.mbx_path).is_file())
-    else {
-        return argv.to_vec();
-    };
-    let mut out = vec![
-        r.mbx_path.clone(),
-        "reserve".into(),
-        "--cpus".into(),
-        r.cpus.max(1).to_string(),
-        "--memory".into(),
-        format!("{}MiB", r.mem_bytes.div_ceil(1 << 20).max(1)),
-        "--".into(),
-    ];
-    out.extend_from_slice(argv);
-    out
+    grant.reserved_argv(argv)
 }
 
 /// Waits for the command, keeps the scope's last readable stats, and turns SIGINT/SIGTERM into scope kills.

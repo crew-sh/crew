@@ -1,10 +1,13 @@
+use std::collections::HashMap;
 use std::fs;
 use std::io;
+use std::net::Shutdown;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -12,7 +15,7 @@ use crew_proto::envelope::Body;
 use crew_sys::idle;
 
 use crate::config::Config;
-use crate::daemon::{Conn, Daemon, Msg};
+use crate::daemon::{Conn, Daemon, Msg, StatePaths};
 use crate::log::Log;
 
 #[derive(Debug, thiserror::Error)]
@@ -28,16 +31,29 @@ pub struct Paths {
     pub socket: PathBuf,
     pub sizes: PathBuf,
     pub log: PathBuf,
+    /// The state file of detached jobs.
+    pub jobs: PathBuf,
+    /// Default logs and exit-status files of detached jobs.
+    pub job_logs: PathBuf,
 }
 
 impl Paths {
-    pub fn from_env() -> Self {
-        let state = crew_sys::paths::state_dir();
+    /// The usher's files under `state`, listening on `socket`.
+    pub fn in_state(socket: PathBuf, state: &Path) -> Self {
         Self {
-            socket: crew_sys::paths::socket_path(),
+            socket,
             sizes: state.join("usher-sizes.pb"),
             log: state.join("usher.log"),
+            jobs: state.join("usher-jobs.pb"),
+            job_logs: state.join("jobs"),
         }
+    }
+
+    pub fn from_env() -> Self {
+        Self::in_state(
+            crew_sys::paths::socket_path(),
+            &crew_sys::paths::state_dir(),
+        )
     }
 }
 
@@ -47,10 +63,14 @@ pub enum IdleSource {
     Off,
 }
 
+/// Open client connections, so `stop` can close them the way a dying process would.
+type Open = Arc<Mutex<HashMap<u64, UnixStream>>>;
+
 pub struct Server {
     socket: PathBuf,
     tx: Sender<Msg>,
     actor: Option<JoinHandle<()>>,
+    open: Open,
 }
 
 fn bind(path: &Path) -> Result<UnixListener, ServerError> {
@@ -83,14 +103,22 @@ fn serve_connection(stream: UnixStream, tx: &Sender<Msg>) {
         let msg = match crew_proto::read_frame(&mut reader) {
             Ok(Some(env)) => match env.body {
                 Some(Body::JobRequest(req)) => {
-                    job_id = Some(req.id.clone());
+                    // A detached job belongs to the usher, so its connection closing says nothing about it.
+                    if !req.detach {
+                        job_id = Some(req.id.clone());
+                    }
                     Msg::Job {
-                        req,
+                        req: Box::new(req),
                         conn: conn.clone(),
                     }
                 }
                 Some(Body::JobDone(done)) => Msg::Done { done },
                 Some(Body::TopRequest(_)) => Msg::Top { conn: conn.clone() },
+                Some(Body::JobsRequest(_)) => Msg::Jobs { conn: conn.clone() },
+                Some(Body::CancelRequest(c)) => Msg::Cancel {
+                    job_id: c.job_id,
+                    conn: conn.clone(),
+                },
                 Some(Body::OwnerSet(set)) => Msg::Owner {
                     set,
                     conn: conn.clone(),
@@ -102,10 +130,13 @@ fn serve_connection(stream: UnixStream, tx: &Sender<Msg>) {
                 _ => continue,
             },
             Ok(None) | Err(_) => {
-                let _ = tx.send(Msg::Hangup { conn });
                 if let Some(job_id) = job_id {
-                    let _ = tx.send(Msg::Gone { job_id });
+                    let _ = tx.send(Msg::Gone {
+                        job_id,
+                        conn: conn.clone(),
+                    });
                 }
+                let _ = tx.send(Msg::Hangup { conn });
                 return;
             }
         };
@@ -147,19 +178,45 @@ impl Server {
             }
         }
 
-        let daemon = Daemon::new(cfg, paths.sizes.clone(), log.clone());
+        let daemon = Daemon::new(
+            cfg,
+            StatePaths {
+                sizes: paths.sizes.clone(),
+                jobs: paths.jobs.clone(),
+                job_logs: paths.job_logs.clone(),
+            },
+            log.clone(),
+            tx.clone(),
+        );
         let actor = thread::Builder::new()
             .name("usher".into())
             .spawn(move || daemon.run(&rx))
             .expect("spawn actor");
 
         let accept_tx = tx.clone();
+        let open: Open = Open::default();
+        let accept_open = Arc::clone(&open);
         thread::Builder::new()
             .name("accept".into())
             .spawn(move || {
+                let next = AtomicU64::new(0);
                 for stream in listener.incoming().flatten() {
                     let tx = accept_tx.clone();
-                    thread::spawn(move || serve_connection(stream, &tx));
+                    let id = next.fetch_add(1, Ordering::Relaxed);
+                    let registry = Arc::clone(&accept_open);
+                    if let Ok(copy) = stream.try_clone() {
+                        registry
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .insert(id, copy);
+                    }
+                    thread::spawn(move || {
+                        serve_connection(stream, &tx);
+                        registry
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .remove(&id);
+                    });
                 }
             })
             .expect("spawn acceptor");
@@ -169,6 +226,7 @@ impl Server {
             socket: paths.socket.clone(),
             tx,
             actor: Some(actor),
+            open,
         })
     }
 
@@ -178,5 +236,13 @@ impl Server {
             let _ = actor.join();
         }
         let _ = fs::remove_file(&self.socket);
+        for stream in self
+            .open
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+        {
+            let _ = stream.shutdown(Shutdown::Both);
+        }
     }
 }

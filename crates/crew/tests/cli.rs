@@ -313,6 +313,22 @@ struct WaitJson {
     outcome: String,
     condition: String,
     waited_ms: u64,
+    #[serde(default)]
+    exit_code: Option<i32>,
+}
+
+#[derive(serde::Deserialize)]
+struct JobsJson {
+    jobs: Vec<JobRecordJson>,
+}
+
+#[derive(serde::Deserialize)]
+struct JobRecordJson {
+    id: String,
+    phase: String,
+    detached: bool,
+    exit_code: Option<i32>,
+    log_path: String,
 }
 
 fn top_json(d: &Daemon) -> TopJson {
@@ -657,4 +673,84 @@ fn cargo_and_build_reach_crew_depot_and_the_other_subcommands_still_work() {
     assert!(depot.exists());
     let top = run(&["help"]);
     assert!(String::from_utf8_lossy(&top.stdout).contains("cargo <args>"));
+}
+
+#[test]
+fn run_detach_hands_the_job_to_the_usher_and_wait_job_exits_with_its_code() {
+    let Some(d) = Daemon::start() else { return };
+    let log = d.dir.path().join("job.log");
+    let log_arg = log.display().to_string();
+    let o = d.crew(&[
+        "run",
+        "--detach",
+        "--log",
+        &log_arg,
+        "--kind",
+        "other",
+        "--",
+        "sh",
+        "-c",
+        "echo hello; exit 4",
+    ]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    let id = stdout(&o).trim().to_string();
+    assert_eq!(id.len(), 36, "stdout should be the bare job id: {id:?}");
+    assert!(stderr(&o).contains(&log_arg), "{}", stderr(&o));
+
+    let (code, w) = wait_json(&d, &["wait", "job", &id, "--timeout", "30s", "--json"]);
+    assert_eq!(
+        (code, w.outcome.as_str(), w.condition.as_str(), w.exit_code),
+        (Some(4), "satisfied", "job_exit", Some(4))
+    );
+    assert_eq!(std::fs::read_to_string(&log).unwrap().trim(), "hello");
+
+    let o = d.crew(&["jobs", "--json"]);
+    let jobs: JobsJson = serde_json::from_str(stdout(&o).trim()).unwrap();
+    let j = jobs.jobs.iter().find(|j| j.id == id).unwrap();
+    assert_eq!(
+        (
+            j.phase.as_str(),
+            j.detached,
+            j.exit_code,
+            j.log_path.as_str()
+        ),
+        ("exited", true, Some(4), log_arg.as_str())
+    );
+    let text = stdout(&d.crew(&["jobs"]));
+    assert!(
+        text.contains(&id) && text.contains("exit 4") && text.contains(&log_arg),
+        "{text}"
+    );
+}
+
+#[test]
+fn cancel_stops_a_detached_job_and_reports_when_there_is_nothing_to_cancel() {
+    let Some(d) = Daemon::start() else { return };
+    let o = d.crew(&["run", "--detach", "--kind", "other", "--", "sleep", "60"]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    let id = stdout(&o).trim().to_string();
+    until("the sleep to run", || {
+        (top_json(&d).running.len() == 1).then_some(())
+    });
+    let o = d.crew(&["cancel", &id]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    let (code, w) = wait_json(&d, &["wait", "job", &id, "--timeout", "30s", "--json"]);
+    assert_eq!((code, w.outcome.as_str()), (Some(125), "job_lost"));
+    assert_eq!(d.crew(&["cancel", &id]).status.code(), Some(1));
+    assert_eq!(d.crew(&["cancel", "never-existed"]).status.code(), Some(1));
+}
+
+#[test]
+fn run_detach_without_a_usher_is_an_error_never_an_unmanaged_run() {
+    let dir = tempdir("crew-detach-down-");
+    let marker = dir.path().join("ran");
+    let marker_arg = marker.display().to_string();
+    let o = crew_with(
+        &dir.path().join("none.sock"),
+        &["run", "--detach", "--", "touch", &marker_arg],
+        &[],
+    );
+    assert_eq!(o.status.code(), Some(125), "{}", stderr(&o));
+    assert!(stderr(&o).contains("not running"), "{}", stderr(&o));
+    assert!(!marker.exists());
 }
