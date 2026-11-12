@@ -1,6 +1,9 @@
 use std::fmt::Write;
 
-use crew_proto::{JobKind, JobView, MachineView, OwnerSource, TopReply, WaitingOn};
+use crew_proto::{
+    AccountingSource, AgentKind, AgentView, JobKind, JobView, MachineView, OwnerSource,
+    ProjectView, TopReply, WaitingOn,
+};
 
 const GIB: f64 = (1u64 << 30) as f64;
 
@@ -104,6 +107,97 @@ fn queued_row(v: &JobView) -> String {
     )
 }
 
+fn mib(bytes: u64) -> String {
+    format!("{:.0}M", bytes as f64 / (1u64 << 20) as f64)
+}
+
+fn agent_row(a: &AgentView) -> String {
+    let kind = match AgentKind::try_from(a.kind).unwrap_or(AgentKind::Unspecified) {
+        AgentKind::Codex => "codex",
+        AgentKind::Claude => "claude",
+        AgentKind::Unspecified => "?",
+    };
+    let source = match AccountingSource::try_from(a.source).unwrap_or(AccountingSource::Unspecified)
+    {
+        AccountingSource::Cgroup => "cgroup",
+        AccountingSource::Proc => "proc",
+        AccountingSource::Unspecified => "?",
+    };
+    let note = if a.has_tty {
+        "terminal"
+    } else if !a.named {
+        "unnamed"
+    } else if a.actionable {
+        ""
+    } else {
+        "protected"
+    };
+    format!(
+        "{:<14} {:<6} {:<12} {:>5} {:>5.1} {:>8} {:>7} {:>7} {:>7} {:<6} {}",
+        truncate(&a.name, 14),
+        kind,
+        truncate(&a.project, 12),
+        a.processes,
+        f64::from(a.cpu_milli) / 1000.0,
+        duration(a.cpu_usec / 1000),
+        gib(a.mem_bytes),
+        mib(a.io_read_bytes),
+        mib(a.io_write_bytes),
+        source,
+        note,
+    )
+}
+
+fn project_row(p: &ProjectView) -> String {
+    format!(
+        "{:<14} {:>6} {:>5} {:>5.1} {:>8} {:>7} {:>7} {:>7} {:>4}/{:<4}",
+        truncate(&p.name, 14),
+        p.agents,
+        p.processes,
+        f64::from(p.cpu_milli) / 1000.0,
+        duration(p.cpu_usec / 1000),
+        gib(p.mem_bytes),
+        mib(p.io_read_bytes),
+        mib(p.io_write_bytes),
+        p.running_jobs,
+        p.queued_jobs,
+    )
+}
+
+fn agent_sections(t: &TopReply, out: &mut String) {
+    if !t.agents.is_empty() {
+        let _ = writeln!(out, "\nAGENTS ({})", t.agents.len());
+        let _ = writeln!(
+            out,
+            "{:<14} {:<6} {:<12} {:>5} {:>5} {:>8} {:>7} {:>7} {:>7} {:<6} NOTE",
+            "AGENT",
+            "KIND",
+            "PROJECT",
+            "PROCS",
+            "CPU",
+            "CPU TIME",
+            "MEM GiB",
+            "READ",
+            "WRITTEN",
+            "SOURCE"
+        );
+        for a in &t.agents {
+            let _ = writeln!(out, "{}", agent_row(a));
+        }
+    }
+    if !t.projects.is_empty() {
+        let _ = writeln!(out, "\nPROJECTS ({})", t.projects.len());
+        let _ = writeln!(
+            out,
+            "{:<14} {:>6} {:>5} {:>5} {:>8} {:>7} {:>7} {:>7} JOBS run/queued",
+            "PROJECT", "AGENTS", "PROCS", "CPU", "CPU TIME", "MEM GiB", "READ", "WRITTEN"
+        );
+        for p in &t.projects {
+            let _ = writeln!(out, "{}", project_row(p));
+        }
+    }
+}
+
 pub fn render(t: &TopReply) -> String {
     let mut out = String::new();
     if let Some(m) = &t.machine {
@@ -131,6 +225,7 @@ pub fn render(t: &TopReply) -> String {
     for v in &t.queued {
         let _ = writeln!(out, "{}", queued_row(v));
     }
+    agent_sections(t, &mut out);
     out
 }
 
@@ -172,6 +267,7 @@ mod tests {
                 owner_source: OwnerSource::Manual as i32,
                 ..Default::default()
             }),
+            ..Default::default()
         };
         let s = render(&t);
         assert!(s.contains("RUNNING (1)") && s.contains("QUEUED (1)"), "{s}");
@@ -186,6 +282,61 @@ mod tests {
                 && s.contains("present (manual)"),
             "{s}"
         );
+    }
+
+    #[test]
+    fn agents_and_projects_render_with_their_accounting_and_protection() {
+        let agent = |name: &str, tty: bool, actionable: bool, source: AccountingSource| AgentView {
+            name: name.into(),
+            kind: AgentKind::Claude as i32,
+            project: "horizonmc".into(),
+            processes: 7,
+            cpu_milli: 2500,
+            cpu_usec: 90_000_000,
+            mem_bytes: 3 << 30,
+            io_read_bytes: 5 << 20,
+            io_write_bytes: 7 << 20,
+            source: source as i32,
+            has_tty: tty,
+            named: name != "claude-9",
+            actionable,
+            ..Default::default()
+        };
+        let t = TopReply {
+            agents: vec![
+                agent("t1", false, true, AccountingSource::Cgroup),
+                agent("claude-9", true, false, AccountingSource::Proc),
+                agent("lead", false, false, AccountingSource::Proc),
+            ],
+            projects: vec![ProjectView {
+                name: "horizonmc".into(),
+                agents: 3,
+                processes: 21,
+                running_jobs: 2,
+                queued_jobs: 1,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let s = render(&t);
+        let line = |name: &str| {
+            s.lines()
+                .find(|l| l.starts_with(name))
+                .unwrap_or_default()
+                .to_string()
+        };
+        assert!(
+            s.contains("AGENTS (3)") && s.contains("PROJECTS (1)"),
+            "{s}"
+        );
+        let t1 = line("t1");
+        assert!(
+            t1.contains("cgroup") && t1.contains("2.5") && t1.contains("3.0") && t1.contains("5M"),
+            "{t1}"
+        );
+        assert!(line("claude-9").ends_with("terminal"), "{s}");
+        assert!(line("lead").ends_with("protected"), "{s}");
+        assert!(line("horizonmc").contains("2/1"), "{s}");
     }
 
     #[test]

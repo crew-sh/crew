@@ -1,15 +1,16 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::io;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
-use std::sync::mpsc::{Receiver, RecvTimeoutError};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use crew_proto::{
     Ack, Decision, DiskView, Envelope, Grant, JobDone, JobKind, JobRequest, JobView, Limits,
-    MachineView, OwnerSet, OwnerSource, Queued, Refusal, Reply, TopReply, WaitingOn, envelope,
-    reply,
+    MachineView, OwnerSet, OwnerSource, Queued, Refusal, Reply, TopReply, WaitCondition,
+    WaitOutcome, WaitReply, WaitRequest, WaitingOn, envelope, reply,
 };
 use crew_sys::display::{self, Desktop};
 use crew_sys::idle::IdleEvent;
@@ -17,13 +18,16 @@ use crew_sys::machine;
 use crew_sys::scope::{self, KillSignal};
 
 use crate::admission::{self, Facts, Running, Verdict, Waiting};
+use crate::agents::{self, Agent, Collector, Planner};
 use crate::config::Config;
 use crate::log::Log;
 use crate::sizes::{self, Sizes};
+use crate::waits::{self, Fate, JobState};
 
 const TICK: Duration = Duration::from_secs(2);
 const RENOTIFY_MS: u64 = 30_000;
 const MIN_LEARNED_CORES_MILLI: u32 = 100;
+const FATE_HISTORY: usize = 1024;
 
 #[derive(Clone)]
 pub struct Conn(Arc<Mutex<UnixStream>>);
@@ -32,6 +36,10 @@ impl Conn {
     pub fn new(stream: UnixStream) -> io::Result<Self> {
         stream.set_write_timeout(Some(Duration::from_secs(2)))?;
         Ok(Self(Arc::new(Mutex::new(stream))))
+    }
+
+    pub fn same(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
     }
 
     fn send(&self, body: envelope::Body) {
@@ -49,6 +57,8 @@ pub enum Msg {
     Gone { job_id: String },
     Top { conn: Conn },
     Owner { set: OwnerSet, conn: Conn },
+    Wait { req: WaitRequest, conn: Conn },
+    Hangup { conn: Conn },
     Idle(IdleEvent),
     Stop,
 }
@@ -76,6 +86,14 @@ struct RunningJob {
     stats: scope::Stats,
 }
 
+struct PendingWait {
+    conn: Conn,
+    condition: WaitCondition,
+    job_id: String,
+    since_ms: u64,
+    deadline_ms: Option<u64>,
+}
+
 #[derive(Default)]
 struct Owner {
     manual: Option<bool>,
@@ -100,6 +118,46 @@ impl Owner {
 struct CpuLoad {
     last: Option<(u64, u64, u64)>,
     unmanaged_cores: f64,
+    psi_cpu: f64,
+}
+
+/// Agent sessions seen by the scanner thread; the thread ends when the sender is dropped.
+struct AgentWatch {
+    latest: Arc<Mutex<Vec<Agent>>>,
+    _stop: Sender<()>,
+}
+
+impl AgentWatch {
+    fn start(mut collector: Collector) -> Self {
+        let latest = Arc::new(Mutex::new(Vec::new()));
+        let (stop, quit) = mpsc::channel::<()>();
+        let shared = Arc::clone(&latest);
+        thread::Builder::new()
+            .name("agents".into())
+            .spawn(move || {
+                loop {
+                    let seen = collector.collect(Instant::now());
+                    *shared
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = seen;
+                    if !matches!(quit.recv_timeout(TICK), Err(RecvTimeoutError::Timeout)) {
+                        return;
+                    }
+                }
+            })
+            .expect("spawn agent scanner");
+        Self {
+            latest,
+            _stop: stop,
+        }
+    }
+
+    fn agents(&self) -> Vec<Agent> {
+        self.latest
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
 }
 
 pub struct Daemon {
@@ -113,6 +171,10 @@ pub struct Daemon {
     owner: Owner,
     load: CpuLoad,
     finished_cpu_usec: u64,
+    waits: Vec<PendingWait>,
+    fates: VecDeque<(String, Fate)>,
+    agents: Option<AgentWatch>,
+    planner: Planner,
 }
 
 fn clean_id(id: &str) -> String {
@@ -133,6 +195,18 @@ fn nonzero(v: u32, fallback: u32) -> u32 {
 impl Daemon {
     pub fn new(cfg: Config, sizes_path: PathBuf, log: Arc<Log>) -> Self {
         let sizes = Sizes::load(&sizes_path);
+        if cfg.adopt.move_ || cfg.adopt.freeze {
+            log.line(
+                "WARN adopt.move and adopt.freeze are not implemented yet: dry-run log lines only",
+            );
+        }
+        let agents = cfg.adopt.enabled.then(|| {
+            AgentWatch::start(Collector::new(
+                std::path::Path::new("/proc"),
+                std::path::Path::new("/sys/fs/cgroup"),
+                cfg.adopt.protect.clone(),
+            ))
+        });
         Self {
             cfg,
             sizes_path,
@@ -144,6 +218,10 @@ impl Daemon {
             owner: Owner::default(),
             load: CpuLoad::default(),
             finished_cpu_usec: 0,
+            waits: Vec::new(),
+            fates: VecDeque::new(),
+            agents,
+            planner: Planner::default(),
         }
     }
 
@@ -153,11 +231,12 @@ impl Daemon {
 
     pub fn run(mut self, rx: &Receiver<Msg>) {
         loop {
-            match rx.recv_timeout(TICK) {
+            match rx.recv_timeout(self.next_wake()) {
                 Ok(Msg::Stop) | Err(RecvTimeoutError::Disconnected) => return,
                 Ok(msg) => {
                     self.handle(msg);
                     self.reschedule();
+                    self.settle_waits();
                 }
                 Err(RecvTimeoutError::Timeout) => self.tick(),
             }
@@ -192,6 +271,8 @@ impl Daemon {
                     message: msg,
                 }));
             }
+            Msg::Wait { req, conn } => self.begin_wait(&req, conn),
+            Msg::Hangup { conn } => self.waits.retain(|w| !w.conn.same(&conn)),
             Msg::Idle(ev) => self.set_owner(|o| o.idle = Some(ev == IdleEvent::Resumed)),
             Msg::Stop => {}
         }
@@ -317,6 +398,7 @@ impl Daemon {
                 }
                 Verdict::Refuse(reason, detail) => {
                     let job = self.queue.remove(at);
+                    self.remember(&job.req.id, Fate::Refused);
                     self.log.line(&format!(
                         "REFUSE id={} kind={} reason={} detail={detail:?}",
                         job.req.id,
@@ -378,6 +460,7 @@ impl Daemon {
     }
 
     fn grant(&mut self, job: QueuedJob, owner_present: bool) {
+        self.remember(&job.req.id, Fate::Granted);
         let spec = self.cfg.kind(job.kind);
         let declared = job.req.declared.unwrap_or_default();
         let base_limits = Limits {
@@ -476,6 +559,7 @@ impl Daemon {
     fn lose(&mut self, job_id: &str) {
         if let Some(at) = self.queue.iter().position(|q| q.req.id == job_id) {
             self.queue.remove(at);
+            self.remember(job_id, Fate::Gone);
             self.log.line(&format!("GONE id={job_id} while queued"));
         } else if let Some(at) = self.running.iter().position(|r| r.req.id == job_id) {
             let job = self.running.remove(at);
@@ -493,12 +577,108 @@ impl Daemon {
         }
         self.update_load();
         self.reschedule();
+        self.adopt_dry_run();
+        self.settle_waits();
+    }
+
+    fn next_wake(&self) -> Duration {
+        let now = self.now_ms();
+        self.waits
+            .iter()
+            .filter_map(|w| w.deadline_ms)
+            .map(|d| Duration::from_millis(d.saturating_sub(now)))
+            .fold(TICK, Duration::min)
+            .max(Duration::from_millis(1))
+    }
+
+    fn remember(&mut self, id: &str, fate: Fate) {
+        if self.fates.len() == FATE_HISTORY {
+            self.fates.pop_front();
+        }
+        self.fates.push_back((id.to_string(), fate));
+    }
+
+    fn job_state(&self, id: &str) -> JobState {
+        if self.queue.iter().any(|q| q.req.id == id) {
+            return JobState::Queued;
+        }
+        match self.fates.iter().rev().find(|(f, _)| f == id) {
+            Some((_, Fate::Granted)) => JobState::Granted,
+            Some((_, Fate::Refused)) => JobState::Refused,
+            Some((_, Fate::Gone)) => JobState::Gone,
+            None => JobState::Unknown,
+        }
+    }
+
+    fn begin_wait(&mut self, req: &WaitRequest, conn: Conn) {
+        let condition =
+            WaitCondition::try_from(req.condition).unwrap_or(WaitCondition::Unspecified);
+        let now = self.now_ms();
+        self.waits.push(PendingWait {
+            conn,
+            condition,
+            job_id: req.job_id.clone(),
+            since_ms: now,
+            deadline_ms: (req.timeout_ms > 0).then(|| now + req.timeout_ms),
+        });
+    }
+
+    /// Answers every wait whose condition now holds, is malformed, or has run out of time.
+    fn settle_waits(&mut self) {
+        if self.waits.is_empty() {
+            return;
+        }
+        let now = self.now_ms();
+        let job = |id: &str| self.job_state(id);
+        let facts = waits::Facts {
+            queue_empty: self.queue.is_empty(),
+            owner_present: self.owner.present(),
+            job: &job,
+        };
+        let mut answers = Vec::new();
+        for (at, w) in self.waits.iter().enumerate() {
+            let verdict = match waits::evaluate(w.condition, &w.job_id, &facts) {
+                Err(detail) => Some((WaitOutcome::Rejected, detail)),
+                Ok(Some(v)) => Some(v),
+                Ok(None) if w.deadline_ms.is_some_and(|d| now >= d) => {
+                    Some((WaitOutcome::TimedOut, "timed out".to_string()))
+                }
+                Ok(None) => None,
+            };
+            if let Some(v) = verdict {
+                answers.push((at, v));
+            }
+        }
+        for (at, (outcome, detail)) in answers.into_iter().rev() {
+            let w = self.waits.remove(at);
+            w.conn.send(envelope::Body::WaitReply(WaitReply {
+                outcome: outcome as i32,
+                condition: w.condition as i32,
+                detail,
+                waited_ms: now.saturating_sub(w.since_ms),
+            }));
+        }
+    }
+
+    fn adopt_dry_run(&mut self) {
+        let Some(watch) = &self.agents else { return };
+        let seen = watch.agents();
+        let notes = self.planner.plan(
+            &self.cfg.adopt,
+            &seen,
+            self.owner.present(),
+            self.load.psi_cpu,
+        );
+        for note in notes {
+            self.log.line(&note.line());
+        }
     }
 
     fn update_load(&mut self) {
         let Ok(snap) = machine::snapshot(&[]) else {
             return;
         };
+        self.load.psi_cpu = snap.psi.cpu_some_avg10;
         let now_ms = self.now_ms();
         let scopes =
             self.finished_cpu_usec + self.running.iter().map(|r| r.stats.cpu_usec).sum::<u64>();
@@ -579,7 +759,21 @@ impl Daemon {
                 })
             })
             .collect();
+        let seen = self
+            .agents
+            .as_ref()
+            .map(AgentWatch::agents)
+            .unwrap_or_default();
+        let mut jobs: BTreeMap<String, (u32, u32)> = BTreeMap::new();
+        for r in &self.running {
+            jobs.entry(r.req.project.clone()).or_default().0 += 1;
+        }
+        for q in &self.queue {
+            jobs.entry(q.req.project.clone()).or_default().1 += 1;
+        }
         TopReply {
+            agents: seen.iter().map(Agent::view).collect(),
+            projects: agents::project_views(&seen, &jobs),
             running,
             queued,
             machine: Some(MachineView {

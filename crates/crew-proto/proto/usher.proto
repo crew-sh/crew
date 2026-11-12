@@ -150,10 +150,96 @@ message MachineView {
   double unmanaged_cpu_pct = 11;
 }
 
+enum AgentKind {
+  AGENT_KIND_UNSPECIFIED = 0;
+  AGENT_KIND_CLAUDE = 1;
+  AGENT_KIND_CODEX = 2;
+}
+
+enum AccountingSource {
+  ACCOUNTING_SOURCE_UNSPECIFIED = 0;
+  // Summed over the session's processes from /proc.
+  ACCOUNTING_SOURCE_PROC = 1;
+  // Read from a cgroup that holds only the session's processes.
+  ACCOUNTING_SOURCE_CGROUP = 2;
+}
+
+// One agent session: a claude or codex process and its descendants. Observed, never changed.
+message AgentView {
+  // CREW_AGENT of the session's process, else "<kind>-<pid>".
+  string name = 1;
+  AgentKind kind = 2;
+  uint32 pid = 3;
+  string project = 4;
+  string cwd = 5;
+  uint32 processes = 6;
+  uint64 cpu_usec = 7;
+  uint32 cpu_milli = 8;
+  uint64 mem_bytes = 9;
+  uint64 io_read_bytes = 10;
+  uint64 io_write_bytes = 11;
+  string cgroup = 12;
+  AccountingSource source = 13;
+  uint64 age_ms = 14;
+  // The session's name came from CREW_AGENT.
+  bool named = 15;
+  // The session has a controlling terminal: an owner's session.
+  bool has_tty = 16;
+  // Adoption could act on this session once its flags are on: named, no terminal, not protected.
+  bool actionable = 17;
+}
+
+message ProjectView {
+  string name = 1;
+  string toplevel = 2;
+  uint32 agents = 3;
+  uint32 processes = 4;
+  uint64 cpu_usec = 5;
+  uint32 cpu_milli = 6;
+  uint64 mem_bytes = 7;
+  uint64 io_read_bytes = 8;
+  uint64 io_write_bytes = 9;
+  uint32 running_jobs = 10;
+  uint32 queued_jobs = 11;
+}
+
 message TopReply {
   repeated JobView running = 1;
   repeated JobView queued = 2;
   MachineView machine = 3;
+  repeated AgentView agents = 4;
+  repeated ProjectView projects = 5;
+}
+
+enum WaitCondition {
+  WAIT_CONDITION_UNSPECIFIED = 0;
+  WAIT_CONDITION_QUEUE_EMPTY = 1;
+  // The job with WaitRequest.job_id is running or has finished.
+  WAIT_CONDITION_JOB_GRANTED = 2;
+  WAIT_CONDITION_OWNER_AWAY = 3;
+}
+
+message WaitRequest {
+  WaitCondition condition = 1;
+  string job_id = 2;
+  // Zero waits without a limit.
+  uint64 timeout_ms = 3;
+}
+
+enum WaitOutcome {
+  WAIT_OUTCOME_UNSPECIFIED = 0;
+  WAIT_OUTCOME_SATISFIED = 1;
+  WAIT_OUTCOME_TIMED_OUT = 2;
+  WAIT_OUTCOME_REJECTED = 3;
+  // The job was refused or its client left before it was granted.
+  WAIT_OUTCOME_NEVER_GRANTED = 4;
+}
+
+message WaitReply {
+  WaitOutcome outcome = 1;
+  WaitCondition condition = 2;
+  string detail = 3;
+  uint64 waited_ms = 4;
 }
 
 message OwnerSet {
@@ -170,6 +256,8 @@ message Envelope {
     TopReply top_reply = 5;
     OwnerSet owner_set = 6;
     Ack ack = 7;
+    WaitRequest wait_request = 8;
+    WaitReply wait_reply = 9;
   }
 }
 

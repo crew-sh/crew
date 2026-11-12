@@ -10,13 +10,14 @@ use std::time::{Duration, Instant};
 use crew_proto::envelope::Body;
 use crew_proto::{
     Envelope, Grant, JobDone, JobKind, OwnerSet, OwnerSource, Reply, TopReply, TopRequest,
-    WaitingOn, reply,
+    WaitCondition, WaitReply, WaitRequest, WaitingOn, reply,
 };
 use crew_sys::display::{self, Desktop};
 use crew_sys::scope::{self, KillSignal, ScopeLimits, Stats};
 use crew_sys::signals;
 
 use crate::error::ClientError;
+use crate::json::{self, RunEvent, UnmanagedReason};
 use crate::kind;
 use crate::request::{self, Inputs};
 
@@ -34,7 +35,21 @@ pub struct RunOptions {
     pub argv: Vec<String>,
     /// A missing daemon is an error instead of an unmanaged run.
     pub strict: bool,
+    /// Progress as JSON lines on stderr instead of text.
+    pub json: bool,
+    /// The caller already runs inside a granted job (CREW_JOB): run in its scope instead of asking again.
+    pub inside_job: bool,
 }
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WaitSpec {
+    pub condition: WaitCondition,
+    pub job_id: String,
+    pub timeout: Option<Duration>,
+}
+
+/// Longer than any answer the usher owes, so a dead usher cannot hang a wait forever.
+const WAIT_GRACE: Duration = Duration::from_secs(15);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OwnerArg {
@@ -127,6 +142,27 @@ impl Client {
         }
     }
 
+    /// Blocks until the usher reports the condition (it notifies; nothing is polled).
+    pub fn wait(&self, spec: &WaitSpec) -> Result<WaitReply, ClientError> {
+        let mut s = self.connect()?;
+        let req = WaitRequest {
+            condition: spec.condition as i32,
+            job_id: spec.job_id.clone(),
+            timeout_ms: spec.timeout.map_or(0, |t| t.as_millis().max(1) as u64),
+        };
+        crew_proto::write_frame(&mut s, &Envelope::of(Body::WaitRequest(req)))?;
+        if let Some(t) = spec.timeout {
+            s.set_read_timeout(Some(t + WAIT_GRACE))?;
+        }
+        match crew_proto::read_frame(&mut s)?
+            .ok_or(ClientError::Closed)?
+            .body
+        {
+            Some(Body::WaitReply(w)) => Ok(w),
+            _ => Err(ClientError::Protocol),
+        }
+    }
+
     /// Runs the command under an admission grant and returns its exit code.
     pub fn run(&self, opts: &RunOptions) -> Result<i32, ClientError> {
         if opts.argv.is_empty() {
@@ -146,14 +182,29 @@ impl Client {
         });
 
         // A command already inside a granted job runs within that job's scope and grant; asking again could deadlock on the parent's reservation.
-        if env.contains_key("CREW_JOB") {
+        if opts.inside_job {
+            progress(
+                opts,
+                &RunEvent::Unmanaged {
+                    reason: UnmanagedReason::InsideGrantedJob,
+                },
+            );
             return run_nested(&opts.argv, &cwd, env);
         }
         let mut stream = match self.connect() {
             Ok(s) => s,
             Err(e) if opts.strict => return Err(e),
             Err(e) => {
-                eprintln!("crew: {e}; running unmanaged");
+                if opts.json {
+                    progress(
+                        opts,
+                        &RunEvent::Unmanaged {
+                            reason: UnmanagedReason::UsherDown,
+                        },
+                    );
+                } else {
+                    eprintln!("crew: {e}; running unmanaged");
+                }
                 return run_unmanaged(&opts.argv, &cwd, env);
             }
         };
@@ -169,7 +220,21 @@ impl Client {
             };
             match outcome {
                 Some(reply::Outcome::Grant(g)) => break g,
-                Some(reply::Outcome::Queued(q)) => eprintln!("{}", describe_wait(&q)),
+                Some(reply::Outcome::Queued(q)) => {
+                    if opts.json {
+                        progress(
+                            opts,
+                            &RunEvent::Queued {
+                                position: q.position,
+                                queued_ms: q.queued_ms,
+                                waiting_on: q.waiting_on.into(),
+                                detail: q.detail,
+                            },
+                        );
+                    } else {
+                        eprintln!("{}", describe_wait(&q));
+                    }
+                }
                 Some(reply::Outcome::Refusal(r)) => {
                     let reason = crew_proto::RefusalReason::try_from(r.reason)
                         .unwrap_or(crew_proto::RefusalReason::Unspecified);
@@ -182,6 +247,13 @@ impl Client {
             }
         };
 
+        progress(
+            opts,
+            &RunEvent::Granted {
+                job_id: grant.job_id.clone(),
+                scope: grant.scope_name.clone(),
+            },
+        );
         signals::install_termination_handler();
         let outcome = run_granted(&opts.argv, &cwd, env, &grant);
         let (code, done) = match outcome {
@@ -196,10 +268,28 @@ impl Client {
                 return Err(e);
             }
         };
+        progress(
+            opts,
+            &RunEvent::Done {
+                job_id: done.job_id.clone(),
+                exit_code: done.exit_code,
+                wall_ms: done.wall_ms,
+                cpu_usec: done.cpu_usec,
+                peak_mem_bytes: done.peak_mem_bytes,
+                io_read_bytes: done.io_read_bytes,
+                io_write_bytes: done.io_write_bytes,
+            },
+        );
         let _ = crew_proto::write_frame(&mut stream, &Envelope::of(Body::JobDone(done)));
         let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
         let _ = crew_proto::read_frame(&mut stream);
         Ok(code)
+    }
+}
+
+fn progress(opts: &RunOptions, event: &RunEvent) {
+    if opts.json {
+        eprintln!("{}", json::event(event));
     }
 }
 

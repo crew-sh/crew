@@ -1,13 +1,65 @@
-use crew_proto::JobKind;
-use crew_usher_client::{OwnerArg, RunOptions};
+use std::time::Duration;
+
+use crew_proto::{JobKind, WaitCondition};
+use crew_usher_client::{OwnerArg, RunOptions, WaitSpec};
 
 #[derive(Debug, PartialEq)]
 pub enum Sub {
     Help,
     Run(RunOptions),
-    Top { watch: bool },
-    Owner(OwnerArg),
+    Top { watch: bool, json: bool },
+    Owner { arg: OwnerArg, json: bool },
+    Wait { spec: WaitSpec, json: bool },
     Plugin { name: String, rest: Vec<String> },
+}
+
+/// "90", "90s", "500ms", "5m", "2h".
+pub fn parse_duration(s: &str) -> Result<Duration, String> {
+    let bad = || format!("bad duration `{s}`");
+    let t = s.trim();
+    let end = t
+        .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .unwrap_or(t.len());
+    let n: f64 = t[..end].parse().map_err(|_| bad())?;
+    let secs = match &t[end..] {
+        "" | "s" => n,
+        "ms" => n / 1000.0,
+        "m" => n * 60.0,
+        "h" => n * 3600.0,
+        _ => return Err(bad()),
+    };
+    Duration::try_from_secs_f64(secs).map_err(|_| bad())
+}
+
+fn parse_wait(args: &[String]) -> Result<Sub, String> {
+    const USAGE: &str =
+        "usage: crew wait queue-empty|owner-away|job <id> [--timeout 30s|5m] [--json]";
+    let mut json = false;
+    let mut timeout = None;
+    let mut words = Vec::new();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--json" => json = true,
+            "--timeout" => timeout = Some(parse_duration(value(&mut it, "--timeout")?)?),
+            s if s.starts_with('-') => return Err(format!("unknown option `{s}`\n{USAGE}")),
+            _ => words.push(a.as_str()),
+        }
+    }
+    let (condition, job_id) = match words.as_slice() {
+        ["queue-empty"] => (WaitCondition::QueueEmpty, String::new()),
+        ["owner-away"] => (WaitCondition::OwnerAway, String::new()),
+        ["job", id] | ["job-granted", id] => (WaitCondition::JobGranted, (*id).to_string()),
+        _ => return Err(USAGE.into()),
+    };
+    Ok(Sub::Wait {
+        spec: WaitSpec {
+            condition,
+            job_id,
+            timeout,
+        },
+        json,
+    })
 }
 
 /// "8G", "512M", "1.5GiB", "4096" (bytes).
@@ -53,6 +105,7 @@ fn parse_run(args: &[String]) -> Result<RunOptions, String> {
                 opts.cpus = Some(v.parse().map_err(|_| format!("bad --cpus `{v}`"))?);
             }
             "--display" => opts.display = true,
+            "--json" => opts.json = true,
             s if s.starts_with('-') => {
                 return Err(format!("unknown option `{s}` (put the command after `--`)"));
             }
@@ -73,17 +126,34 @@ pub fn parse(argv: &[String]) -> Result<Sub, String> {
     Ok(match argv.first().map(String::as_str) {
         None | Some("-h" | "--help" | "help") => Sub::Help,
         Some("run") => Sub::Run(parse_run(&argv[1..])?),
-        Some("top") => match &argv[1..] {
-            [] => Sub::Top { watch: false },
-            [f] if f == "--watch" || f == "-w" => Sub::Top { watch: true },
-            _ => return Err("usage: crew top [--watch]".into()),
-        },
-        Some("owner") => match argv.get(1).map(String::as_str) {
-            Some("here") if argv.len() == 2 => Sub::Owner(OwnerArg::Here),
-            Some("away") if argv.len() == 2 => Sub::Owner(OwnerArg::Away),
-            Some("auto") if argv.len() == 2 => Sub::Owner(OwnerArg::Auto),
-            _ => return Err("usage: crew owner here|away|auto".into()),
-        },
+        Some("top") => {
+            let flags = &argv[1..];
+            let json = flags.iter().any(|f| f == "--json");
+            let watch = flags.iter().any(|f| f == "--watch" || f == "-w");
+            if flags
+                .iter()
+                .any(|f| !matches!(f.as_str(), "--json" | "--watch" | "-w"))
+            {
+                return Err("usage: crew top [--watch] [--json]".into());
+            }
+            Sub::Top { watch, json }
+        }
+        Some("owner") => {
+            let json = argv.iter().skip(1).any(|f| f == "--json");
+            let words: Vec<&str> = argv[1..]
+                .iter()
+                .map(String::as_str)
+                .filter(|f| *f != "--json")
+                .collect();
+            let arg = match words.as_slice() {
+                ["here"] => OwnerArg::Here,
+                ["away"] => OwnerArg::Away,
+                ["auto"] => OwnerArg::Auto,
+                _ => return Err("usage: crew owner here|away|auto [--json]".into()),
+            };
+            Sub::Owner { arg, json }
+        }
+        Some("wait") => parse_wait(&argv[1..])?,
         Some(name) => Sub::Plugin {
             name: name.to_string(),
             rest: argv[1..].to_vec(),
@@ -132,6 +202,59 @@ mod tests {
     }
 
     #[test]
+    fn json_flag_belongs_to_crew_only_before_the_command() {
+        assert!(run("run --json -- true").json);
+        assert_eq!(run("run -- sh --json").argv, ["sh", "--json"]);
+        assert!(!run("run -- sh --json").json);
+    }
+
+    #[test]
+    fn durations() {
+        assert_eq!(parse_duration("90").unwrap(), Duration::from_secs(90));
+        assert_eq!(parse_duration("500ms").unwrap(), Duration::from_millis(500));
+        assert_eq!(parse_duration("5m").unwrap(), Duration::from_secs(300));
+        assert_eq!(parse_duration("1.5h").unwrap(), Duration::from_secs(5400));
+        assert!(
+            parse_duration("soon").is_err()
+                && parse_duration("5x").is_err()
+                && parse_duration("").is_err()
+        );
+    }
+
+    #[test]
+    fn wait_conditions() {
+        let wait = |c: &str| match parse(c).unwrap() {
+            Sub::Wait { spec, json } => (spec, json),
+            other => panic!("{other:?}"),
+        };
+        let (s, j) = wait("wait queue-empty --timeout 30s --json");
+        assert_eq!(
+            (s.condition, s.timeout, j),
+            (
+                WaitCondition::QueueEmpty,
+                Some(Duration::from_secs(30)),
+                true
+            )
+        );
+        assert_eq!(
+            wait("wait owner-away").0.condition,
+            WaitCondition::OwnerAway
+        );
+        let (s, _) = wait("wait job abc-123");
+        assert_eq!(
+            (s.condition, s.job_id.as_str(), s.timeout),
+            (WaitCondition::JobGranted, "abc-123", None)
+        );
+        assert!(
+            parse("wait").is_err() && parse("wait job").is_err() && parse("wait sometime").is_err()
+        );
+        assert!(
+            parse("wait queue-empty --timeout").is_err()
+                && parse("wait queue-empty --nope").is_err()
+        );
+    }
+
+    #[test]
     fn run_errors() {
         assert!(parse("run").is_err());
         assert!(parse("run --kind nope -- true").is_err());
@@ -141,9 +264,42 @@ mod tests {
 
     #[test]
     fn other_subcommands() {
-        assert_eq!(parse("top").unwrap(), Sub::Top { watch: false });
-        assert_eq!(parse("top --watch").unwrap(), Sub::Top { watch: true });
-        assert_eq!(parse("owner away").unwrap(), Sub::Owner(OwnerArg::Away));
+        assert_eq!(
+            parse("top").unwrap(),
+            Sub::Top {
+                watch: false,
+                json: false
+            }
+        );
+        assert_eq!(
+            parse("top --watch").unwrap(),
+            Sub::Top {
+                watch: true,
+                json: false
+            }
+        );
+        assert_eq!(
+            parse("top --json -w").unwrap(),
+            Sub::Top {
+                watch: true,
+                json: true
+            }
+        );
+        assert!(parse("top --bogus").is_err());
+        assert_eq!(
+            parse("owner away").unwrap(),
+            Sub::Owner {
+                arg: OwnerArg::Away,
+                json: false
+            }
+        );
+        assert_eq!(
+            parse("owner --json here").unwrap(),
+            Sub::Owner {
+                arg: OwnerArg::Here,
+                json: true
+            }
+        );
         assert!(parse("owner").is_err() && parse("owner sideways").is_err());
         assert_eq!(
             parse("queue merge --now").unwrap(),

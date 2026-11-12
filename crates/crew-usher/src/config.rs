@@ -32,6 +32,32 @@ impl Default for OwnerWeights {
     }
 }
 
+/// Agent adoption: sessions are always observed; `move` and `freeze` only ever log what they would do.
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Adopt {
+    pub enabled: bool,
+    #[serde(rename = "move")]
+    pub move_: bool,
+    pub freeze: bool,
+    /// Agent names (CREW_AGENT) and pids that adoption must never act on.
+    pub protect: Vec<String>,
+    /// Cpu pressure (psi some avg10) above which the busiest actionable agent would be frozen.
+    pub freeze_psi_cpu: f64,
+}
+
+impl Default for Adopt {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            move_: false,
+            freeze: false,
+            protect: Vec::new(),
+            freeze_psi_cpu: 40.0,
+        }
+    }
+}
+
 /// Per-kind overrides of the built-in defaults.
 #[derive(Clone, Debug, Default, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -79,6 +105,7 @@ pub struct Config {
     pub idle_timeout_secs: u64,
     pub starve_after_secs: u64,
     pub kinds: Kinds,
+    pub adopt: Adopt,
 }
 
 impl Default for Config {
@@ -97,6 +124,7 @@ impl Default for Config {
             idle_timeout_secs: 120,
             starve_after_secs: 600,
             kinds: Kinds::default(),
+            adopt: Adopt::default(),
         }
     }
 }
@@ -201,6 +229,14 @@ mod tests {
         assert_eq!(c.kind(JobKind::Build).cpu_weight, 100);
         assert_eq!(c.min_free_disk("/projects"), Some(10 * GIB));
         assert_eq!(c.min_free_disk("/"), None);
+    }
+
+    #[test]
+    fn adoption_acts_on_nothing_by_default() {
+        let c = Config::default();
+        assert!(c.adopt.enabled && !c.adopt.move_ && !c.adopt.freeze);
+        let c: Config = toml::from_str("[adopt]\nmove = true\nprotect = [\"lead\"]\n").unwrap();
+        assert!(c.adopt.move_ && !c.adopt.freeze && c.adopt.protect == ["lead"]);
     }
 
     #[test]

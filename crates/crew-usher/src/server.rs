@@ -95,9 +95,14 @@ fn serve_connection(stream: UnixStream, tx: &Sender<Msg>) {
                     set,
                     conn: conn.clone(),
                 },
+                Some(Body::WaitRequest(req)) => Msg::Wait {
+                    req,
+                    conn: conn.clone(),
+                },
                 _ => continue,
             },
             Ok(None) | Err(_) => {
+                let _ = tx.send(Msg::Hangup { conn });
                 if let Some(job_id) = job_id {
                     let _ = tx.send(Msg::Gone { job_id });
                 }
