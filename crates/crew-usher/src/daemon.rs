@@ -411,6 +411,9 @@ pub struct Daemon {
     resubmits: BTreeMap<String, u64>,
     /// The state file came from a usher that did not record queued clients, so their claimed queue time is believed.
     legacy_claims: bool,
+    /// How often the job state was written, for tests.
+    #[cfg(test)]
+    saves: std::cell::Cell<usize>,
 }
 
 /// A queued job's entry goes to a new connection only when its client is gone, or the new connection is the same process.
@@ -561,6 +564,8 @@ impl Daemon {
             pool: PoolHold::default(),
             resubmits: BTreeMap::new(),
             legacy_claims: false,
+            #[cfg(test)]
+            saves: std::cell::Cell::new(0),
         };
         daemon.restore_owner();
         daemon.restore();
@@ -1796,6 +1801,8 @@ impl Daemon {
 
     /// Writes what must outlive the usher: detached jobs, running and queued `crew run` jobs.
     fn persist(&self) {
+        #[cfg(test)]
+        self.saves.set(self.saves.get() + 1);
         let mut jobs = self.finished.clone();
         jobs.extend(self.running.iter().map(|r| self.running_record(r)));
         jobs.extend(self.queue.iter().map(|q| self.queued_record(q)));
@@ -1817,8 +1824,20 @@ impl Daemon {
         }
     }
 
-    /// Moves a detached job's record to the finished list.
+    /// Moves a detached job's record to the finished list and saves the state.
     fn conclude(
+        &mut self,
+        rec: DetachedJob,
+        phase: JobPhase,
+        exit_code: Option<i32>,
+        reason: String,
+    ) {
+        self.conclude_unsaved(rec, phase, exit_code, reason);
+        self.persist();
+    }
+
+    /// `conclude` without the save, for a caller that saves once at the end.
+    fn conclude_unsaved(
         &mut self,
         mut rec: DetachedJob,
         phase: JobPhase,
@@ -1843,7 +1862,6 @@ impl Daemon {
         self.finished.push(rec);
         let now = self.now_ms();
         detached::prune(&mut self.finished, now, &self.dirs);
-        self.persist();
     }
 
     /// A queued detached job that was removed from the queue without ever running.
@@ -1919,7 +1937,7 @@ impl Daemon {
                                 .to_string(),
                         ),
                     };
-                    self.conclude(rec, phase, code, reason);
+                    self.conclude_unsaved(rec, phase, code, reason);
                     ended += 1;
                 }
                 JobPhase::Exited | JobPhase::Failed | JobPhase::Cancelled => {
@@ -2217,6 +2235,63 @@ mod tests {
             assert!(Instant::now() < deadline, "the stalled client stayed open");
             thread::sleep(Duration::from_millis(50));
         }
+    }
+
+    #[test]
+    fn a_restore_writes_the_state_once_when_it_is_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path();
+        let ended = |id: &str| {
+            let status = state.join(format!("{id}.status"));
+            std::fs::write(&status, "0\n").unwrap();
+            DetachedJob {
+                request: Some(JobRequest {
+                    id: id.into(),
+                    argv: vec!["true".into()],
+                    detach: true,
+                    ..JobRequest::default()
+                }),
+                phase: JobPhase::Running as i32,
+                scope_name: format!("crew-gone-{id}"),
+                status_path: status.display().to_string(),
+                log_path: state.join(format!("{id}.log")).display().to_string(),
+                ..DetachedJob::default()
+            }
+        };
+        let queued = DetachedJob {
+            request: Some(JobRequest {
+                id: "waiting".into(),
+                argv: vec!["true".into()],
+                detach: true,
+                ..JobRequest::default()
+            }),
+            phase: JobPhase::Queued as i32,
+            queued_at_unix_ms: 5,
+            ..DetachedJob::default()
+        };
+        let stored = vec![ended("one"), ended("two"), queued];
+        detached::save(&state.join("usher-jobs.pb"), stored).unwrap();
+
+        let paths = StatePaths {
+            sizes: state.join("usher-sizes.pb"),
+            owner: state.join("usher-owner.pb"),
+            jobs: state.join("usher-jobs.pb"),
+            job_logs: state.join("jobs"),
+        };
+        let cfg = Config {
+            tmp_root: state.join("jobtmp").display().to_string(),
+            ..Config::default()
+        };
+        let (events, _rx) = mpsc::channel();
+        let daemon = Daemon::new(cfg, paths, Arc::new(Log::sink()), events);
+
+        assert_eq!(daemon.finished.len(), 2);
+        assert_eq!(daemon.queue.len(), 1);
+        assert_eq!(
+            daemon.saves.get(),
+            1,
+            "a crash between two writes would lose the records not yet restored"
+        );
     }
 
     #[test]
