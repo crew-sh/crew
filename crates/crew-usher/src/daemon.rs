@@ -126,6 +126,11 @@ pub enum Msg {
         job_id: String,
         conn: Conn,
     },
+    /// Is the asking process inside this running job's scope?
+    InsideJob {
+        job_id: String,
+        conn: Conn,
+    },
     Top {
         conn: Conn,
     },
@@ -573,6 +578,10 @@ impl Daemon {
             }
             Msg::Cancel { job_id, conn } => {
                 let ack = self.cancel(&job_id);
+                conn.send(envelope::Body::Ack(ack));
+            }
+            Msg::InsideJob { job_id, conn } => {
+                let ack = self.inside_job(&job_id, &conn);
                 conn.send(envelope::Body::Ack(ack));
             }
             Msg::Top { conn } => {
@@ -1957,6 +1966,28 @@ impl Daemon {
             );
         }
         ack(false, format!("no queued or running job {id}"))
+    }
+
+    /// Whether `conn`'s process sits in the cgroup of the running job `id`; `CREW_JOB` alone proves nothing.
+    fn inside_job(&self, id: &str, conn: &Conn) -> Ack {
+        let verdict = |ok: bool, message: &str| Ack {
+            ok,
+            message: message.to_string(),
+        };
+        let Some(job) = self.running.iter().find(|r| r.req.id == id) else {
+            return verdict(false, "no such job is running");
+        };
+        let Some(pid) = conn.pid else {
+            return verdict(false, "cannot tell which process asks");
+        };
+        let unit = format!("{}.scope", job.scope_name);
+        let inside = procs::read_cgroup_path(Path::new("/proc"), pid)
+            .is_some_and(|path| path.split('/').any(|part| part == unit));
+        if inside {
+            verdict(true, "")
+        } else {
+            verdict(false, "the caller is not inside the job's scope")
+        }
     }
 
     fn jobs(&self) -> JobsReply {

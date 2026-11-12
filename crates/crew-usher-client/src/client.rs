@@ -9,9 +9,9 @@ use std::time::{Duration, Instant};
 
 use crew_proto::envelope::Body;
 use crew_proto::{
-    Ack, CancelRequest, Envelope, FrameError, Grant, JobDone, JobKind, JobRequest, JobsReply,
-    JobsRequest, OwnerSet, OwnerSource, Reply, TopReply, TopRequest, WaitCondition, WaitReply,
-    WaitRequest, WaitingOn, reply,
+    Ack, CancelRequest, Envelope, FrameError, Grant, InsideJobRequest, JobDone, JobKind,
+    JobRequest, JobsReply, JobsRequest, OwnerSet, OwnerSource, Reply, TopReply, TopRequest,
+    WaitCondition, WaitReply, WaitRequest, WaitingOn, reply,
 };
 use crew_sys::display::{self, Desktop};
 use crew_sys::scope::{self, KillSignal, ScopeLimits, Stats};
@@ -42,8 +42,9 @@ pub struct RunOptions {
     pub strict: bool,
     /// Progress as JSON lines on stderr instead of text.
     pub json: bool,
-    /// The caller already runs inside a granted job (CREW_JOB): run in its scope instead of asking again.
-    pub inside_job: bool,
+    /// The job id the caller found in `CREW_JOB`. If the usher confirms the caller really runs inside that job's
+    /// scope, the command runs there instead of asking again; otherwise the claim is ignored.
+    pub claimed_job: Option<String>,
     /// With `Client::detach`: where the job's output goes; default is a file in the usher's state directory.
     pub log: Option<PathBuf>,
 }
@@ -257,6 +258,24 @@ impl Client {
         }
     }
 
+    /// Whether the usher says this process runs inside the running job `claimed`. A leaked or forged `CREW_JOB`,
+    /// an unreachable usher or an unknown job all mean no.
+    fn confirmed_inside(&self, claimed: Option<&str>) -> bool {
+        let Some(id) = claimed else { return false };
+        let answer = self.ask(Body::InsideJobRequest(InsideJobRequest {
+            job_id: id.to_string(),
+        }));
+        match answer.map(|e| e.body) {
+            Ok(Some(Body::Ack(a))) if a.ok => true,
+            _ => {
+                eprintln!(
+                    "crew: CREW_JOB={id} is not this process's job; asking the usher as usual"
+                );
+                false
+            }
+        }
+    }
+
     /// Waits for a lost usher to come back and queues `req` again under its old id and time.
     fn requeue(
         &self,
@@ -348,7 +367,7 @@ impl Client {
         });
 
         // A command already inside a granted job runs within that job's scope and grant; asking again could deadlock on the parent's reservation.
-        if opts.inside_job {
+        if self.confirmed_inside(opts.claimed_job.as_deref()) {
             progress(
                 opts,
                 &RunEvent::Unmanaged {
@@ -397,7 +416,10 @@ impl Client {
                 Err(e) => return Err(e.into()),
             };
             let Some(Body::Reply(Reply { outcome, .. })) = frame.body else {
-                return Err(ClientError::Protocol);
+                return Err(match frame.body {
+                    Some(Body::Ack(a)) if !a.ok => ClientError::Rejected(a.message),
+                    _ => ClientError::Protocol,
+                });
             };
             match outcome {
                 Some(reply::Outcome::Grant(g)) => break g,

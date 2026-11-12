@@ -319,7 +319,14 @@ message Envelope {
     JobsRequest jobs_request = 11;
     JobsReply jobs_reply = 12;
     CancelRequest cancel_request = 13;
+    InsideJobRequest inside_job_request = 14;
   }
+}
+
+// Asks whether the calling process runs inside the named running job's scope; the usher answers with an Ack
+// from the caller's pid as the kernel reports it, never from what the caller says about itself.
+message InsideJobRequest {
+  string job_id = 1;
 }
 
 // The usher took a detached job: it is queued (or already running) and no longer needs the client.

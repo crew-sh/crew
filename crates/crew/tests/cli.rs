@@ -267,6 +267,73 @@ fn a_crew_run_inside_a_granted_job_runs_in_that_job_instead_of_queueing_behind_i
     assert_ne!(stdout(&out).trim(), "inner:");
 }
 
+#[test]
+fn a_crew_job_variable_that_does_not_match_the_callers_scope_is_ignored() {
+    let Some(d) = Daemon::start() else { return };
+    // A made-up id, as an agent could export, and the id of a job that already ended, as a leaked one is.
+    let finished = d.crew(&["run", "--", "true"]);
+    assert_eq!(finished.status.code(), Some(0));
+    let ended = stdout(&d.crew(&["jobs", "--json"]));
+    let ended_id = ended
+        .split("\"id\":\"")
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .map(str::to_string);
+    for claimed in [
+        "forged-id".to_string(),
+        ended_id.unwrap_or_else(|| "none".into()),
+    ] {
+        let out = crew_with(
+            &d.socket,
+            &["run", "--", "sh", "-c", "echo job=$CREW_JOB"],
+            &[("CREW_JOB", &claimed)],
+        );
+        assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+        // The usher's own grant sets CREW_JOB; a bypass would have kept the claimed value.
+        let seen = stdout(&out).trim().trim_start_matches("job=").to_string();
+        assert_ne!(seen, claimed, "the claimed job was trusted");
+        assert!(!seen.is_empty());
+    }
+}
+
+#[test]
+fn a_claimed_job_does_not_bypass_a_running_bench() {
+    let Some(d) = Daemon::start() else { return };
+    assert!(d.crew(&["owner", "away"]).status.success());
+    let mut bench = Command::new(CREW)
+        .args(["run", "--kind", "bench", "--", "sleep", "3"])
+        .env("CREW_SOCKET", &d.socket)
+        .env_remove("CREW_JOB")
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let bench_id = loop {
+        let top = stdout(&d.crew(&["top", "--json"]));
+        if let Some(id) = top
+            .split("\"id\":\"")
+            .nth(1)
+            .and_then(|r| r.split('"').next())
+        {
+            break id.to_string();
+        }
+        assert!(Instant::now() < deadline, "the bench never ran");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    // Outside the bench's scope, naming it must not skip the exclusivity wait.
+    let started = Instant::now();
+    let out = crew_with(
+        &d.socket,
+        &["run", "--kind", "test", "--", "true"],
+        &[("CREW_JOB", &bench_id)],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert!(
+        started.elapsed() > Duration::from_millis(500),
+        "ran beside the bench"
+    );
+    let _ = bench.wait();
+}
+
 #[derive(serde::Deserialize)]
 struct TopJson {
     machine: MachineJson,

@@ -86,7 +86,7 @@ pub fn cargo(args: &[String]) -> Result<ExitCode> {
     let opts = RunOptions {
         argv,
         strict: env.get("CREW_STRICT").is_some_and(|v| v == "1"),
-        inside_job: env.contains_key("CREW_JOB"),
+        claimed_job: env.get("CREW_JOB").cloned(),
         ..RunOptions::default()
     };
     let result = Client::from_env().run_with(&opts, |grant| {

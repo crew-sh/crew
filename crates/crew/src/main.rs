@@ -87,7 +87,7 @@ fn main() -> ExitCode {
         }
         Sub::Run(mut opts) => {
             opts.strict = std::env::var("CREW_STRICT").is_ok_and(|v| v == "1");
-            opts.inside_job = std::env::var_os("CREW_JOB").is_some();
+            opts.claimed_job = std::env::var("CREW_JOB").ok();
             match client.run(&opts) {
                 Ok(code) => ExitCode::from(u8::try_from(code & 0xff).unwrap_or(EXIT_ERROR)),
                 Err(e) => fail(&e, opts.json),

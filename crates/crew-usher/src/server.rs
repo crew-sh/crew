@@ -225,6 +225,10 @@ fn serve_connection(stream: UnixStream, tx: &Sender<Msg>) {
                 },
                 Some(Body::TopRequest(_)) => Msg::Top { conn: conn.clone() },
                 Some(Body::JobsRequest(_)) => Msg::Jobs { conn: conn.clone() },
+                Some(Body::InsideJobRequest(q)) => Msg::InsideJob {
+                    job_id: q.job_id,
+                    conn: conn.clone(),
+                },
                 Some(Body::CancelRequest(c)) => Msg::Cancel {
                     job_id: c.job_id,
                     conn: conn.clone(),
