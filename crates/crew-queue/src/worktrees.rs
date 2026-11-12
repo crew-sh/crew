@@ -80,6 +80,14 @@ fn ancestors() -> Vec<(u64, String)> {
     out
 }
 
+/// Who the caller is as a worktree owner: `--owner-pid`, else the agent session above it, else its session leader.
+fn caller_owner(owner_pid: Option<u64>) -> u64 {
+    owner_pid.unwrap_or_else(|| {
+        let owner = default_owner(&ancestors(), session_leader());
+        if owner == 0 { parent_pid() } else { owner }
+    })
+}
+
 /// Create (or take over, when its owner is dead) the step's worktree, deciding under the queue's state lock.
 pub fn new(ctx: &Ctx, step: &str, owner_pid: Option<u64>) -> Result<PathBuf> {
     if !crew_ledger::valid_id(step) {
@@ -90,11 +98,7 @@ pub fn new(ctx: &Ctx, step: &str, owner_pid: Option<u64>) -> Result<PathBuf> {
     if ctx.ledger()?.plan().step(step).is_none() {
         bail!("step `{step}` is not in the plan");
     }
-    let owner = owner_pid.unwrap_or_else(|| {
-        let session = session_leader();
-        let owner = default_owner(&ancestors(), session);
-        if owner == 0 { parent_pid() } else { owner }
-    });
+    let owner = caller_owner(owner_pid);
     let path = ctx.worktree_root().join(step);
     Store::new(&ctx.crew_dir()).update(|f| -> Result<()> {
         if let Some(reg) = f.worktrees.iter().find(|w| w.step_id == step)
@@ -127,13 +131,22 @@ pub fn new(ctx: &Ctx, step: &str, owner_pid: Option<u64>) -> Result<PathBuf> {
     Ok(path)
 }
 
-/// Mark the step's worktree finished and drop its target dir; `gc` removes it later.
-pub fn done(ctx: &Ctx, step: &str) -> Result<()> {
-    let found = Store::new(&ctx.crew_dir()).update(|f| {
-        let w = f.worktrees.iter_mut().find(|w| w.step_id == step)?;
+/// Mark the step's worktree finished and drop its target dir; `gc` removes it later. Only its owner may close a live one.
+pub fn done(ctx: &Ctx, step: &str, owner_pid: Option<u64>) -> Result<()> {
+    let caller = caller_owner(owner_pid);
+    let found = Store::new(&ctx.crew_dir()).update(|f| -> Result<Option<PathBuf>> {
+        let Some(w) = f.worktrees.iter_mut().find(|w| w.step_id == step) else {
+            return Ok(None);
+        };
+        if !is_dead(w) && w.owner_pid != caller {
+            bail!(
+                "step {step} is owned by live pid {}; only its owner closes it (pass --owner-pid to act for it)",
+                w.owner_pid
+            );
+        }
         w.done = true;
-        Some(PathBuf::from(&w.path))
-    })?;
+        Ok(Some(PathBuf::from(&w.path)))
+    })??;
     let path = found.with_context(|| format!("no registered worktree for step {step}"))?;
     let target = path.join("target");
     if target.is_dir() {
@@ -217,6 +230,11 @@ fn pids_working_in(dir: &Path) -> Vec<u32> {
 
 /// Salvage then remove every dead worktree; a failed salvage, a process working in it or a takeover keeps it.
 pub fn gc(ctx: &Ctx) -> Result<Vec<GcRow>> {
+    gc_with(ctx, &|_| {})
+}
+
+/// `gc`, calling `before_remove` for each worktree after it was salvaged and judged dead, just before the removal step.
+pub(crate) fn gc_with(ctx: &Ctx, before_remove: &dyn Fn(&WorktreeReg)) -> Result<Vec<GcRow>> {
     let store = Store::new(&ctx.crew_dir());
     let dead: Vec<WorktreeReg> = store
         .load()?
@@ -262,29 +280,33 @@ pub fn gc(ctx: &Ctx) -> Result<Vec<GcRow>> {
                 }
             }
         }
-        // Salvage took a while; the step may have been taken over meanwhile.
-        let still_dead = store
-            .load()?
-            .worktrees
-            .iter()
-            .find(|w| w.step_id == reg.step_id)
-            .is_some_and(|now| *now == reg || is_dead(now) && now.owner_pid == reg.owner_pid);
-        if !still_dead {
+        before_remove(&reg);
+        // The last look and the removal happen under the state lock, so a takeover cannot slip between them.
+        let removed = store.update(|f| -> Result<bool> {
+            let still_dead = f
+                .worktrees
+                .iter()
+                .find(|w| w.step_id == reg.step_id)
+                .is_some_and(|now| *now == reg || is_dead(now) && now.owner_pid == reg.owner_pid);
+            if !still_dead {
+                return Ok(false);
+            }
+            let registered = crew_git::worktree_list(&ctx.root)?
+                .iter()
+                .any(|w| w.path == path);
+            if registered {
+                crew_git::worktree_remove(&ctx.root, &path, true)?;
+            }
+            f.worktrees.retain(|w| w.step_id != reg.step_id);
+            Ok(true)
+        })??;
+        if !removed {
             eprintln!("queue: gc keeps {}: it was taken over", reg.step_id);
-            continue;
         }
-        let registered = crew_git::worktree_list(&ctx.root)?
-            .iter()
-            .any(|w| w.path == path);
-        if registered {
-            crew_git::worktree_remove(&ctx.root, &path, true)?;
-        }
-        let step = reg.step_id.clone();
-        store.update(|f| f.worktrees.retain(|w| w.step_id != step))?;
         rows.push(GcRow {
             step_id: reg.step_id,
-            removed: true,
-            salvage_dir,
+            removed,
+            salvage_dir: if removed { salvage_dir } else { None },
         });
     }
     Ok(rows)

@@ -503,7 +503,7 @@ fn done_drops_the_target_dir_and_gc_then_collects_it() {
     let wt = worktrees::new(&fx.ctx, "s1", Some(u64::from(std::process::id()))).unwrap();
     fs::create_dir_all(wt.join("target")).unwrap();
     fs::write(wt.join("target/big"), "x").unwrap();
-    worktrees::done(&fx.ctx, "s1").unwrap();
+    worktrees::done(&fx.ctx, "s1", Some(u64::from(std::process::id()))).unwrap();
     assert!(!wt.join("target").exists());
     let rows = worktrees::gc(&fx.ctx).unwrap();
     assert!(rows[0].removed && !wt.exists());
@@ -863,4 +863,44 @@ fn a_chatty_check_costs_no_memory_and_its_last_lines_are_still_reported() {
         "300 MB of check output grew the process by {} MiB",
         grown >> 20
     );
+}
+
+#[test]
+fn gc_does_not_remove_a_worktree_taken_over_just_before_the_removal() {
+    let fx = Fx::new(&[("s1", &[])], "");
+    let wt = worktrees::new(&fx.ctx, "s1", Some(dead_pid())).unwrap();
+    let me = u64::from(std::process::id());
+    let rows = worktrees::gc_with(&fx.ctx, &|reg| {
+        // Another agent resumes the step after gc judged it dead and salvaged it.
+        worktrees::new(&fx.ctx, &reg.step_id, Some(me)).unwrap();
+        fs::write(wt.join("fresh-edit.txt"), "the new owner's work").unwrap();
+    })
+    .unwrap();
+    assert!(!rows[0].removed, "{rows:?}");
+    assert!(wt.join("fresh-edit.txt").exists());
+    assert_eq!(status::report(&fx.ctx).unwrap().worktrees.len(), 1);
+}
+
+#[test]
+fn done_is_refused_for_another_agents_live_worktree_and_allowed_for_its_owner() {
+    let fx = Fx::new(&[("s1", &[]), ("s2", &[])], "");
+    let me = u64::from(std::process::id());
+    let mut other = Command::new("sleep").arg("30").spawn().unwrap();
+    let theirs = u64::from(other.id());
+    let wt = worktrees::new(&fx.ctx, "s1", Some(theirs)).unwrap();
+    fs::create_dir_all(wt.join("target")).unwrap();
+
+    let err = worktrees::done(&fx.ctx, "s1", Some(me)).unwrap_err();
+    assert!(err.to_string().contains("owned by"), "{err}");
+    assert!(wt.join("target").exists(), "a refused done removes nothing");
+    assert!(!status::report(&fx.ctx).unwrap().worktrees[0].dead);
+
+    worktrees::done(&fx.ctx, "s1", Some(theirs)).unwrap();
+    assert!(!wt.join("target").exists());
+
+    // A worktree whose owner is gone can be closed by anyone.
+    worktrees::new(&fx.ctx, "s2", Some(dead_pid())).unwrap();
+    worktrees::done(&fx.ctx, "s2", Some(me)).unwrap();
+    let _ = other.kill();
+    let _ = other.wait();
 }

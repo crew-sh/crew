@@ -115,12 +115,16 @@ fn run() -> Result<u8> {
                     println!("{}", worktrees::new(&ctx, &step, owner)?.display());
                 }
                 Some("done") => {
+                    let owner = args
+                        .value("--owner-pid")?
+                        .map(|v| v.parse::<u64>())
+                        .transpose()?;
                     let step = args.positional();
                     args.finish()?;
                     let Some(step) = step else {
                         bail!("usage: worktree done <step>")
                     };
-                    worktrees::done(&ctx, &step)?;
+                    worktrees::done(&ctx, &step, owner)?;
                 }
                 _ => bail!("usage: worktree new|done <step>"),
             }
