@@ -165,7 +165,8 @@ fn top_and_owner_talk_to_the_daemon() {
         "{text}"
     );
     assert!(stdout(&d.crew(&["owner", "away"])).contains("away"));
-    assert!(stdout(&d.crew(&["top"])).contains("owner    away (manual)"));
+    // Without a compositor (CI) the line goes on with "; idle watcher unavailable, retrying".
+    assert!(stdout(&d.crew(&["top"])).contains("owner    away (manual"));
     assert!(stdout(&d.crew(&["owner", "auto"])).contains("present"));
 }
 
