@@ -356,6 +356,7 @@ pub enum ErrorKind {
     Spawn,
     Usage,
     Io,
+    ProjectConfig,
 }
 
 #[derive(Debug, Serialize)]
@@ -399,6 +400,7 @@ pub fn failure(e: &crate::ClientError) -> String {
         E::Spawn { .. } => (ErrorKind::Spawn, None),
         E::EmptyCommand => (ErrorKind::Usage, None),
         E::Io(_) => (ErrorKind::Io, None),
+        E::ProjectRules(_) => (ErrorKind::ProjectConfig, None),
     };
     line(&Failure {
         event: "error",
@@ -474,7 +476,7 @@ mod tests {
                 cpu_count: 24,
                 owner_source: OwnerSource::WaylandIdle as i32,
                 disk: vec![DiskView {
-                    path: "/projects".into(),
+                    path: "/data".into(),
                     free_bytes: 5,
                     min_free_bytes: 1,
                 }],
@@ -515,7 +517,7 @@ mod tests {
                 back.machine.disk[0].path.as_str(),
                 back.machine.disk[0].free_bytes
             ),
-            ("/projects", 5)
+            ("/data", 5)
         );
         let a = &back.agents[0];
         assert_eq!(
@@ -566,7 +568,7 @@ mod tests {
         );
         let f = failure(&crate::ClientError::Refused {
             reason: RefusalReason::DiskLow,
-            detail: "/projects".into(),
+            detail: "/data".into(),
         });
         assert!(
             f.contains(r#""event":"error","kind":"refused","refusal":"disk_low""#),

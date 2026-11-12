@@ -170,7 +170,10 @@ impl Client {
         }
         let env: BTreeMap<String, String> = std::env::vars().collect();
         let cwd = std::env::current_dir()?;
-        let kind = opts.kind.unwrap_or_else(|| kind::infer(&opts.argv));
+        let kind = match opts.kind {
+            Some(k) => k,
+            None => kind::infer_with(&opts.argv, &kind::ProjectRules::discover(&cwd)?),
+        };
         let req = request::build(&Inputs {
             kind,
             argv: &opts.argv,

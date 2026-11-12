@@ -2,6 +2,8 @@ use std::io;
 
 use crew_proto::{FrameError, RefusalReason};
 
+use crate::kind::ProjectRulesError;
+
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
     #[error("usher is not running at {socket} ({source})")]
@@ -19,6 +21,8 @@ pub enum ClientError {
     Frame(#[from] FrameError),
     #[error("cannot start `{command}`: {source}")]
     Spawn { command: String, source: io::Error },
+    #[error("{0}")]
+    ProjectRules(#[from] ProjectRulesError),
     #[error("nothing to run")]
     EmptyCommand,
     #[error("{0}")]
