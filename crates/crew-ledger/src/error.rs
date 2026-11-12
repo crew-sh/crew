@@ -19,6 +19,13 @@ pub enum Error {
     UnknownStep(String),
     #[error("step `{0}` needs an owner approval before it can leave PLANNED")]
     NeedsApproval(String),
+    #[error("step `{step}` cannot go from {from} to {to}{why}")]
+    BadTransition {
+        step: String,
+        from: &'static str,
+        to: &'static str,
+        why: String,
+    },
     #[error("{0}")]
     Invalid(String),
 }

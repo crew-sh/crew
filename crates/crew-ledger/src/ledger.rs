@@ -7,8 +7,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::Serialize;
 
 use crate::plan::{self, Plan, RunKind, Step};
-use crate::{Error, store};
-use crew_proto::ledger::{Approval, BudgetUse, Event, Landed, Status, StepStatus, approval, event};
+use crate::{Error, owner, store};
+use crew_proto::ledger::{
+    Approval, ApprovedStep, ApproverContext, BudgetUse, Event, Landed, Status, StepStatus,
+    approval, event,
+};
 
 pub fn now_ms() -> u64 {
     SystemTime::now()
@@ -43,24 +46,71 @@ pub mod events {
         }
     }
 
+    /// An approval with no owner context, as written before approvals were bound to one: it counts for any
+    /// version of the step. `crew plan approve` no longer writes these.
     pub fn approve_step(step_id: &str, by: &str, note: &str) -> Event {
         Event {
             body: Some(event::Body::Approval(Approval {
                 target: Some(approval::Target::StepId(step_id.into())),
                 by: by.into(),
-                at_ms: 0,
                 note: note.into(),
+                ..Approval::default()
             })),
         }
     }
 
+    /// The legacy scope approval: every extra, now and later.
     pub fn approve_scope(by: &str, note: &str) -> Event {
         Event {
             body: Some(event::Body::Approval(Approval {
                 target: Some(approval::Target::Scope(Default::default())),
                 by: by.into(),
-                at_ms: 0,
                 note: note.into(),
+                ..Approval::default()
+            })),
+        }
+    }
+
+    /// An approval of `step` as it reads now, given by the owner in `ctx`.
+    pub fn approve_step_as(
+        step: &crate::Step,
+        by: &str,
+        note: &str,
+        ctx: ApproverContext,
+    ) -> Event {
+        Event {
+            body: Some(event::Body::Approval(Approval {
+                target: Some(approval::Target::StepId(step.id.clone())),
+                by: by.into(),
+                note: note.into(),
+                approver: Some(ctx),
+                step_hash: step.approval_hash(),
+                ..Approval::default()
+            })),
+        }
+    }
+
+    /// A scope approval that names the extra steps it covers, each as it reads now.
+    pub fn approve_scope_as(
+        covered: &[&crate::Step],
+        by: &str,
+        note: &str,
+        ctx: ApproverContext,
+    ) -> Event {
+        Event {
+            body: Some(event::Body::Approval(Approval {
+                target: Some(approval::Target::Scope(Default::default())),
+                by: by.into(),
+                note: note.into(),
+                approver: Some(ctx),
+                scope_steps: covered
+                    .iter()
+                    .map(|s| ApprovedStep {
+                        step_id: s.id.clone(),
+                        step_hash: s.approval_hash(),
+                    })
+                    .collect(),
+                ..Approval::default()
             })),
         }
     }
@@ -106,6 +156,8 @@ pub struct StepState {
     pub status: Status,
     /// True when the step may leave PLANNED: it needs no approval, or one was recorded.
     pub allowed: bool,
+    /// An approval exists, but the step has changed since: it needs a new one.
+    pub approval_stale: bool,
     pub landed: Option<Landed>,
     pub used: Use,
     pub by: String,
@@ -127,7 +179,8 @@ impl StepState {
 #[derive(Clone)]
 struct Raw {
     status: Status,
-    approved: bool,
+    /// Hashes of the step as approved; empty for an approval from before hashes.
+    approvals: Vec<String>,
     landed: Option<Landed>,
     used: Use,
     by: String,
@@ -139,7 +192,7 @@ impl Default for Raw {
     fn default() -> Self {
         Self {
             status: Status::Planned,
-            approved: false,
+            approvals: Vec::new(),
             landed: None,
             used: Use::default(),
             by: String::new(),
@@ -152,7 +205,10 @@ impl Default for Raw {
 /// The fold of every event in the ledger file at one moment.
 pub struct Snapshot {
     raw: BTreeMap<String, Raw>,
-    scope_approved: bool,
+    /// A scope approval from before it named steps: every extra, now and later.
+    scope_legacy: bool,
+    /// Extra steps named by scope approvals, with the hashes approved.
+    scope_steps: BTreeMap<String, Vec<String>>,
     pub warnings: Vec<String>,
 }
 
@@ -160,7 +216,8 @@ impl Snapshot {
     fn fold(events: &[Event]) -> Self {
         let mut s = Self {
             raw: BTreeMap::new(),
-            scope_approved: false,
+            scope_legacy: false,
+            scope_steps: BTreeMap::new(),
             warnings: Vec::new(),
         };
         for e in events {
@@ -182,21 +239,41 @@ impl Snapshot {
                     r.status = Status::Landed;
                     r.landed = Some(l.clone());
                     r.at_ms = l.at_ms;
+                    r.detail = format!("landed {}", l.sha);
                 }
-                event::Body::Approval(a) => match &a.target {
-                    Some(approval::Target::StepId(id)) => {
-                        let r = s.raw.entry(id.clone()).or_default();
-                        r.approved = true;
-                        if r.status == Status::Planned {
-                            r.status = Status::Approved;
-                            r.by = a.by.clone();
-                            r.detail = a.note.clone();
-                            r.at_ms = a.at_ms;
-                        }
+                event::Body::Approval(a) => {
+                    if !a.approver.as_ref().is_none_or(owner::counts) {
+                        s.warnings.push(format!(
+                            "an approval by `{}` was not given by the owner (not from a terminal with a typed confirmation, or from an agent) and is ignored",
+                            a.by
+                        ));
+                        continue;
                     }
-                    Some(approval::Target::Scope(_)) => s.scope_approved = true,
-                    None => {}
-                },
+                    match &a.target {
+                        Some(approval::Target::StepId(id)) => {
+                            let r = s.raw.entry(id.clone()).or_default();
+                            r.approvals.push(a.step_hash.clone());
+                            if r.status == Status::Planned {
+                                r.status = Status::Approved;
+                                r.by = a.by.clone();
+                                r.detail = a.note.clone();
+                                r.at_ms = a.at_ms;
+                            }
+                        }
+                        Some(approval::Target::Scope(_)) => {
+                            if a.approver.is_none() && a.scope_steps.is_empty() {
+                                s.scope_legacy = true;
+                            }
+                            for covered in &a.scope_steps {
+                                s.scope_steps
+                                    .entry(covered.step_id.clone())
+                                    .or_default()
+                                    .push(covered.step_hash.clone());
+                            }
+                        }
+                        None => {}
+                    }
+                }
                 event::Body::BudgetUse(b) => {
                     let u = &mut s.raw.entry(b.step_id.clone()).or_default().used;
                     u.builds += u64::from(b.builds);
@@ -210,17 +287,26 @@ impl Snapshot {
     }
 
     pub fn scope_approved(&self) -> bool {
-        self.scope_approved
+        self.scope_legacy || !self.scope_steps.is_empty()
     }
 
     pub fn state(&self, step: &Step) -> StepState {
         let r = self.raw.get(&step.id).cloned().unwrap_or_default();
-        let allowed = !step.needs_approval()
-            || r.approved
-            || (self.scope_approved && step.covered_by_scope());
+        let hash = step.approval_hash();
+        let matches = |h: &String| h.is_empty() || *h == hash;
+        let direct = r.approvals.iter().any(matches);
+        let by_scope = step.covered_by_scope()
+            && (self.scope_legacy
+                || self
+                    .scope_steps
+                    .get(&step.id)
+                    .is_some_and(|hs| hs.iter().any(matches)));
+        let allowed = !step.needs_approval() || direct || by_scope;
+        let had_approval = !r.approvals.is_empty() || self.scope_steps.contains_key(&step.id);
         StepState {
             status: r.status,
             allowed,
+            approval_stale: step.needs_approval() && !allowed && had_approval,
             landed: r.landed,
             used: r.used,
             by: r.by,
@@ -232,6 +318,29 @@ impl Snapshot {
     /// Ids the ledger mentions.
     pub fn step_ids(&self) -> BTreeSet<&str> {
         self.raw.keys().map(String::as_str).collect()
+    }
+}
+
+fn status_label(s: Status) -> &'static str {
+    crate::status_name(s)
+}
+
+/// Landed is entered only through a `Landed` event (with a sha, from the queue); a dropped step can only be replanned.
+fn transition_error(from: Status, to: Status, by_landed_event: bool) -> Option<String> {
+    let why = |m: &str| Some(format!(": {m}"));
+    match (from, to) {
+        (Status::Landed, Status::Landed) if !by_landed_event => None,
+        (Status::Landed, _) => why("a landed step stays landed"),
+        (_, Status::Landed) if !by_landed_event => {
+            why("only the queue lands a step, with a `landed` record carrying the merge sha")
+        }
+        (Status::Dropped, t) if !matches!(t, Status::Dropped | Status::Planned) => {
+            why("a dropped step can only be put back to planned")
+        }
+        (f, Status::Landed) if !matches!(f, Status::Approved | Status::Running | Status::Built) => {
+            why("a step lands from approved, running or built")
+        }
+        _ => None,
     }
 }
 
@@ -406,12 +515,45 @@ impl Ledger {
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes).map_err(io)?;
         let parsed = store::parse(&self.path, &bytes)?;
-        if let (true, Some(step)) = (starts_work, step)
-            && !Snapshot::fold(&parsed.events).state(step).allowed
-        {
-            return Err(Error::NeedsApproval(step.id.clone()));
+        if let Some(step) = step {
+            let state = Snapshot::fold(&parsed.events).state(step);
+            if starts_work && !state.allowed {
+                return Err(Error::NeedsApproval(step.id.clone()));
+            }
+            let change = match &event.body {
+                Some(event::Body::Status(s)) => Some((s.status(), false)),
+                Some(event::Body::Landed(_)) => Some((Status::Landed, true)),
+                _ => None,
+            };
+            if matches!(&event.body, Some(event::Body::Landed(_))) {
+                let snap = Snapshot::fold(&parsed.events);
+                if let Some(dep) = step.deps.iter().find(|d| {
+                    !self
+                        .plan
+                        .step(d)
+                        .is_some_and(|s| snap.state(s).status == Status::Landed)
+                }) {
+                    return Err(Error::Invalid(format!(
+                        "step `{}` cannot land before its dependency `{dep}` has",
+                        step.id
+                    )));
+                }
+            }
+            if let Some((to, by_landed_event)) = change
+                && let Some(why) = transition_error(state.status, to, by_landed_event)
+            {
+                return Err(Error::BadTransition {
+                    step: step.id.clone(),
+                    from: status_label(state.status),
+                    to: status_label(to),
+                    why,
+                });
+            }
         }
         if parsed.valid_len < bytes.len() {
+            // Keep what is about to be cut away; a cut-off tail is rare, so a copy costs nothing.
+            let aside = self.path.with_extension(format!("pb.truncated-{now}"));
+            fs::write(&aside, &bytes).map_err(io)?;
             file.set_len(parsed.valid_len as u64).map_err(io)?;
         }
         file.write_all(&store::encode(&event)).map_err(io)?;

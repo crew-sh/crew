@@ -4,6 +4,7 @@ mod check;
 mod error;
 mod glob;
 mod ledger;
+pub mod owner;
 mod plan;
 mod report;
 mod store;

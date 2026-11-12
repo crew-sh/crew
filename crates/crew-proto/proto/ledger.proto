@@ -33,6 +33,29 @@ message Landed {
 // Covers every step of kind extra whose review is not owner-before.
 message ScopeAll {}
 
+// Where an approval was given from. Only the owner's terminal, or the owner's token, makes it count.
+message ApproverContext {
+  // Standard input and output were terminals.
+  bool interactive = 1;
+  // The owner typed the step id (or `scope`) back after seeing what it covers.
+  bool typed_confirmation = 2;
+  // The approval was made with `--owner-confirmed` and a matching CREW_OWNER_TOKEN.
+  bool via_owner_token = 3;
+  // CREW_AGENT in the approver's environment; an agent's approval does not count.
+  string agent = 4;
+  // The approver ran inside a crew job scope.
+  bool in_crew_job = 5;
+  string user = 6;
+  uint32 pid = 7;
+  string tty = 8;
+}
+
+// A step an approval covers, with the hash of its content at the time.
+message ApprovedStep {
+  string step_id = 1;
+  string step_hash = 2;
+}
+
 message Approval {
   oneof target {
     string step_id = 1;
@@ -41,6 +64,12 @@ message Approval {
   string by = 3;
   uint64 at_ms = 4;
   string note = 5;
+  // Absent in approvals from before approvals were bound to an owner context; those keep counting.
+  ApproverContext approver = 6;
+  // The step approved (step_id target), by its content hash; a later change to the step needs a new approval.
+  string step_hash = 7;
+  // The extra steps a scope approval covers; extras added later are not covered.
+  repeated ApprovedStep scope_steps = 8;
 }
 
 // Amounts are deltas added to the step's running totals.

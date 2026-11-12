@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use crew_ledger::{
-    Error, Ledger, Refusal, RunKind, Use, events, parse_status, render_markdown, render_show, show,
-    status_name,
+    Error, Ledger, Refusal, RunKind, Use, events, owner, parse_status, render_markdown,
+    render_show, show, status_name,
 };
 
 const HELP: &str = "usage: crew plan [--root DIR] <command>
@@ -13,7 +13,10 @@ const HELP: &str = "usage: crew plan [--root DIR] <command>
   show [--json]                           counts per kind, then the steps
   report                                  one-screen summary for the owner
   render                                  markdown for PLAN.md
-  approve <id|scope> [--note TEXT]
+  approve <id|scope> [--note TEXT] [--owner-confirmed]
+                                          owner only: from a terminal, typing the id back; scripts use
+                                          --owner-confirmed with CREW_OWNER_TOKEN (see `owner-token`)
+  owner-token                             create the token file for --owner-confirmed (terminal only)
   status <id> <status> [--detail TEXT]    planned approved running built landed failed held dropped
   landed <id> <sha> [--batch ID]
   use <id> [--builds N] [--test-ms N] [--harnesses N] [--games N]
@@ -90,6 +93,116 @@ fn warn(ledger: &Ledger) {
     }
 }
 
+fn config_dir() -> PathBuf {
+    let base = match std::env::var_os("XDG_CONFIG_HOME") {
+        Some(v) if !v.is_empty() => PathBuf::from(v),
+        _ => PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".config"),
+    };
+    base.join("crew")
+}
+
+fn denied(err: &owner::Denied) -> Res<ExitCode> {
+    eprintln!("crew-plan: {err}");
+    Ok(ExitCode::from(1))
+}
+
+/// Approvals are the owner's: from a terminal with the target typed back, or from a script holding the owner's token.
+fn approve(ledger: &Ledger, target: &str, note: &str, confirmed: bool) -> Res<ExitCode> {
+    let token_file = owner::token_file(&config_dir());
+    let caller = owner::caller_here(confirmed, &config_dir());
+    let channel = match owner::channel(&caller, &token_file.display().to_string()) {
+        Ok(c) => c,
+        Err(err) => return denied(&err),
+    };
+    let plan = ledger.plan();
+    let covered: Vec<&crew_ledger::Step> =
+        plan.steps.iter().filter(|s| s.covered_by_scope()).collect();
+    let step = if target == "scope" {
+        None
+    } else {
+        Some(
+            plan.step(target)
+                .ok_or_else(|| format!("unknown step `{target}`"))?,
+        )
+    };
+    let typed = channel == owner::Channel::Terminal;
+    if typed {
+        let summary = match step {
+            Some(s) => format!(
+                "Step `{}` ({}, review {}): {}\n  owns: {}\n  budget: {:?}\n  content hash {}",
+                s.id,
+                s.kind.name(),
+                match s.review() {
+                    crew_ledger::Review::OwnerBefore => "owner-before",
+                    crew_ledger::Review::OwnerAfter => "owner-after",
+                    crew_ledger::Review::None => "none",
+                },
+                s.title,
+                s.owns.join(", "),
+                s.budget,
+                s.approval_hash()
+            ),
+            None => format!(
+                "Every extra step listed here, as it reads now (steps added later need their own approval):\n{}",
+                covered
+                    .iter()
+                    .map(|s| format!("  {}: {}", s.id, s.title))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ),
+        };
+        let stdin = std::io::stdin();
+        if !owner::confirm(&summary, target, &mut stdin.lock(), &mut std::io::stdout()) {
+            eprintln!("crew-plan: not confirmed; nothing was approved");
+            return Ok(ExitCode::from(1));
+        }
+    }
+    let ctx = owner::context(&caller, channel, typed);
+    let ev = match step {
+        Some(s) => events::approve_step_as(s, &by(), note, ctx),
+        None => events::approve_scope_as(&covered, &by(), note, ctx),
+    };
+    ledger.record(ev).map_err(e)?;
+    println!("approved {target}");
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Writes a new random token (mode 0600) for scripted owners; refused anywhere but the owner's terminal.
+fn owner_token() -> Res<ExitCode> {
+    let caller = owner::caller_here(false, &config_dir());
+    if let Err(err) = owner::channel(&caller, "") {
+        return denied(&err);
+    }
+    let path = owner::token_file(&config_dir());
+    if path.exists() {
+        return Err(format!(
+            "{} exists; delete it first to replace the token",
+            path.display()
+        ));
+    }
+    let mut bytes = [0u8; 24];
+    std::io::Read::read_exact(
+        &mut std::fs::File::open("/dev/urandom").map_err(|e| e.to_string())?,
+        &mut bytes,
+    )
+    .map_err(|e| e.to_string())?;
+    let token: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    let mut out = std::fs::OpenOptions::new();
+    std::os::unix::fs::OpenOptionsExt::mode(out.write(true).create_new(true), 0o600);
+    let mut file = out.open(&path).map_err(|e| e.to_string())?;
+    std::io::Write::write_all(&mut file, format!("{token}\n").as_bytes())
+        .map_err(|e| e.to_string())?;
+    println!(
+        "wrote {}\nexport {}={token}  # in the owner's own shell, never in an agent's environment",
+        path.display(),
+        owner::TOKEN_ENV
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
 fn run(mut args: Vec<String>) -> Res<ExitCode> {
     let root_flag = flag(&mut args, "--root")?;
     if args.is_empty() || args[0] == "--help" || args[0] == "-h" || args[0] == "help" {
@@ -134,14 +247,18 @@ fn run(mut args: Vec<String>) -> Res<ExitCode> {
         }
         "approve" => {
             let note = flag(&mut args, "--note")?.unwrap_or_default();
-            let target = positionals(args, 1, "approve <id|scope> [--note TEXT]")?.remove(0);
-            let ev = if target == "scope" {
-                events::approve_scope(&by(), &note)
-            } else {
-                events::approve_step(&target, &by(), &note)
-            };
-            ledger.record(ev).map_err(e)?;
-            println!("approved {target}");
+            let confirmed = switch(&mut args, "--owner-confirmed");
+            let target = positionals(
+                args,
+                1,
+                "approve <id|scope> [--note TEXT] [--owner-confirmed]",
+            )?
+            .remove(0);
+            return approve(&ledger, &target, &note, confirmed);
+        }
+        "owner-token" => {
+            positionals(args, 0, "owner-token")?;
+            return owner_token();
         }
         "status" => {
             let detail = flag(&mut args, "--detail")?.unwrap_or_default();

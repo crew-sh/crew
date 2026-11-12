@@ -454,3 +454,237 @@ fn the_plan_file_rejects_unknown_keys_and_kinds() {
         );
     }
 }
+
+fn owner_context() -> crew_proto::ledger::ApproverContext {
+    crew_proto::ledger::ApproverContext {
+        interactive: true,
+        typed_confirmation: true,
+        user: "owner".into(),
+        ..Default::default()
+    }
+}
+
+fn step<'a>(l: &'a Ledger, id: &str) -> &'a crew_ledger::Step {
+    l.plan().step(id).unwrap()
+}
+
+#[test]
+fn a_step_cannot_be_landed_by_a_status_nor_leave_landed_nor_come_back_from_dropped() {
+    let (_d, l) = project(PLAN);
+    set(&l, "a", Status::Running);
+    assert!(matches!(
+        l.record(events::status("a", Status::Landed, "agent", "")),
+        Err(Error::BadTransition { .. })
+    ));
+    assert_ne!(l.state("a").unwrap().status, Status::Landed);
+    assert!(
+        !ids(&l).contains(&"b".to_string()),
+        "b waits for a real landing"
+    );
+    // A landing needs the merge sha, and only a step that was started.
+    assert!(matches!(
+        l.record(events::landed("b", "abc", "")),
+        Err(Error::Invalid(_) | Error::BadTransition { .. })
+    ));
+    l.record(events::landed("a", "abc123", "batch")).unwrap();
+    assert_eq!(l.state("a").unwrap().status, Status::Landed);
+    assert_eq!(l.state("a").unwrap().detail, "landed abc123");
+    for back in [
+        Status::Planned,
+        Status::Running,
+        Status::Built,
+        Status::Dropped,
+    ] {
+        assert!(
+            matches!(
+                l.record(events::status("a", back, "t", "")),
+                Err(Error::BadTransition { .. })
+            ),
+            "landed -> {back:?}"
+        );
+    }
+
+    set(&l, "c2", Status::Dropped);
+    assert!(matches!(
+        l.record(events::status("c2", Status::Built, "t", "")),
+        Err(Error::BadTransition { .. })
+    ));
+    set(&l, "c2", Status::Planned);
+}
+
+#[test]
+fn a_step_whose_dependency_has_not_landed_cannot_land() {
+    let (_d, l) = project(PLAN);
+    set(&l, "b", Status::Built);
+    let err = l.record(events::landed("b", "abc", "")).unwrap_err();
+    assert!(err.to_string().contains("dependency `a`"), "{err}");
+}
+
+#[test]
+fn an_approval_binds_to_the_step_as_the_owner_saw_it() {
+    let (d, l) = project(PLAN);
+    l.record(events::approve_step_as(
+        step(&l, "x"),
+        "owner",
+        "",
+        owner_context(),
+    ))
+    .unwrap();
+    assert!(l.state("x").unwrap().allowed);
+    // The agent edits plan.toml afterwards: a bigger budget, same id. The approval no longer matches.
+    let edited = PLAN.replace(
+        "owns = [\"crates/x/**\"]",
+        "owns = [\"crates/x/**\"]\nbudget = { builds = 999 }",
+    );
+    std::fs::write(d.path().join("plan.toml"), edited).unwrap();
+    let l = Ledger::open(d.path()).unwrap();
+    let st = l.state("x").unwrap();
+    assert!(!st.allowed && st.approval_stale);
+    assert!(matches!(
+        l.record(events::status("x", Status::Running, "t", "")),
+        Err(Error::NeedsApproval(_))
+    ));
+    l.record(events::approve_step_as(
+        step(&l, "x"),
+        "owner",
+        "",
+        owner_context(),
+    ))
+    .unwrap();
+    assert!(l.state("x").unwrap().allowed);
+}
+
+#[test]
+fn a_scope_approval_covers_the_extras_it_listed_and_not_ones_added_later() {
+    let (d, l) = project(PLAN);
+    let extras: Vec<&crew_ledger::Step> = l
+        .plan()
+        .steps
+        .iter()
+        .filter(|s| s.covered_by_scope())
+        .collect();
+    assert_eq!(extras.len(), 1);
+    l.record(events::approve_scope_as(
+        &extras,
+        "owner",
+        "",
+        owner_context(),
+    ))
+    .unwrap();
+    assert!(l.state("x").unwrap().allowed);
+    let later = format!(
+        "{PLAN}\n[[step]]\nid = \"y\"\ntitle = \"added after\"\nkind = \"extra\"\nowns = [\"crates/y/**\"]\n"
+    );
+    std::fs::write(d.path().join("plan.toml"), later).unwrap();
+    let l = Ledger::open(d.path()).unwrap();
+    assert!(l.state("x").unwrap().allowed);
+    assert!(
+        !l.state("y").unwrap().allowed,
+        "an extra added after the scope approval needs its own"
+    );
+}
+
+#[test]
+fn an_approval_from_an_agent_context_is_ignored_and_reported() {
+    let (_d, l) = project(PLAN);
+    let agent = crew_proto::ledger::ApproverContext {
+        agent: "worker-1".into(),
+        interactive: true,
+        typed_confirmation: true,
+        ..Default::default()
+    };
+    l.record(events::approve_step_as(
+        step(&l, "x"),
+        "worker-1",
+        "",
+        agent,
+    ))
+    .unwrap();
+    assert!(!l.state("x").unwrap().allowed);
+    assert!(
+        l.snapshot()
+            .unwrap()
+            .warnings
+            .iter()
+            .any(|w| w.contains("not given by the owner")),
+        "{:?}",
+        l.snapshot().unwrap().warnings
+    );
+    let untyped = crew_proto::ledger::ApproverContext {
+        interactive: true,
+        ..Default::default()
+    };
+    l.record(events::approve_step_as(step(&l, "x"), "owner", "", untyped))
+        .unwrap();
+    assert!(!l.state("x").unwrap().allowed, "no typed confirmation");
+    let token = crew_proto::ledger::ApproverContext {
+        via_owner_token: true,
+        ..Default::default()
+    };
+    l.record(events::approve_step_as(step(&l, "x"), "owner", "", token))
+        .unwrap();
+    assert!(l.state("x").unwrap().allowed);
+}
+
+fn varint(mut n: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    loop {
+        let byte = (n & 0x7f) as u8;
+        n >>= 7;
+        if n == 0 {
+            out.push(byte);
+            return out;
+        }
+        out.push(byte | 0x80);
+    }
+}
+
+#[test]
+fn a_damaged_length_in_the_middle_is_corruption_not_a_cut_off_tail() {
+    let (_d, l) = project(PLAN);
+    set(&l, "a", Status::Running);
+    set(&l, "a", Status::Built);
+    set(&l, "x", Status::Held);
+    let path = l.path().to_path_buf();
+    let good = std::fs::read(&path).unwrap();
+    // The first record's length now claims more bytes than the file has, as a damaged byte could make it.
+    let first_len = good[0] as usize;
+    let mut bad = varint(good.len() + 50);
+    bad.extend_from_slice(&good[1..]);
+    std::fs::write(&path, &bad).unwrap();
+    assert!(
+        matches!(l.state("a"), Err(Error::Corrupt { .. })),
+        "records behind it were swallowed as a tail"
+    );
+    assert!(
+        l.record(events::status("a", Status::Failed, "t", ""))
+            .is_err(),
+        "a write must not truncate the file here"
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), bad, "the file is untouched");
+    // An absurd claim is damage too.
+    let mut huge = varint(1 << 30);
+    huge.extend_from_slice(&good[1..first_len + 1]);
+    std::fs::write(&path, &huge).unwrap();
+    assert!(matches!(l.state("a"), Err(Error::Corrupt { .. })));
+}
+
+#[test]
+fn cutting_off_a_partial_tail_keeps_a_copy_of_the_file_first() {
+    let (_d, l) = project(PLAN);
+    set(&l, "a", Status::Running);
+    set(&l, "a", Status::Built);
+    let path = l.path().to_path_buf();
+    let whole = std::fs::read(&path).unwrap();
+    let cut = &whole[..whole.len() - 2];
+    std::fs::write(&path, cut).unwrap();
+    l.record(events::status("a", Status::Failed, "t", ""))
+        .unwrap();
+    let copies: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().contains("truncated-"))
+        .collect();
+    assert_eq!(copies.len(), 1);
+    assert_eq!(std::fs::read(copies[0].path()).unwrap(), cut);
+}

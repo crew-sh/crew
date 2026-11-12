@@ -130,6 +130,48 @@ impl Step {
         self.kind == Kind::Extra || self.review() == Review::OwnerBefore
     }
 
+    /// A hash of everything the owner looks at when approving: a change to any of it voids the approval.
+    pub fn approval_hash(&self) -> String {
+        let join = |v: &[String]| v.join("\u{1e}");
+        let fields = [
+            self.id.clone(),
+            self.title.clone(),
+            self.kind.name().to_string(),
+            match self.review() {
+                Review::OwnerBefore => "owner-before",
+                Review::OwnerAfter => "owner-after",
+                Review::None => "none",
+            }
+            .to_string(),
+            join(&self.deps),
+            match self.model {
+                Model::Sonnet => "sonnet",
+                Model::Opus => "opus",
+                Model::Haiku => "haiku",
+                Model::Fable => "fable",
+            }
+            .to_string(),
+            join(&self.owns),
+            join(&self.verify),
+            [
+                self.budget.builds,
+                self.budget.test_minutes,
+                self.budget.harnesses,
+                self.budget.games,
+            ]
+            .map(|n| n.map_or_else(|| "-".to_string(), |n| n.to_string()))
+            .join(","),
+            self.issue.map_or_else(String::new, |n| n.to_string()),
+        ];
+        // FNV-1a over the fields; stable across builds and good enough to notice an edit.
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for byte in fields.join("\u{1f}").bytes() {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0100_0000_01b3);
+        }
+        format!("{hash:016x}")
+    }
+
     /// Whether a scope approval covers this step.
     pub fn covered_by_scope(&self) -> bool {
         self.kind == Kind::Extra && self.review() != Review::OwnerBefore

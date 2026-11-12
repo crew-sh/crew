@@ -33,8 +33,7 @@ pub fn record_landed(ledger: &Ledger, step: &str, sha: &str, batch: &str) -> Res
         .record(Event {
             body: Some(event::Body::Landed(body)),
         })
-        .map_err(|e| anyhow::anyhow!("ledger: {e}"))?;
-    record_status(ledger, step, Status::Landed, &format!("landed {sha}"))
+        .map_err(|e| anyhow::anyhow!("ledger: {e}"))
 }
 
 pub fn state_of(ledger: &Ledger, step: &str) -> Result<Status> {

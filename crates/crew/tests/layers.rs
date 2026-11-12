@@ -66,7 +66,7 @@ fn layers() -> BTreeMap<&'static str, Crate> {
             "crew-ledger",
             Crate {
                 layer: 1,
-                only: Some(&["crew-proto"]),
+                only: Some(&["crew-proto", "crew-sys"]),
             },
         ),
         (
