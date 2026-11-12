@@ -35,9 +35,9 @@ impl Dirs {
         self.logs.join(format!("{}.status", file_stem(id)))
     }
 
-    /// Whether the usher made this log itself, and so may remove it with the job's record.
-    fn owns_log(&self, log: &Path) -> bool {
-        log.parent() == Some(self.logs.as_path())
+    /// Whether the usher made this log itself, and so may remove it with the job's record: only the default name for the id, never a `--log` that happens to sit in the folder.
+    fn owns_log(&self, log: &Path, id: &str) -> bool {
+        log == self.default_log(id)
     }
 }
 
@@ -110,7 +110,8 @@ pub fn prune(finished: &mut Vec<DetachedJob>, now_ms: u64, dirs: &Dirs) -> usize
         if !keep {
             let _ = fs::remove_file(&j.status_path);
             let log = Path::new(&j.log_path);
-            if dirs.owns_log(log) {
+            let id = j.request.as_ref().map_or("", |r| r.id.as_str());
+            if dirs.owns_log(log, id) {
                 let _ = fs::remove_file(log);
             }
         }
@@ -245,5 +246,22 @@ mod tests {
         assert!(elsewhere.exists(), "a log the user chose is never removed");
         assert!(!dirs.default_log("old").exists());
         assert!(dirs.default_log("fresh").exists());
+    }
+
+    #[test]
+    fn a_log_the_user_put_inside_the_jobs_folder_is_not_removed_with_the_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let dirs = Dirs {
+            state: dir.path().to_path_buf(),
+            logs: dir.path().join("jobs"),
+        };
+        fs::create_dir_all(&dirs.logs).unwrap();
+        let theirs = dirs.logs.join("notes-for-me.log");
+        fs::write(&theirs, "x").unwrap();
+        let mut rec = record("job", JobPhase::Exited, 1);
+        rec.log_path = theirs.display().to_string();
+        let gone = prune(&mut vec![rec], KEEP_FINISHED_MS + 10, &dirs);
+        assert_eq!(gone, 1);
+        assert!(theirs.exists());
     }
 }
