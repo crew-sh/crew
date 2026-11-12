@@ -244,11 +244,38 @@ enum Watch {
     Scope,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Cancel {
     No,
-    Terminated { at_ms: u64 },
+    /// `crew cancel` asked; SIGTERM counts from `at_ms` once `sent`, and not before the scope exists.
+    Terminated {
+        at_ms: u64,
+        sent: bool,
+    },
     Killed,
+}
+
+/// What a cancelled job's scope is due next: SIGTERM once the scope exists, then SIGKILL after the grace.
+fn next_signal(cancel: Cancel, now_ms: u64, scope_alive: bool) -> (Cancel, Option<KillSignal>) {
+    match cancel {
+        Cancel::Terminated { at_ms, sent: true }
+            if now_ms.saturating_sub(at_ms) >= CANCEL_GRACE_MS =>
+        {
+            (Cancel::Killed, Some(KillSignal::Kill))
+        }
+        // A cancel right after the start can beat the scope into existence; the signal would go nowhere.
+        Cancel::Terminated {
+            sent: false,
+            at_ms: _,
+        } if scope_alive => (
+            Cancel::Terminated {
+                at_ms: now_ms,
+                sent: true,
+            },
+            Some(KillSignal::Term),
+        ),
+        other => (other, None),
+    }
 }
 
 struct QueuedJob {
@@ -2042,16 +2069,12 @@ impl Daemon {
     fn watch_detached(&mut self) {
         let now = self.now_ms();
         for r in &mut self.running {
-            match r.cancel {
-                Cancel::Terminated { at_ms } if now.saturating_sub(at_ms) >= CANCEL_GRACE_MS => {
-                    scope::kill(&r.scope_name, KillSignal::Kill);
-                    r.cancel = Cancel::Killed;
+            if matches!(r.cancel, Cancel::Terminated { .. }) {
+                let (next, signal) = next_signal(r.cancel, now, scope::alive(&r.scope_name));
+                r.cancel = next;
+                if let Some(signal) = signal {
+                    scope::kill(&r.scope_name, signal);
                 }
-                // A cancel right after the start can beat the scope into existence, and then the signal went nowhere.
-                Cancel::Terminated { .. } if !scope::alive(&r.scope_name) => {
-                    scope::kill(&r.scope_name, KillSignal::Term);
-                }
-                _ => {}
             }
         }
         let gone: Vec<(String, bool)> = self
@@ -2105,10 +2128,23 @@ impl Daemon {
         let now = self.now_ms();
         if let Some(r) = self.running.iter_mut().find(|r| r.req.id == id) {
             if r.cancel == Cancel::No {
-                r.cancel = Cancel::Terminated { at_ms: now };
-                scope::kill(&r.scope_name, KillSignal::Term);
-                self.log
-                    .line(&format!("CANCEL id={id} while running; SIGTERM sent"));
+                let asked = Cancel::Terminated {
+                    at_ms: now,
+                    sent: false,
+                };
+                let (next, signal) = next_signal(asked, now, scope::alive(&r.scope_name));
+                r.cancel = next;
+                if let Some(signal) = signal {
+                    scope::kill(&r.scope_name, signal);
+                }
+                self.log.line(&format!(
+                    "CANCEL id={id} while running; {}",
+                    if signal.is_some() {
+                        "SIGTERM sent"
+                    } else {
+                        "SIGTERM waits for the scope"
+                    }
+                ));
             }
             return ack(
                 true,
@@ -2291,6 +2327,31 @@ mod tests {
             daemon.saves.get(),
             1,
             "a crash between two writes would lose the records not yet restored"
+        );
+    }
+
+    #[test]
+    fn a_cancel_that_beat_the_scope_still_gets_its_sigterm_before_any_sigkill() {
+        let asked = Cancel::Terminated {
+            at_ms: 1_000,
+            sent: false,
+        };
+        // No scope yet: nothing to signal, and the grace does not run.
+        assert!(matches!(
+            next_signal(asked, 1_000 + CANCEL_GRACE_MS * 3, false),
+            (Cancel::Terminated { sent: false, .. }, None)
+        ));
+        // The scope shows up late: SIGTERM first, and the grace starts then.
+        let late = 1_000 + CANCEL_GRACE_MS + 5;
+        let (sent, signal) = next_signal(asked, late, true);
+        assert_eq!(signal, Some(KillSignal::Term));
+        assert!(matches!(sent, Cancel::Terminated { sent: true, at_ms } if at_ms == late));
+        assert_eq!(next_signal(sent, late + 1, true).1, None);
+        let (killed, signal) = next_signal(sent, late + CANCEL_GRACE_MS, true);
+        assert_eq!((killed, signal), (Cancel::Killed, Some(KillSignal::Kill)));
+        assert_eq!(
+            next_signal(killed, late + 10 * CANCEL_GRACE_MS, true).1,
+            None
         );
     }
 
