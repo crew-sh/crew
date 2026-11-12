@@ -38,7 +38,7 @@ fn machine_lines(m: &MachineView, out: &mut String) {
     let source = match OwnerSource::try_from(m.owner_source).unwrap_or(OwnerSource::Unspecified) {
         OwnerSource::Manual => "manual",
         OwnerSource::WaylandIdle => "wayland idle",
-        OwnerSource::Default => "no idle source",
+        OwnerSource::Default => "assumed, no idle event yet",
         OwnerSource::Auto | OwnerSource::Unspecified => "?",
     };
     let _ = writeln!(

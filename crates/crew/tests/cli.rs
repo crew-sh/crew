@@ -197,3 +197,41 @@ fn unknown_subcommands_exec_crew_plugins_or_fail_clearly() {
     assert_eq!(o.status.code(), Some(125));
     assert!(stderr(&o).contains("crew-no-such-plugin"));
 }
+
+#[test]
+fn sigterm_to_crew_run_kills_the_scope_and_exits_143() {
+    let Some(d) = Daemon::start() else { return };
+    let mut run = Command::new(CREW)
+        .args(["run", "--", "sleep", "30"])
+        .env("CREW_SOCKET", &d.socket)
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !stdout(&d.crew(&["top"])).contains("RUNNING (1)") {
+        assert!(Instant::now() < deadline, "sleep never started");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // Let the supervisor install its handler and the scope settle.
+    std::thread::sleep(Duration::from_millis(300));
+    let pid = run.id().to_string();
+    assert!(
+        Command::new("kill")
+            .args(["-TERM", &pid])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let started = Instant::now();
+    let status = loop {
+        if let Some(s) = run.try_wait().unwrap() {
+            break s;
+        }
+        if started.elapsed() > Duration::from_secs(10) {
+            let _ = run.kill();
+            panic!("crew run did not exit after SIGTERM");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(status.code(), Some(143));
+    assert!(stdout(&d.crew(&["top"])).contains("RUNNING (0)"));
+}
