@@ -351,11 +351,27 @@ impl Owner {
     }
 }
 
+/// Unmanaged load is the median of the last few ticks, so one spike does not lower the CPU cap.
+const LOAD_TICKS: usize = 3;
+
 #[derive(Default)]
 struct CpuLoad {
     last: Option<(u64, u64, u64)>,
+    recent: VecDeque<f64>,
     unmanaged_cores: f64,
     psi_cpu: f64,
+}
+
+impl CpuLoad {
+    fn record(&mut self, cores: f64) {
+        if self.recent.len() == LOAD_TICKS {
+            self.recent.pop_front();
+        }
+        self.recent.push_back(cores);
+        let mut sorted: Vec<f64> = self.recent.iter().copied().collect();
+        sorted.sort_by(f64::total_cmp);
+        self.unmanaged_cores = sorted[sorted.len() / 2];
+    }
 }
 
 /// Agent sessions seen by the scanner thread; the thread ends when the sender is dropped.
@@ -1661,7 +1677,8 @@ impl Daemon {
             if dt_usec > 0 {
                 let busy_d = snap.cpu_busy_usec.saturating_sub(busy);
                 let scope_d = scopes.saturating_sub(scoped);
-                self.load.unmanaged_cores = busy_d.saturating_sub(scope_d) as f64 / dt_usec as f64;
+                self.load
+                    .record(busy_d.saturating_sub(scope_d) as f64 / dt_usec as f64);
             }
         }
         self.load.last = Some((now_ms, snap.cpu_busy_usec, scopes));
@@ -2353,6 +2370,20 @@ mod tests {
             next_signal(killed, late + 10 * CANCEL_GRACE_MS, true).1,
             None
         );
+    }
+
+    #[test]
+    fn one_busy_tick_does_not_count_as_unmanaged_load_but_a_sustained_one_does() {
+        let mut load = CpuLoad::default();
+        for cores in [0.5, 0.5, 20.0] {
+            load.record(cores);
+        }
+        assert_eq!(load.unmanaged_cores, 0.5, "a one-tick spike");
+        load.record(20.0);
+        assert_eq!(load.unmanaged_cores, 20.0, "two busy ticks of three");
+        load.record(0.5);
+        load.record(0.5);
+        assert_eq!(load.unmanaged_cores, 0.5, "the load ended");
     }
 
     #[test]
