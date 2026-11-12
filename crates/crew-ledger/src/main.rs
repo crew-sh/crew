@@ -147,9 +147,13 @@ fn run(mut args: Vec<String>) -> Res<ExitCode> {
             let detail = flag(&mut args, "--detail")?.unwrap_or_default();
             let a = positionals(args, 2, "status <id> <status> [--detail TEXT]")?;
             let status = parse_status(&a[1]).ok_or_else(|| format!("unknown status `{}`", a[1]))?;
-            ledger
-                .record(events::status(&a[0], status, &by(), &detail))
-                .map_err(e)?;
+            match ledger.record(events::status(&a[0], status, &by(), &detail)) {
+                Err(err @ crew_ledger::Error::NeedsApproval(_)) => {
+                    eprintln!("crew-plan: {err}");
+                    return Ok(ExitCode::from(1));
+                }
+                r => r.map_err(e)?,
+            }
             println!("{} is {}", a[0], status_name(status));
         }
         "landed" => {

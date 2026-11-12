@@ -50,7 +50,10 @@ fn the_cli_walks_a_step_from_plan_to_landed() {
     let p = d.path();
     assert_eq!(plan(p, &["check"]).status.code(), Some(0));
     assert_eq!(out(&plan(p, &["next"])).trim(), "one\tasked\tfirst");
-    assert!(plan(p, &["status", "two", "running"]).status.code() == Some(2));
+    assert_eq!(
+        plan(p, &["status", "two", "running"]).status.code(),
+        Some(1)
+    );
     assert_eq!(plan(p, &["may-run", "one", "build"]).status.code(), Some(0));
     assert_eq!(
         plan(p, &["use", "one", "--builds", "1"]).status.code(),
