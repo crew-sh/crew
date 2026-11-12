@@ -44,7 +44,6 @@ pub fn usher_side_overrides(user: &Depot, resolved: &Depot) -> Vec<String> {
         }
     };
     note("mbx", user.mbx != resolved.mbx);
-    note("mbx_path", user.mbx_path != resolved.mbx_path);
     note("mbx_reserve", user.mbx_reserve != resolved.mbx_reserve);
     note("reserve_cpus", user.reserve_cpus != resolved.reserve_cpus);
     note(

@@ -19,6 +19,19 @@ use crate::{mbx, why};
 pub const EXIT_ERROR: u8 = 125;
 pub const EXIT_REFUSED: u8 = 75;
 
+/// One line per user-only key the project's crew.toml sets; they are ignored.
+pub fn ignored_project_keys(dir: &Path) -> Result<Vec<String>> {
+    Ok(DepotTable::project(dir)?
+        .user_only_keys_set()
+        .into_iter()
+        .map(|key| {
+            format!(
+                "crew: {key} in this project's crew.toml is ignored: a checked-out branch must not choose what runs or where records go; set it in depot.toml"
+            )
+        })
+        .collect())
+}
+
 /// User settings, then the project's on top.
 pub fn depot_for(dir: &Path) -> Result<Depot> {
     Ok(DepotTable::user()?
@@ -73,6 +86,9 @@ fn record_build(store: &Path, root: &Path, args: &[String], report: &Path) {
 pub fn cargo(args: &[String]) -> Result<ExitCode> {
     let cwd = std::env::current_dir()?;
     let depot = depot_for(&cwd)?;
+    for note in ignored_project_keys(&cwd)? {
+        eprintln!("{note}");
+    }
     for note in plan::usher_side_overrides(&DepotTable::user()?.resolve(), &depot) {
         eprintln!("{note}");
     }

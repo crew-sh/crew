@@ -90,6 +90,28 @@ fn the_project_overrides_the_user_key_by_key() {
 }
 
 #[test]
+fn a_project_cannot_choose_the_mbx_program_or_the_store() {
+    let user = parse("[depot]\nmbx_path = \"/usr/bin/mbx\"\nstore = \"/var/crew\"\n").unwrap();
+    let project =
+        parse("[depot]\nmbx_path = \"./evil\"\nstore = \"/tmp/theirs\"\ntoolchain = \"stable\"\n")
+            .unwrap();
+    assert_eq!(project.user_only_keys_set(), ["mbx_path", "store"]);
+    let d = user.layered(project).resolve();
+    assert_eq!(d.mbx_path, Some(PathBuf::from("/usr/bin/mbx")));
+    assert_eq!(d.store, PathBuf::from("/var/crew"));
+    assert_eq!(
+        d.toolchain.as_deref(),
+        Some("stable"),
+        "other keys still layer"
+    );
+
+    let bare = parse("[depot]\n")
+        .unwrap()
+        .layered(parse("[depot]\nmbx_path = \"./evil\"\n").unwrap());
+    assert_eq!(bare.resolve().mbx_path, None);
+}
+
+#[test]
 fn files_are_read_from_the_config_dir_and_the_nearest_crew_toml() {
     let dir = tempfile::tempdir().unwrap();
     assert_eq!(

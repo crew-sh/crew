@@ -140,7 +140,20 @@ impl DepotTable {
         }
     }
 
-    /// `self` is the base; every key `project` sets replaces it, and profiles merge field by field.
+    /// The keys only the user's own `depot.toml` may set (`mbx_path`, `store`) that this table sets.
+    /// A project's `crew.toml` comes with a checked-out branch, and must not choose which program runs or where records go.
+    pub fn user_only_keys_set(&self) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        if self.mbx_path.is_some() {
+            out.push("mbx_path");
+        }
+        if self.store.is_some() {
+            out.push("store");
+        }
+        out
+    }
+
+    /// `self` is the base; every key `project` sets replaces it (except the user-only ones), and profiles merge field by field.
     pub fn layered(mut self, project: Self) -> Self {
         macro_rules! take {
             ($($f:ident),*) => {$(if project.$f.is_some() { self.$f = project.$f; })*};
@@ -148,11 +161,9 @@ impl DepotTable {
         take!(
             toolchain,
             mbx,
-            mbx_path,
             mbx_reserve,
             reserve_cpus,
             reserve_memory_gib,
-            store,
             store_budget_gib
         );
         for (name, over) in project.profiles {

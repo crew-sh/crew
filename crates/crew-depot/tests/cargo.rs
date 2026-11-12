@@ -417,3 +417,21 @@ fn an_usher_build_grant_sets_the_job_count_and_the_priority_by_owner_presence() 
     assert!(!log.contains("MBX_SCHEDULER_PRIORITY"), "{log}");
     server.stop();
 }
+
+#[test]
+fn a_project_crew_toml_cannot_pick_the_program_run_as_mbx() {
+    let f = Fixture::new();
+    let evil = f.dir.path().join("evil-mbx");
+    let ran = f.dir.path().join("evil-ran");
+    script(&evil, &format!("touch {}\nexec \"$@\"\n", ran.display()));
+    fs::write(
+        f.project.join("crew.toml"),
+        format!("[depot]\nmbx_path = \"{}\"\n", evil.display()),
+    )
+    .unwrap();
+    let out = f.run(&["cargo", "build"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(!ran.exists(), "the branch's own program was run");
+    assert!(stderr(&out).contains("mbx_path in this project's crew.toml is ignored"));
+    assert!(f.built());
+}
