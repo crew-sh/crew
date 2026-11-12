@@ -1,0 +1,73 @@
+name: Release
+
+# A `v*` tag builds static Linux binaries and attaches them with sha256 sums; a manual run only builds.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build ${{ matrix.arch }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: The tag names this version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          version=$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml)
+          test "v$version" = "$GITHUB_REF_NAME" || { echo "tag $GITHUB_REF_NAME, but Cargo.toml says $version" >&2; exit 1; }
+      - name: Install protoc and musl
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler musl-tools
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.arch }}-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.arch }}
+      - name: Build
+        run: cargo build --release --locked --workspace --bins --target ${{ matrix.arch }}-unknown-linux-musl
+      - name: Package
+        run: contrib/package-release.sh ${{ matrix.arch }}-unknown-linux-musl target/${{ matrix.arch }}-unknown-linux-musl/release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: crew-${{ matrix.arch }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: assets
+          merge-multiple: true
+      - name: Sums for every asset
+        run: cd assets && sha256sum *.tar.gz | tee SHA256SUMS
+      - name: Attach to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" assets/* --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$GITHUB_REF_NAME" assets/* --generate-notes --title "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY"
+          fi

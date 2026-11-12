@@ -23,3 +23,20 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       # Scope tests skip when the runner has no systemd user session.
       - run: cargo test --workspace
+
+  # What a release builds, on every push: static binaries, packaged and smoke-run by the release script.
+  static:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install protoc and musl
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler musl-tools
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: static
+      - run: shellcheck -S warning site/install.sh contrib/package-release.sh
+      - run: cargo build --locked --workspace --bins --target x86_64-unknown-linux-musl
+      - run: contrib/package-release.sh x86_64-unknown-linux-musl target/x86_64-unknown-linux-musl/debug
