@@ -73,6 +73,7 @@ pub struct KindOverride {
     pub io_weight: Option<u32>,
     pub exclusive: Option<bool>,
     pub away_only: Option<bool>,
+    pub restartable: Option<bool>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Deserialize)]
@@ -98,6 +99,8 @@ pub struct KindSpec {
     pub exclusive: bool,
     /// The kind runs only while the owner is away.
     pub away_only: bool,
+    /// The usher may kill a running job of the kind when memory runs critically low, and run it again.
+    pub restartable: bool,
 }
 
 fn watched_paths_for(home: Option<&Path>) -> Vec<String> {
@@ -136,6 +139,8 @@ fn default_tmp_root() -> String {
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub min_free_mem_gib: u64,
+    /// Below this much available memory the usher kills its newest restartable job; 0 never kills.
+    pub kill_below_free_mem_gib: u64,
     pub max_games: u32,
     pub cpu_oversub: f64,
     pub watched_paths: Vec<String>,
@@ -163,6 +168,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             min_free_mem_gib: 16,
+            kill_below_free_mem_gib: 3,
             max_games: 4,
             cpu_oversub: 1.5,
             watched_paths: default_watched_paths(),
@@ -191,10 +197,16 @@ fn builtin(kind: JobKind) -> KindSpec {
         io_weight: 100,
         exclusive: false,
         away_only: false,
+        restartable: false,
     };
     match kind {
         JobKind::Build => KindSpec {
             expected_cores: 4.0,
+            restartable: true,
+            ..base
+        },
+        JobKind::Test => KindSpec {
+            restartable: true,
             ..base
         },
         JobKind::Game => KindSpec {
@@ -210,7 +222,7 @@ fn builtin(kind: JobKind) -> KindSpec {
             cpu_weight: 20,
             ..base
         },
-        JobKind::Test | JobKind::Harness | JobKind::Other | JobKind::Unspecified => base,
+        JobKind::Harness | JobKind::Other | JobKind::Unspecified => base,
     }
 }
 
@@ -223,13 +235,17 @@ impl Config {
                     path: shown.clone(),
                     source,
                 })?;
+                let table = text.parse::<toml::Table>().unwrap_or_default();
                 // A threshold the file never wrote is the built-in `/`; it must not break a config that watches other paths.
-                let wrote_thresholds = text
-                    .parse::<toml::Table>()
-                    .is_ok_and(|t| t.contains_key("min_free_disk_gib"));
-                if !wrote_thresholds {
+                if !table.contains_key("min_free_disk_gib") {
                     let watched = cfg.watched_paths.clone();
                     cfg.min_free_disk_gib.retain(|p, _| watched.contains(p));
+                }
+                // Nor may the built-in kill threshold break a config that keeps less free than it: kills are off there.
+                if !table.contains_key("kill_below_free_mem_gib")
+                    && cfg.kill_below_free_mem_gib >= cfg.min_free_mem_gib
+                {
+                    cfg.kill_below_free_mem_gib = 0;
                 }
                 cfg.validate().map_err(|problem| ConfigError::Invalid {
                     path: shown,
@@ -245,8 +261,15 @@ impl Config {
         }
     }
 
-    /// A disk threshold for a path nobody measures would never be enforced.
+    /// A disk threshold for a path nobody measures would never be enforced; a kill threshold at or above the admission one would kill what admission just let in.
     pub fn validate(&self) -> Result<(), String> {
+        if self.kill_below_free_mem_gib > 0 && self.kill_below_free_mem_gib >= self.min_free_mem_gib
+        {
+            return Err(format!(
+                "kill_below_free_mem_gib ({}) must be below min_free_mem_gib ({}), or 0 to never kill",
+                self.kill_below_free_mem_gib, self.min_free_mem_gib
+            ));
+        }
         match self
             .min_free_disk_gib
             .keys()
@@ -279,11 +302,16 @@ impl Config {
             io_weight: o.io_weight.unwrap_or(b.io_weight),
             exclusive: o.exclusive.unwrap_or(b.exclusive),
             away_only: o.away_only.unwrap_or(b.away_only),
+            restartable: o.restartable.unwrap_or(b.restartable),
         }
     }
 
     pub fn min_free_mem(&self) -> u64 {
         self.min_free_mem_gib * GIB
+    }
+
+    pub fn kill_below_free_mem(&self) -> u64 {
+        self.kill_below_free_mem_gib * GIB
     }
 
     pub fn min_free_disk(&self, path: &str) -> Option<u64> {
@@ -444,6 +472,57 @@ mod tests {
             Config::load(&path),
             Err(ConfigError::Invalid { .. })
         ));
+    }
+
+    #[test]
+    fn only_builds_and_tests_are_restartable_unless_the_file_says_otherwise() {
+        let c = Config::default();
+        let restartable: Vec<JobKind> = JobKind::ALL
+            .into_iter()
+            .filter(|k| c.kind(*k).restartable)
+            .collect();
+        assert_eq!(restartable, [JobKind::Build, JobKind::Test]);
+        let c: Config = toml::from_str(
+            "[kinds.build]\nrestartable = false\n[kinds.harness]\nrestartable = true\n",
+        )
+        .unwrap();
+        assert!(!c.kind(JobKind::Build).restartable);
+        assert!(c.kind(JobKind::Harness).restartable);
+        assert!(c.kind(JobKind::Test).restartable);
+    }
+
+    #[test]
+    fn the_kill_threshold_must_sit_below_the_admission_one() {
+        let parse = |text: &str| toml::from_str::<Config>(text).unwrap().validate();
+        assert!(parse("").is_ok(), "the defaults are 3 below 16");
+        assert!(parse("min_free_mem_gib = 8\nkill_below_free_mem_gib = 7\n").is_ok());
+        for bad in [
+            "min_free_mem_gib = 8\nkill_below_free_mem_gib = 8\n",
+            "min_free_mem_gib = 8\nkill_below_free_mem_gib = 12\n",
+            "min_free_mem_gib = 2\n",
+        ] {
+            let why = parse(bad).unwrap_err();
+            assert!(why.contains("kill_below_free_mem_gib"), "{bad}: {why}");
+        }
+        assert!(
+            parse("min_free_mem_gib = 0\nkill_below_free_mem_gib = 0\n").is_ok(),
+            "0 turns kills off whatever admission keeps"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("usher.toml");
+        fs::write(&path, "min_free_mem_gib = 4\nkill_below_free_mem_gib = 5\n").unwrap();
+        assert!(matches!(
+            Config::load(&path),
+            Err(ConfigError::Invalid { .. })
+        ));
+        fs::write(&path, "min_free_mem_gib = 2\n").unwrap();
+        let c = Config::load(&path).unwrap();
+        assert_eq!(
+            c.kill_below_free_mem_gib, 0,
+            "a file that keeps less free than the built-in kill threshold loads, with kills off"
+        );
+        fs::write(&path, "min_free_mem_gib = 8\n").unwrap();
+        assert_eq!(Config::load(&path).unwrap().kill_below_free_mem_gib, 3);
     }
 
     #[test]

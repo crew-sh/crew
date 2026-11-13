@@ -25,6 +25,8 @@ pub struct Learned {
 pub struct Sizes {
     samples: BTreeMap<String, Vec<SizeSample>>,
     last_seen_ms: BTreeMap<String, u64>,
+    /// What a run killed for memory set for the next run of its command.
+    kill_floors: BTreeMap<String, u64>,
 }
 
 fn base(arg: &str) -> &str {
@@ -94,6 +96,9 @@ impl Sizes {
             Ok(f) if f.version <= FORMAT_VERSION => {
                 let mut sizes = Self::default();
                 for e in f.entries {
+                    if e.samples.is_empty() && e.kill_floor_mem_bytes == 0 {
+                        continue;
+                    }
                     // Files from before keys expired get a fresh lease.
                     let seen = if e.last_seen_unix_ms == 0 {
                         now_ms
@@ -101,7 +106,14 @@ impl Sizes {
                         e.last_seen_unix_ms
                     };
                     sizes.last_seen_ms.insert(e.key.clone(), seen);
-                    sizes.samples.insert(e.key, e.samples);
+                    if e.kill_floor_mem_bytes > 0 {
+                        sizes
+                            .kill_floors
+                            .insert(e.key.clone(), e.kill_floor_mem_bytes);
+                    }
+                    if !e.samples.is_empty() {
+                        sizes.samples.insert(e.key, e.samples);
+                    }
                 }
                 return Read::Loaded(sizes);
             }
@@ -118,12 +130,14 @@ impl Sizes {
         let file = SizesFile {
             version: FORMAT_VERSION,
             entries: self
-                .samples
+                .last_seen_ms
                 .iter()
-                .map(|(k, s)| SizeEntry {
+                .filter(|(k, _)| self.samples.contains_key(*k) || self.kill_floors.contains_key(*k))
+                .map(|(k, seen)| SizeEntry {
                     key: k.clone(),
-                    samples: s.clone(),
-                    last_seen_unix_ms: self.last_seen_ms.get(k).copied().unwrap_or(0),
+                    samples: self.samples.get(k).cloned().unwrap_or_default(),
+                    last_seen_unix_ms: *seen,
+                    kill_floor_mem_bytes: self.kill_floors.get(k).copied().unwrap_or(0),
                 })
                 .collect(),
         };
@@ -140,8 +154,23 @@ impl Sizes {
         if list.len() > KEEP_SAMPLES {
             list.remove(0);
         }
+        // A run that got through says what the command needs again; the floor was for the run after a kill.
+        self.kill_floors.remove(key);
         self.last_seen_ms.insert(key.to_string(), now_ms);
         self.forget_stale(now_ms);
+    }
+
+    /// A run of `key` was killed for memory: its next run reserves at least `mem_bytes`, until one succeeds.
+    pub fn record_kill(&mut self, key: &str, mem_bytes: u64, now_ms: u64) {
+        let floor = self.kill_floors.entry(key.to_string()).or_default();
+        *floor = (*floor).max(mem_bytes);
+        self.last_seen_ms.insert(key.to_string(), now_ms);
+        self.forget_stale(now_ms);
+    }
+
+    /// The least a run of `key` reserves after an earlier run was killed for memory.
+    pub fn kill_floor(&self, key: &str) -> Option<u64> {
+        self.kill_floors.get(key).copied()
     }
 
     fn forget_stale(&mut self, now_ms: u64) {
@@ -153,16 +182,17 @@ impl Sizes {
             .collect();
         for k in stale {
             self.samples.remove(&k);
+            self.kill_floors.remove(&k);
             self.last_seen_ms.remove(&k);
         }
     }
 
     pub fn len(&self) -> usize {
-        self.samples.len()
+        self.last_seen_ms.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.samples.is_empty()
+        self.last_seen_ms.is_empty()
     }
 
     pub fn expected(&self, key: &str) -> Option<Learned> {
@@ -301,6 +331,39 @@ mod tests {
     }
 
     #[test]
+    fn a_kill_sets_a_floor_that_survives_a_save_until_a_run_succeeds() {
+        let mut s = Sizes::default();
+        s.record("k", run(2, 1), 1);
+        s.record_kill("k", 15, 2);
+        s.record_kill("k", 9, 3);
+        assert_eq!(
+            s.kill_floor("k"),
+            Some(15),
+            "a smaller later figure does not lower it"
+        );
+        s.record_kill("never-succeeded", 30, 4);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sizes.pb");
+        s.save(&path).unwrap();
+        let Read::Loaded(mut loaded) = Sizes::load(&path, 5) else {
+            panic!("a saved file loads");
+        };
+        assert_eq!(loaded.kill_floor("k"), Some(15));
+        assert_eq!(loaded.kill_floor("never-succeeded"), Some(30));
+        assert_eq!(loaded.expected("never-succeeded"), None);
+        assert_eq!(loaded.expected("k").unwrap().peak_mem_bytes, 2);
+        loaded.record("k", run(12, 1), 6);
+        assert_eq!(loaded.kill_floor("k"), None);
+        assert_eq!(loaded.kill_floor("never-succeeded"), Some(30));
+        loaded.record("other", run(1, 1), 6 + KEEP_KEY_MS);
+        assert_eq!(
+            loaded.kill_floor("never-succeeded"),
+            None,
+            "it expires like a key"
+        );
+    }
+
+    #[test]
     fn a_damaged_sizes_file_is_set_aside_and_a_file_without_dates_gets_a_lease() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("sizes.pb");
@@ -320,6 +383,7 @@ mod tests {
                     wall_ms: 0,
                 }],
                 last_seen_unix_ms: 0,
+                kill_floor_mem_bytes: 0,
             }],
         };
         fs::write(&path, undated.encode_to_vec()).unwrap();

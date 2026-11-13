@@ -63,6 +63,7 @@ impl Fixture {
         let dir = tempdir("crew-it-");
         let mut cfg = Config {
             min_free_mem_gib: 0,
+            kill_below_free_mem_gib: 0,
             watched_paths: vec![],
             min_free_disk_gib: Default::default(),
             tmp_root: dir.path().join("jobtmp").display().to_string(),

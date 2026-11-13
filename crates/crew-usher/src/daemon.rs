@@ -14,9 +14,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crew_proto::{
     Ack, Decision, DetachedAccepted, DetachedJob, DiskView, Envelope, Grant, IdleWatcher, JobDone,
-    JobKind, JobPhase, JobRequest, JobSummary, JobView, JobsReply, Limits, MachineView, OwnerSet,
-    OwnerSource, Queued, Refusal, RefusalReason, Reply, TopReply, WaitCondition, WaitOutcome,
-    WaitReply, WaitRequest, WaitingOn, envelope, reply,
+    JobKind, JobPhase, JobRequest, JobSummary, JobView, JobsReply, Limits, MachineView,
+    MemoryKilled, MemoryRetry, OwnerSet, OwnerSource, Queued, Refusal, RefusalReason, Reply,
+    TopReply, WaitCondition, WaitOutcome, WaitReply, WaitRequest, WaitingOn, envelope, reply,
 };
 use crew_sys::display::{self, Desktop};
 use crew_sys::idle::IdleEvent;
@@ -24,7 +24,7 @@ use crew_sys::machine;
 use crew_sys::procs;
 use crew_sys::scope::{self, KillSignal, ScopeLimits};
 
-use crate::admission::{self, Facts, Running, Verdict, Waiting};
+use crate::admission::{self, Facts, KillGate, Killable, Running, Verdict, Waiting};
 use crate::agents::{self, Agent, Collector, Planner};
 use crate::config::Config;
 use crate::detached::{self, Dirs};
@@ -290,6 +290,8 @@ struct QueuedJob {
     last_notice_ms: Option<u64>,
     position: u32,
     detail: String,
+    /// Set when the usher killed an earlier run of this job for memory.
+    retry: Option<MemoryRetry>,
 }
 
 struct RunningJob {
@@ -310,6 +312,17 @@ struct RunningJob {
     client: Option<(u32, u64)>,
     /// The scope has been seen to exist, so its absence now means the job is over.
     scope_seen: bool,
+    /// Set when an earlier run of this job was killed for memory.
+    retry: Option<MemoryRetry>,
+    /// The usher killed this run for memory; the job is queued again with this once the run ends.
+    memory_kill: Option<MemoryRetry>,
+}
+
+/// A queued `crew run` client of an earlier usher that may come back.
+#[derive(Clone, Copy, Debug)]
+struct Resubmit {
+    queued_at_ms: u64,
+    retry: Option<MemoryRetry>,
 }
 
 struct PendingWait {
@@ -450,8 +463,10 @@ pub struct Daemon {
     agents: Option<AgentWatch>,
     planner: Planner,
     pool: PoolHold,
-    /// Queued `crew run` clients of an earlier usher that may come back: id to first queue time.
-    resubmits: BTreeMap<String, u64>,
+    /// Queued `crew run` clients of an earlier usher that may come back, by id.
+    resubmits: BTreeMap<String, Resubmit>,
+    /// Where the last memory kill stands.
+    kill_gate: KillGate,
     /// The state file came from a usher that did not record queued clients, so their claimed queue time is believed.
     legacy_claims: bool,
     /// How often the job state was written, for tests.
@@ -508,6 +523,12 @@ fn worth_learning(done: &JobDone, min_wall_secs: u64) -> bool {
     done.exit_code == 0
         && done.peak_mem_bytes > 0
         && done.wall_ms >= min_wall_secs.saturating_mul(1000).max(1)
+}
+
+/// The retry a run that just ended gets: only one the usher killed for memory, that nobody cancelled, and that did not succeed first.
+fn retry_after(job: &RunningJob, exit_code: Option<i32>) -> Option<MemoryRetry> {
+    job.memory_kill
+        .filter(|_| job.cancel == Cancel::No && exit_code != Some(0))
 }
 
 /// The scope is gone and either was seen before or had time to appear.
@@ -606,6 +627,7 @@ impl Daemon {
             planner: Planner::default(),
             pool: PoolHold::default(),
             resubmits: BTreeMap::new(),
+            kill_gate: KillGate::Open,
             legacy_claims: false,
             #[cfg(test)]
             saves: std::cell::Cell::new(0),
@@ -878,13 +900,16 @@ impl Daemon {
 
     fn expectations(&self, req: &JobRequest, kind: JobKind) -> (u64, f64) {
         let spec = self.cfg.kind(kind);
-        let learned = self.sizes.expected(&sizes::key(req));
+        let key = sizes::key(req);
+        let learned = self.sizes.expected(&key);
         let declared = req.declared.unwrap_or_default();
+        // A run of this command that was killed for memory outweighs --mem and the learned median.
         let mem = expected_mem(
             spec.expected_mem,
             declared.mem_bytes,
             learned.map(|l| l.peak_mem_bytes),
-        );
+        )
+        .max(self.sizes.kill_floor(&key).unwrap_or(0));
         // What the caller asked for beats what earlier runs suggested.
         let cores = declared
             .cpus
@@ -903,15 +928,25 @@ impl Daemon {
         self.queue.insert(at, job);
     }
 
-    fn queued_job(&self, req: JobRequest, origin: Origin, queued_at_ms: u64) -> QueuedJob {
+    fn queued_job(
+        &self,
+        mut req: JobRequest,
+        origin: Origin,
+        queued_at_ms: u64,
+        retry: Option<MemoryRetry>,
+    ) -> QueuedJob {
+        if retry.is_some_and(|r| r.kills >= admission::ALONE_AFTER_KILLS) {
+            req.exclusive = true;
+        }
         let kind = JobKind::try_from(req.kind).unwrap_or(JobKind::Unspecified);
         let (expected_mem, expected_cores) = self.expectations(&req, kind);
         QueuedJob {
+            expected_mem: retry.map_or(expected_mem, |r| r.expected_mem_bytes),
+            retry,
             req,
             kind,
             origin,
             queued_at_ms,
-            expected_mem,
             expected_cores,
             waiting: WaitingOn::Unspecified,
             last_notice_ms: None,
@@ -951,7 +986,7 @@ impl Daemon {
             return;
         }
         let now = self.now_ms();
-        let at = self.resubmit_time(&req, now);
+        let (at, retry) = self.resubmit_time(&req, now);
         if at < now {
             self.log.line(&format!(
                 "RESUBMIT id={} queued {}s ago",
@@ -959,26 +994,27 @@ impl Daemon {
                 (now - at) / 1000
             ));
         }
-        let job = self.queued_job(req, Origin::Attached(conn), at);
+        let job = self.queued_job(req, Origin::Attached(conn), at, retry);
         self.insert_queued(job);
         self.persist();
     }
 
-    /// When a resubmitting client first queued: what an earlier usher recorded, never a client's own say-so.
-    fn resubmit_time(&mut self, req: &JobRequest, now: u64) -> u64 {
+    /// When a resubmitting client first queued, and its memory retry: what an earlier usher recorded, never a client's own say-so.
+    fn resubmit_time(&mut self, req: &JobRequest, now: u64) -> (u64, Option<MemoryRetry>) {
         if let Some(recorded) = self.resubmits.remove(&req.id) {
-            return recorded.min(now);
+            return (recorded.queued_at_ms.min(now), recorded.retry);
         }
         // A usher that predates the record keeps believing its clients, within bounds, for a short while.
         if self.legacy_claims
             && self.started.elapsed() < RESUBMIT_GRACE
             && req.queued_at_unix_ms > 0
         {
-            return req
+            let at = req
                 .queued_at_unix_ms
                 .clamp(now.saturating_sub(LEGACY_CLAIM_MAX_MS), now);
+            return (at, None);
         }
-        now
+        (now, None)
     }
 
     fn reject(conn: &Conn, message: String) {
@@ -1011,7 +1047,7 @@ impl Daemon {
         }
         req.log_path = log.display().to_string();
         let now = self.now_ms();
-        let job = self.queued_job(req.clone(), Origin::Detached(files), now);
+        let job = self.queued_job(req.clone(), Origin::Detached(files), now, None);
         self.log.line(&format!(
             "DETACH id={} kind={} project={} agent={} log={} cmd={:?}",
             req.id,
@@ -1181,8 +1217,15 @@ impl Daemon {
         now_ms: u64,
     ) {
         let job = &mut self.queue[at];
+        let detail = &match job.retry {
+            Some(r) => format!(
+                "{}; {detail}",
+                admission::retry_note(r.kills, r.peak_mem_bytes, r.expected_mem_bytes)
+            ),
+            None => detail.to_string(),
+        };
         job.position = position;
-        job.detail = detail.to_string();
+        job.detail = detail.clone();
         let changed = job.waiting != reason;
         let due = job
             .last_notice_ms
@@ -1250,7 +1293,11 @@ impl Daemon {
             || self.cfg.depot.find_mbx(),
         );
         let id = &job.req.id;
-        let scope_name = format!("crew-{}-{id}", job.kind.name());
+        // A rerun gets its own scope, so the kill gate can tell the killed run's end from the rerun; the id stays last for the temp sweep.
+        let scope_name = match job.retry {
+            Some(r) => format!("crew-{}-r{}-{id}", job.kind.name(), r.kills),
+            None => format!("crew-{}-{id}", job.kind.name()),
+        };
         let tmpdir = format!("{}/{id}", self.cfg.tmp_root.trim_end_matches('/'));
         let grant = Grant {
             job_id: job.req.id.clone(),
@@ -1291,6 +1338,8 @@ impl Daemon {
             cancel: Cancel::No,
             tmpdir: None,
             scope_seen: false,
+            retry: job.retry,
+            memory_kill: None,
             client: match &origin {
                 Origin::Attached(c) => c.pid.and_then(|pid| {
                     procs::read_start_ticks(Path::new("/proc"), pid).map(|t| (pid, t))
@@ -1416,6 +1465,24 @@ impl Daemon {
             return;
         };
         let job = self.running.remove(at);
+        if let Some(retry) = retry_after(&job, Some(done.exit_code)) {
+            self.finished_cpu_usec += done.cpu_usec;
+            self.stop_leftovers(&job.scope_name);
+            let id = job.req.id.clone();
+            self.log.line(&format!(
+                "RETRY id={id} exit={} kills={} mem={}MiB; its client runs it again once granted",
+                done.exit_code,
+                retry.kills,
+                retry.expected_mem_bytes >> 20
+            ));
+            self.requeue_killed(job, retry);
+            self.persist();
+            from.send(envelope::Body::MemoryKilled(MemoryKilled {
+                job_id: id,
+                retry: Some(retry),
+            }));
+            return;
+        }
         self.note_done(&job, done);
         self.stop_leftovers(&job.scope_name);
         self.persist();
@@ -1469,6 +1536,7 @@ impl Daemon {
                 r.scope_seen = true;
             }
         }
+        self.kill_for_memory();
         for line in self.pool.poll() {
             self.log.line(&line);
         }
@@ -1481,6 +1549,123 @@ impl Daemon {
         self.reschedule();
         self.adopt_dry_run();
         self.settle_waits();
+    }
+
+    /// Kills the newest restartable job when available memory runs critically low; it runs again later with more memory reserved.
+    fn kill_for_memory(&mut self) {
+        let now = self.now_ms();
+        self.kill_gate.advance(scope::alive, now);
+        let Ok(snap) = machine::snapshot(&[]) else {
+            return;
+        };
+        let candidates: Vec<Killable> = self
+            .running
+            .iter()
+            .map(|r| Killable {
+                id: r.req.id.clone(),
+                kind: r.kind,
+                exclusive: r.req.exclusive,
+                started_ms: r.started_ms,
+                has_scope: r.scope_seen,
+                ending: r.memory_kill.is_some() || r.cancel != Cancel::No,
+            })
+            .collect();
+        let Some(victim) = admission::memory_victim(
+            &self.cfg,
+            snap.mem_available,
+            now,
+            &self.kill_gate,
+            &candidates,
+        ) else {
+            return;
+        };
+        let Some(at) = self.running.iter().position(|r| r.req.id == victim.id) else {
+            return;
+        };
+        let ours: u64 = self.running.iter().map(|r| r.stats.mem_current).sum();
+        let rest = snap
+            .mem_total
+            .saturating_sub(snap.mem_available)
+            .saturating_sub(ours);
+        let r = &mut self.running[at];
+        let peak = r.stats.peak_worth_learning();
+        let retry = MemoryRetry {
+            kills: r.retry.map_or(0, |x| x.kills) + 1,
+            expected_mem_bytes: admission::retry_mem(
+                r.expected_mem,
+                peak,
+                snap.mem_total.saturating_sub(self.cfg.min_free_mem()),
+            ),
+            peak_mem_bytes: peak,
+        };
+        let fate = match &r.origin {
+            Origin::Adopted => {
+                // No client is left to run it again: it is cancelled as `crew cancel` would.
+                let asked = Cancel::Terminated {
+                    at_ms: now,
+                    sent: false,
+                };
+                let (next, signal) = next_signal(asked, now, scope::alive(&r.scope_name));
+                r.cancel = next;
+                if let Some(signal) = signal {
+                    scope::kill(&r.scope_name, signal);
+                }
+                "adopted from an earlier usher with no client to rerun it: cancelled, not retried"
+            }
+            Origin::Attached(_) => {
+                r.memory_kill = Some(retry);
+                scope::kill(&r.scope_name, KillSignal::Kill);
+                "its client runs it again"
+            }
+            Origin::Detached(files) => {
+                r.memory_kill = Some(retry);
+                scope::kill(&r.scope_name, KillSignal::Kill);
+                if let Ok(mut log) = open_log(&files.log) {
+                    let _ = writeln!(
+                        log,
+                        "\ncrew: the usher killed this job because memory ran low ({} available, below {}); it reached {} and will run again with {} reserved (kill {})",
+                        admission::gib1(snap.mem_available),
+                        admission::gib1(self.cfg.kill_below_free_mem()),
+                        admission::gib1(peak),
+                        admission::gib1(retry.expected_mem_bytes),
+                        retry.kills
+                    );
+                }
+                "the usher runs it again"
+            }
+        };
+        self.kill_gate = KillGate::Dying {
+            scope: r.scope_name.clone(),
+        };
+        self.log.line(&format!(
+            "KILL id={} kind={} project={} peak={}MiB mem_available={}MiB below={}MiB crew_jobs={}MiB rest_of_machine={}MiB kills={} next_mem={}MiB; {fate} cmd={:?}",
+            r.req.id,
+            r.kind.name(),
+            r.req.project,
+            peak >> 20,
+            snap.mem_available >> 20,
+            self.cfg.kill_below_free_mem() >> 20,
+            ours >> 20,
+            rest >> 20,
+            retry.kills,
+            retry.expected_mem_bytes >> 20,
+            command_of(&r.req),
+        ));
+        let key = sizes::key(&r.req);
+        self.sizes.record_kill(&key, retry.expected_mem_bytes, now);
+        if let Err(e) = self.sizes.save(&self.sizes_path) {
+            self.log.line(&format!("WARN could not save sizes: {e}"));
+        }
+        self.persist();
+    }
+
+    /// Puts a run killed for memory back in the queue under its id and first queue time, with its new reservation.
+    fn requeue_killed(&mut self, job: RunningJob, retry: MemoryRetry) {
+        if let Some(dir) = &job.tmpdir {
+            let _ = fs::remove_dir_all(dir);
+        }
+        let queued = self.queued_job(job.req, job.origin, job.queued_at_ms, Some(retry));
+        self.insert_queued(queued);
     }
 
     fn job_tmpdir(&self, id: &str) -> PathBuf {
@@ -1731,8 +1916,9 @@ impl Daemon {
         let running = self
             .running
             .iter()
-            .map(|r| {
-                view(
+            .map(|r| JobView {
+                retry: r.retry,
+                ..view(
                     &r.req,
                     r.kind,
                     r.expected_mem,
@@ -1749,6 +1935,7 @@ impl Daemon {
             .map(|q| JobView {
                 starts_in_ms: starts.get(&q.req.id).copied(),
                 detail: q.detail.clone(),
+                retry: q.retry,
                 ..view(
                     &q.req,
                     q.kind,
@@ -1840,6 +2027,7 @@ impl Daemon {
         DetachedJob {
             expected_mem_bytes: q.expected_mem,
             expected_cores_milli: (q.expected_cores * 1000.0) as u32,
+            retry: q.retry,
             ..self.base_record(&q.req, q.origin.files(), q.queued_at_ms, JobPhase::Queued)
         }
     }
@@ -1858,6 +2046,8 @@ impl Daemon {
                 .unwrap_or_default(),
             client_pid: r.client.map_or(0, |c| c.0),
             client_start_ticks: r.client.map_or(0, |c| c.1),
+            retry: r.memory_kill.or(r.retry),
+            memory_killed: r.memory_kill.is_some(),
             ..self.base_record(&r.req, r.origin.files(), r.queued_at_ms, JobPhase::Running)
         }
     }
@@ -1869,14 +2059,15 @@ impl Daemon {
         let mut jobs = self.finished.clone();
         jobs.extend(self.running.iter().map(|r| self.running_record(r)));
         jobs.extend(self.queue.iter().map(|q| self.queued_record(q)));
-        for (id, queued_at) in &self.resubmits {
+        for (id, r) in &self.resubmits {
             jobs.push(DetachedJob {
                 request: Some(JobRequest {
                     id: id.clone(),
                     ..JobRequest::default()
                 }),
                 phase: JobPhase::Queued as i32,
-                queued_at_unix_ms: *queued_at,
+                queued_at_unix_ms: r.queued_at_ms,
+                retry: r.retry,
                 attached: true,
                 ..DetachedJob::default()
             });
@@ -1957,7 +2148,13 @@ impl Daemon {
             if rec.attached {
                 match phase {
                     JobPhase::Queued => {
-                        self.resubmits.insert(req.id.clone(), rec.queued_at_unix_ms);
+                        self.resubmits.insert(
+                            req.id.clone(),
+                            Resubmit {
+                                queued_at_ms: rec.queued_at_unix_ms,
+                                retry: rec.retry,
+                            },
+                        );
                         waiting += 1;
                     }
                     JobPhase::Running if self.scope_still_there(&rec, None) => {
@@ -1980,7 +2177,12 @@ impl Daemon {
             };
             match phase {
                 JobPhase::Queued => {
-                    let job = self.queued_job(req, Origin::Detached(files), rec.queued_at_unix_ms);
+                    let job = self.queued_job(
+                        req,
+                        Origin::Detached(files),
+                        rec.queued_at_unix_ms,
+                        rec.retry,
+                    );
                     self.queue.push(job);
                     queued += 1;
                 }
@@ -1988,6 +2190,19 @@ impl Daemon {
                     self.running
                         .push(self.adopted_job(req, &rec, Origin::Detached(files)));
                     adopted += 1;
+                }
+                JobPhase::Running
+                    if rec.memory_killed && scope::read_status(&files.status) != Some(0) =>
+                {
+                    // It was killed for memory just before the usher went down.
+                    let job = self.queued_job(
+                        req,
+                        Origin::Detached(files),
+                        rec.queued_at_unix_ms,
+                        rec.retry,
+                    );
+                    self.queue.push(job);
+                    queued += 1;
                 }
                 JobPhase::Running => {
                     // The job ended while no usher was watching: its wrapper's status file still says how.
@@ -2042,6 +2257,8 @@ impl Daemon {
             tmpdir: (!rec.tmpdir.is_empty()).then(|| PathBuf::from(&rec.tmpdir)),
             client: (rec.client_pid > 0).then_some((rec.client_pid, rec.client_start_ticks)),
             scope_seen: scope::alive(&rec.scope_name),
+            retry: rec.retry,
+            memory_kill: rec.retry.filter(|_| rec.memory_killed),
         }
     }
 
@@ -2061,6 +2278,17 @@ impl Daemon {
         self.stop_leftovers(&job.scope_name);
         // The wrapper's status file is the job's own word; the process exit alone cannot tell the job from a failed systemd-run.
         let reported = scope::read_status(&files.status);
+        if let Some(retry) = retry_after(&job, reported) {
+            self.finished_cpu_usec += job.stats.cpu_usec;
+            self.log.line(&format!(
+                "RETRY id={id} exit={reported:?} kills={} mem={}MiB; the usher runs it again once granted",
+                retry.kills,
+                retry.expected_mem_bytes >> 20
+            ));
+            self.requeue_killed(job, retry);
+            self.persist();
+            return;
+        }
         if let Some(exit_code) = reported {
             let done = JobDone {
                 job_id: id.to_string(),
@@ -2236,6 +2464,7 @@ impl Daemon {
                 started_at_unix_ms: 0,
                 finished_at_unix_ms: 0,
                 starts_in_ms: starts.get(&q.req.id).copied(),
+                retry: q.retry,
             }
         });
         let running = self.running.iter().map(|r| {
@@ -2260,6 +2489,7 @@ impl Daemon {
                 started_at_unix_ms: r.started_ms,
                 finished_at_unix_ms: 0,
                 starts_in_ms: None,
+                retry: r.retry,
             }
         });
         let finished = self.finished.iter().rev().map(detached::summary);
@@ -2363,6 +2593,262 @@ mod tests {
             daemon.saves.get(),
             1,
             "a crash between two writes would lose the records not yet restored"
+        );
+    }
+
+    fn daemon_in(state: &Path) -> Daemon {
+        let paths = StatePaths {
+            sizes: state.join("usher-sizes.pb"),
+            owner: state.join("usher-owner.pb"),
+            jobs: state.join("usher-jobs.pb"),
+            job_logs: state.join("jobs"),
+        };
+        let cfg = Config {
+            tmp_root: state.join("jobtmp").display().to_string(),
+            ..Config::default()
+        };
+        let (events, _rx) = mpsc::channel();
+        Daemon::new(cfg, paths, Arc::new(Log::sink()), events)
+    }
+
+    fn request(id: &str) -> JobRequest {
+        JobRequest {
+            id: id.into(),
+            kind: JobKind::Build as i32,
+            argv: vec!["cargo".into(), "build".into()],
+            project: "p".into(),
+            ..JobRequest::default()
+        }
+    }
+
+    fn detached_origin(state: &Path, id: &str) -> Origin {
+        Origin::Detached(Files {
+            log: state.join(format!("{id}.log")),
+            status: state.join(format!("{id}.status")),
+        })
+    }
+
+    fn queued(d: &Daemon, id: &str, origin: Origin, at_ms: u64) -> QueuedJob {
+        d.queued_job(request(id), origin, at_ms, None)
+    }
+
+    /// A running job the usher has killed for memory, as `kill_for_memory` leaves it.
+    fn killed(id: &str, origin: Origin, queued_at_ms: u64, retry: MemoryRetry) -> RunningJob {
+        RunningJob {
+            req: request(id),
+            kind: JobKind::Build,
+            origin,
+            scope_name: format!("crew-build-{id}-gone"),
+            queued_at_ms,
+            started_ms: queued_at_ms + 1,
+            expected_mem: 2 * GIB,
+            expected_cores: 4.0,
+            base_limits: Limits::default(),
+            stats: scope::Stats::default(),
+            watch: Watch::Child,
+            cancel: Cancel::No,
+            tmpdir: None,
+            client: None,
+            scope_seen: true,
+            retry: None,
+            memory_kill: Some(retry),
+        }
+    }
+
+    fn retry(kills: u32, mem: u64) -> MemoryRetry {
+        MemoryRetry {
+            kills,
+            expected_mem_bytes: mem,
+            peak_mem_bytes: mem * 2 / 3,
+        }
+    }
+
+    fn queue_ids(d: &Daemon) -> Vec<&str> {
+        d.queue.iter().map(|q| q.req.id.as_str()).collect()
+    }
+
+    #[test]
+    fn a_detached_job_killed_for_memory_returns_to_its_place_under_its_id_and_survives_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path();
+        let mut d = daemon_in(state);
+        let before = queued(&d, "before", detached_origin(state, "before"), 100);
+        let after = queued(&d, "after", detached_origin(state, "after"), 300);
+        d.insert_queued(before);
+        d.insert_queued(after);
+        d.running.push(killed(
+            "victim",
+            detached_origin(state, "victim"),
+            200,
+            retry(1, 15 * GIB),
+        ));
+
+        d.end_detached("victim", Exit::Signal(9));
+
+        assert!(d.running.is_empty());
+        assert_eq!(queue_ids(&d), ["before", "victim", "after"]);
+        let q = &d.queue[1];
+        assert_eq!((q.queued_at_ms, q.expected_mem), (200, 15 * GIB));
+        assert_eq!(q.retry.map(|r| r.kills), Some(1));
+        assert!(!q.req.exclusive, "one kill does not make it run alone");
+        assert!(d.finished.is_empty(), "it is not over");
+
+        let restored = daemon_in(state);
+        assert_eq!(queue_ids(&restored), ["before", "victim", "after"]);
+        let q = &restored.queue[1];
+        assert_eq!((q.queued_at_ms, q.expected_mem), (200, 15 * GIB));
+        assert_eq!(q.retry.map(|r| r.kills), Some(1));
+        assert!(matches!(q.origin, Origin::Detached(_)));
+    }
+
+    #[test]
+    fn after_its_second_kill_a_job_runs_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path();
+        let mut d = daemon_in(state);
+        d.running.push(killed(
+            "twice",
+            detached_origin(state, "twice"),
+            5,
+            retry(2, 9 * GIB),
+        ));
+        d.end_detached("twice", Exit::Signal(9));
+        assert!(d.queue[0].req.exclusive);
+        assert!(
+            daemon_in(state).queue[0].req.exclusive,
+            "and still after a restart"
+        );
+    }
+
+    #[test]
+    fn a_killed_run_that_was_cancelled_or_had_already_succeeded_is_not_run_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path();
+        let mut d = daemon_in(state);
+        let mut cancelled = killed(
+            "cancelled",
+            detached_origin(state, "cancelled"),
+            1,
+            retry(1, GIB),
+        );
+        cancelled.cancel = Cancel::Killed;
+        d.running.push(cancelled);
+        d.end_detached("cancelled", Exit::Signal(9));
+        std::fs::write(state.join("done.status"), "0\n").unwrap();
+        d.running.push(killed(
+            "done",
+            detached_origin(state, "done"),
+            2,
+            retry(1, GIB),
+        ));
+        d.end_detached("done", Exit::Code(0));
+        assert!(d.queue.is_empty());
+        let phases: Vec<JobPhase> = d.finished.iter().map(detached::phase).collect();
+        assert_eq!(phases, [JobPhase::Cancelled, JobPhase::Exited]);
+    }
+
+    #[test]
+    fn an_attached_client_is_told_on_its_socket_and_keeps_its_job_and_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = daemon_in(dir.path());
+        let (ours, mut theirs) = UnixStream::pair().unwrap();
+        let conn = Conn::new(ours).unwrap();
+        let earlier = queued(&d, "earlier", detached_origin(dir.path(), "earlier"), 10);
+        d.insert_queued(earlier);
+        d.running.push(killed(
+            "attached",
+            Origin::Attached(conn.clone()),
+            50,
+            retry(1, 6 * GIB),
+        ));
+        let done = JobDone {
+            job_id: "attached".into(),
+            exit_code: 137,
+            ..JobDone::default()
+        };
+
+        d.finish(&done, &conn);
+
+        assert_eq!(queue_ids(&d), ["earlier", "attached"]);
+        assert_eq!(d.queue[1].queued_at_ms, 50);
+        assert!(matches!(&d.queue[1].origin, Origin::Attached(c) if c.same(&conn)));
+        match crew_proto::read_frame(&mut theirs).unwrap().unwrap().body {
+            Some(envelope::Body::MemoryKilled(m)) => {
+                assert_eq!(m.job_id, "attached");
+                assert_eq!(m.retry, Some(retry(1, 6 * GIB)));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(
+            d.sizes
+                .expected(&sizes::key(&request("attached")))
+                .is_none(),
+            "a killed run teaches no sample"
+        );
+    }
+
+    #[test]
+    fn a_killed_attached_job_queued_when_the_usher_restarts_keeps_its_retry_when_its_client_returns()
+     {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path();
+        let mut d = daemon_in(state);
+        let (ours, _theirs) = UnixStream::pair().unwrap();
+        let conn = Conn::new(ours).unwrap();
+        d.running.push(killed(
+            "attached",
+            Origin::Attached(conn.clone()),
+            70,
+            retry(2, 7 * GIB),
+        ));
+        d.finish(
+            &JobDone {
+                job_id: "attached".into(),
+                exit_code: 137,
+                ..JobDone::default()
+            },
+            &conn,
+        );
+        drop(d);
+
+        let mut restored = daemon_in(state);
+        assert!(
+            restored.queue.is_empty(),
+            "attached jobs wait for their client"
+        );
+        let (ours, _theirs) = UnixStream::pair().unwrap();
+        restored.enqueue(request("attached"), Conn::new(ours).unwrap());
+        let q = &restored.queue[0];
+        assert_eq!((q.queued_at_ms, q.expected_mem), (70, 7 * GIB));
+        assert_eq!(q.retry.map(|r| r.kills), Some(2));
+        assert!(q.req.exclusive, "its second kill makes it run alone");
+    }
+
+    #[test]
+    fn a_learned_kill_floor_starts_the_next_submission_there_even_over_a_smaller_mem() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = daemon_in(dir.path());
+        let key = sizes::key(&request("x"));
+        d.sizes.record_kill(&key, 30 * GIB, 1);
+        let mut small = request("x");
+        small.declared = Some(Limits {
+            mem_bytes: Some(4 * GIB),
+            ..Limits::default()
+        });
+        assert_eq!(d.expectations(&small, JobKind::Build).0, 30 * GIB);
+        d.sizes.record(
+            &key,
+            sizes::Learned {
+                peak_mem_bytes: 3 * GIB,
+                cores_milli: 1000,
+                wall_ms: Some(60_000),
+            },
+            2,
+        );
+        assert_eq!(
+            d.expectations(&small, JobKind::Build).0,
+            4 * GIB,
+            "a run that got through lifts the floor"
         );
     }
 

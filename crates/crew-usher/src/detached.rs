@@ -138,6 +138,7 @@ pub fn summary(job: &DetachedJob) -> JobSummary {
         queued_at_unix_ms: job.queued_at_unix_ms,
         started_at_unix_ms: job.started_at_unix_ms,
         finished_at_unix_ms: job.finished_at_unix_ms,
+        retry: job.retry,
         starts_in_ms: None,
     }
 }

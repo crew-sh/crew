@@ -164,6 +164,8 @@ message JobView {
   optional uint64 starts_in_ms = 13;
   // Queued jobs: what the wait is, with the numbers.
   string detail = 14;
+  // Set when the usher killed an earlier run of this job for memory.
+  MemoryRetry retry = 15;
 }
 
 message DiskView {
@@ -330,7 +332,24 @@ message Envelope {
     JobsReply jobs_reply = 12;
     CancelRequest cancel_request = 13;
     InsideJobRequest inside_job_request = 14;
+    MemoryKilled memory_killed = 15;
   }
+}
+
+// A job the usher killed because memory ran low, and queued again under its id and first queue time.
+message MemoryRetry {
+  // How many of its runs the usher killed for memory.
+  uint32 kills = 1;
+  // What its next run reserves: the larger of the killed run's reservation and 1.5 times its peak; beats --mem.
+  uint64 expected_mem_bytes = 2;
+  // The working-set peak the last killed run reached.
+  uint64 peak_mem_bytes = 3;
+}
+
+// The answer to a `crew run` client's JobDone when the usher killed that run for memory: the job is queued again on this connection, so the client waits for a new grant and runs the command again.
+message MemoryKilled {
+  string job_id = 1;
+  MemoryRetry retry = 2;
 }
 
 // Asks whether the caller runs inside the named running job; the answer comes from the pid the kernel reports.
@@ -377,6 +396,8 @@ message JobSummary {
   uint64 finished_at_unix_ms = 15;
   // Queued jobs: when the job is expected to start, from learned durations; unset when that is unknown.
   optional uint64 starts_in_ms = 16;
+  // Set when the usher killed an earlier run of this job for memory.
+  MemoryRetry retry = 17;
 }
 
 message JobsReply {
@@ -410,6 +431,10 @@ message DetachedJob {
   // The `crew run` process that holds an attached job, and its start time (clock ticks), so a restarted usher can tell when it died.
   uint32 client_pid = 16;
   uint64 client_start_ticks = 17;
+  // Set once the usher killed one of its runs for memory; for a killed run that has not ended yet, the retry it gets.
+  MemoryRetry retry = 18;
+  // The running job was killed for memory and is queued again once it ends.
+  bool memory_killed = 19;
 }
 
 message JobsFile {
@@ -429,6 +454,8 @@ message SizeEntry {
   repeated SizeSample samples = 2;
   // When a run of this command last taught the usher something; zero in files from before keys expired.
   uint64 last_seen_unix_ms = 3;
+  // What a run killed for memory set for the next one: no less is reserved until a run succeeds; zero for none.
+  uint64 kill_floor_mem_bytes = 4;
 }
 
 message SizesFile {

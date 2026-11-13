@@ -82,7 +82,7 @@ fn gib(bytes: u64) -> u64 {
     bytes / GIB
 }
 
-fn gib1(bytes: u64) -> String {
+pub(crate) fn gib1(bytes: u64) -> String {
     format!("{:.1} GiB", bytes as f64 / GIB as f64)
 }
 
@@ -395,6 +395,98 @@ pub fn schedule(cfg: &Config, facts: &Facts, running: &[Running], queue: &[Waiti
         verdicts,
         draining_for,
     }
+}
+
+/// How long a killed job's memory gets to come back after its scope ends before the usher may kill again.
+pub const KILL_SETTLE_MS: u64 = 5_000;
+/// A job killed for memory this many times runs alone from then on.
+pub const ALONE_AFTER_KILLS: u32 = 2;
+
+/// Where the last memory kill stands: one kill at a time, and none until its memory is back.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum KillGate {
+    #[default]
+    Open,
+    /// The killed job's scope still exists.
+    Dying { scope: String },
+    /// The scope ended at this time.
+    Settling { since_ms: u64 },
+}
+
+impl KillGate {
+    /// Moves on once the killed scope is gone.
+    pub fn advance(&mut self, scope_alive: impl Fn(&str) -> bool, now_ms: u64) {
+        if let Self::Dying { scope } = self
+            && !scope_alive(scope)
+        {
+            *self = Self::Settling { since_ms: now_ms };
+        }
+    }
+
+    fn open(&self, now_ms: u64) -> bool {
+        match self {
+            Self::Open => true,
+            Self::Dying { .. } => false,
+            Self::Settling { since_ms } => now_ms.saturating_sub(*since_ms) >= KILL_SETTLE_MS,
+        }
+    }
+}
+
+/// A running job as the memory kill sees it.
+#[derive(Clone, Debug)]
+pub struct Killable {
+    pub id: String,
+    pub kind: JobKind,
+    /// The job asked to run alone (`--exclusive`), or runs alone after earlier kills.
+    pub exclusive: bool,
+    pub started_ms: u64,
+    /// Its scope has been seen; a job still starting holds nothing a kill would free.
+    pub has_scope: bool,
+    /// Already on its way out: killed before, or cancelled.
+    pub ending: bool,
+}
+
+/// The job to kill when available memory is under `kill_below_free_mem_gib`: the newest running one of a restartable kind that does not run alone.
+pub fn memory_victim<'a>(
+    cfg: &Config,
+    mem_available: u64,
+    now_ms: u64,
+    gate: &KillGate,
+    running: &'a [Killable],
+) -> Option<&'a Killable> {
+    if mem_available >= cfg.kill_below_free_mem() || !gate.open(now_ms) {
+        return None;
+    }
+    running
+        .iter()
+        .filter(|k| {
+            k.has_scope
+                && !k.ending
+                && cfg.kind(k.kind).restartable
+                && !runs_alone(cfg, k.kind, k.exclusive)
+        })
+        .max_by_key(|k| k.started_ms)
+}
+
+/// What a job killed for memory reserves next: 1.5 times the peak it reached, never less than before, never more than the machine admits.
+pub fn retry_mem(previous: u64, peak: u64, ceiling: u64) -> u64 {
+    previous
+        .max(peak.saturating_mul(3) / 2)
+        .min(ceiling.max(previous))
+}
+
+/// The part of a retried job's wait detail that says why it is back in the queue.
+pub fn retry_note(kills: u32, peak: u64, expected_mem: u64) -> String {
+    let alone = if kills >= ALONE_AFTER_KILLS {
+        ", alone"
+    } else {
+        ""
+    };
+    format!(
+        "killed {kills}x for memory (peak {}); reruns with {} reserved{alone}",
+        gib1(peak),
+        gib1(expected_mem)
+    )
 }
 
 /// When each waiting job should start, in ms from now, by replaying admission as running jobs end at their learned durations.
@@ -1155,6 +1247,176 @@ mod tests {
             "{}",
             detail(&v[1])
         );
+    }
+
+    fn killable(id: &str, kind: JobKind, started_ms: u64) -> Killable {
+        Killable {
+            id: id.into(),
+            kind,
+            exclusive: false,
+            started_ms,
+            has_scope: true,
+            ending: false,
+        }
+    }
+
+    fn victim(
+        cfg: &Config,
+        avail_gib: u64,
+        gate: &KillGate,
+        running: &[Killable],
+    ) -> Option<String> {
+        memory_victim(cfg, avail_gib * GIB, 100 * MIN, gate, running).map(|k| k.id.clone())
+    }
+
+    #[test]
+    fn low_memory_kills_the_newest_restartable_job_and_nothing_else() {
+        let cfg = Config::default();
+        let running = [
+            killable("old-build", JobKind::Build, MIN),
+            killable("new-test", JobKind::Test, 3 * MIN),
+            killable("newer-harness", JobKind::Harness, 4 * MIN),
+            killable("newest-game", JobKind::Game, 5 * MIN),
+            Killable {
+                exclusive: true,
+                ..killable("newest-exclusive-build", JobKind::Build, 6 * MIN)
+            },
+        ];
+        assert_eq!(
+            victim(&cfg, 2, &KillGate::Open, &running).as_deref(),
+            Some("new-test")
+        );
+        assert_eq!(
+            victim(&cfg, 3, &KillGate::Open, &running),
+            None,
+            "3 GiB is not below 3"
+        );
+        assert_eq!(victim(&cfg, 40, &KillGate::Open, &running), None);
+        assert_eq!(
+            victim(&cfg, 2, &KillGate::Open, &running[2..]),
+            None,
+            "harness, game and exclusive jobs are never killed"
+        );
+    }
+
+    #[test]
+    fn a_job_still_starting_or_already_ending_is_passed_over() {
+        let cfg = Config::default();
+        let running = [
+            killable("older", JobKind::Build, MIN),
+            Killable {
+                ending: true,
+                ..killable("killed-before", JobKind::Build, 2 * MIN)
+            },
+            Killable {
+                has_scope: false,
+                ..killable("starting", JobKind::Build, 3 * MIN)
+            },
+        ];
+        assert_eq!(
+            victim(&cfg, 1, &KillGate::Open, &running).as_deref(),
+            Some("older")
+        );
+    }
+
+    #[test]
+    fn a_kind_made_restartable_or_not_in_the_file_is_obeyed() {
+        let cfg: Config = toml::from_str(
+            "[kinds.test]\nrestartable = false\n[kinds.harness]\nrestartable = true\n",
+        )
+        .unwrap();
+        let running = [
+            killable("h", JobKind::Harness, MIN),
+            killable("t", JobKind::Test, 2 * MIN),
+        ];
+        assert_eq!(
+            victim(&cfg, 1, &KillGate::Open, &running).as_deref(),
+            Some("h")
+        );
+        let exclusive_kind: Config = toml::from_str("[kinds.build]\nexclusive = true\n").unwrap();
+        assert_eq!(
+            victim(
+                &exclusive_kind,
+                1,
+                &KillGate::Open,
+                &[killable("b", JobKind::Build, MIN)]
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn zero_never_kills() {
+        let cfg = Config {
+            kill_below_free_mem_gib: 0,
+            ..Config::default()
+        };
+        assert_eq!(
+            victim(
+                &cfg,
+                0,
+                &KillGate::Open,
+                &[killable("b", JobKind::Build, MIN)]
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn one_kill_at_a_time_and_none_until_its_memory_had_time_to_come_back() {
+        let cfg = Config::default();
+        let running = [killable("b", JobKind::Build, MIN)];
+        let now = 100 * MIN;
+        let mut gate = KillGate::Dying {
+            scope: "crew-build-x".into(),
+        };
+        assert_eq!(
+            victim(&cfg, 1, &gate, &running),
+            None,
+            "its scope is still there"
+        );
+        gate.advance(|_| true, now);
+        assert_eq!(victim(&cfg, 1, &gate, &running), None);
+        gate.advance(|s| s != "crew-build-x", now - KILL_SETTLE_MS + 1);
+        assert!(matches!(gate, KillGate::Settling { .. }));
+        assert_eq!(victim(&cfg, 1, &gate, &running), None, "still settling");
+        gate.advance(|_| true, now);
+        assert!(
+            matches!(gate, KillGate::Settling { .. }),
+            "settling does not go back to dying"
+        );
+        let settled = KillGate::Settling {
+            since_ms: now - KILL_SETTLE_MS,
+        };
+        assert_eq!(victim(&cfg, 1, &settled, &running).as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn a_retry_reserves_half_again_its_peak_but_never_less_than_before() {
+        let ceiling = 46 * GIB;
+        assert_eq!(retry_mem(2 * GIB, 10 * GIB, ceiling), 15 * GIB);
+        assert_eq!(
+            retry_mem(20 * GIB, 10 * GIB, ceiling),
+            20 * GIB,
+            "a larger earlier figure, from --mem or a learned size, stays"
+        );
+        assert_eq!(
+            retry_mem(4 * GIB, 40 * GIB, ceiling),
+            46 * GIB,
+            "no more than the machine admits, so it is not refused as too large"
+        );
+        assert_eq!(retry_mem(50 * GIB, 60 * GIB, ceiling), 50 * GIB);
+    }
+
+    #[test]
+    fn a_retry_note_names_the_kills_the_peak_and_the_new_size() {
+        let note = retry_note(1, 10 * GIB, 15 * GIB);
+        assert!(
+            note.contains("1x") && note.contains("10.0 GiB") && note.contains("15.0 GiB"),
+            "{note}"
+        );
+        assert!(!note.contains("alone"), "{note}");
+        assert!(retry_note(ALONE_AFTER_KILLS, GIB, GIB).contains("alone"));
     }
 
     #[test]
