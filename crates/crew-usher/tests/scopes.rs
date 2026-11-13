@@ -1252,12 +1252,10 @@ fn run_ids(runs: &Path) -> Vec<String> {
 }
 
 #[test]
-fn a_crew_run_killed_for_memory_runs_again_under_its_id_and_alone_after_two_kills() {
+fn a_crew_run_killed_for_memory_runs_again_under_its_id() {
     let Some(f) = Fixture::start(|c| c.kill_below_free_mem_gib = ALWAYS_LOW_GIB) else {
         return;
     };
-    // The third run is exclusive, and exclusive jobs run only while the owner is away.
-    f.client.set_owner(OwnerArg::Away).unwrap();
     let runs = f.root().join("runs");
     let code = f
         .client

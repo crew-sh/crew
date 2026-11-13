@@ -930,14 +930,11 @@ impl Daemon {
 
     fn queued_job(
         &self,
-        mut req: JobRequest,
+        req: JobRequest,
         origin: Origin,
         queued_at_ms: u64,
         retry: Option<MemoryRetry>,
     ) -> QueuedJob {
-        if retry.is_some_and(|r| r.kills >= admission::ALONE_AFTER_KILLS) {
-            req.exclusive = true;
-        }
         let kind = JobKind::try_from(req.kind).unwrap_or(JobKind::Unspecified);
         let (expected_mem, expected_cores) = self.expectations(&req, kind);
         QueuedJob {
@@ -2702,7 +2699,7 @@ mod tests {
     }
 
     #[test]
-    fn after_its_second_kill_a_job_runs_alone() {
+    fn repeated_kills_raise_the_reservation_but_never_make_a_job_wait_for_the_owner() {
         let dir = tempfile::tempdir().unwrap();
         let state = dir.path();
         let mut d = daemon_in(state);
@@ -2713,11 +2710,13 @@ mod tests {
             retry(2, 9 * GIB),
         ));
         d.end_detached("twice", Exit::Signal(9));
-        assert!(d.queue[0].req.exclusive);
-        assert!(
-            daemon_in(state).queue[0].req.exclusive,
-            "and still after a restart"
-        );
+        let q = &d.queue[0];
+        assert!(!q.req.exclusive);
+        assert_eq!(q.retry.map(|r| r.kills), Some(2));
+        assert!(q.expected_mem >= 9 * GIB);
+        let restored = daemon_in(state);
+        assert!(!restored.queue[0].req.exclusive, "and not after a restart");
+        assert_eq!(restored.queue[0].retry.map(|r| r.kills), Some(2));
     }
 
     #[test]
@@ -2821,7 +2820,10 @@ mod tests {
         let q = &restored.queue[0];
         assert_eq!((q.queued_at_ms, q.expected_mem), (70, 7 * GIB));
         assert_eq!(q.retry.map(|r| r.kills), Some(2));
-        assert!(q.req.exclusive, "its second kill makes it run alone");
+        assert!(
+            !q.req.exclusive,
+            "kills never make a job wait for the owner to leave"
+        );
     }
 
     #[test]

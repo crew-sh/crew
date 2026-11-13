@@ -399,8 +399,6 @@ pub fn schedule(cfg: &Config, facts: &Facts, running: &[Running], queue: &[Waiti
 
 /// How long a killed job's memory gets to come back after its scope ends before the usher may kill again.
 pub const KILL_SETTLE_MS: u64 = 5_000;
-/// A job killed for memory this many times runs alone from then on.
-pub const ALONE_AFTER_KILLS: u32 = 2;
 
 /// Where the last memory kill stands: one kill at a time, and none until its memory is back.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -437,7 +435,7 @@ impl KillGate {
 pub struct Killable {
     pub id: String,
     pub kind: JobKind,
-    /// The job asked to run alone (`--exclusive`), or runs alone after earlier kills.
+    /// The job asked to run alone (`--exclusive`).
     pub exclusive: bool,
     pub started_ms: u64,
     /// Its scope has been seen; a job still starting holds nothing a kill would free.
@@ -477,13 +475,8 @@ pub fn retry_mem(previous: u64, peak: u64, ceiling: u64) -> u64 {
 
 /// The part of a retried job's wait detail that says why it is back in the queue.
 pub fn retry_note(kills: u32, peak: u64, expected_mem: u64) -> String {
-    let alone = if kills >= ALONE_AFTER_KILLS {
-        ", alone"
-    } else {
-        ""
-    };
     format!(
-        "killed {kills}x for memory (peak {}); reruns with {} reserved{alone}",
+        "killed {kills}x for memory (peak {}); reruns with {} reserved",
         gib1(peak),
         gib1(expected_mem)
     )
@@ -1415,8 +1408,6 @@ mod tests {
             note.contains("1x") && note.contains("10.0 GiB") && note.contains("15.0 GiB"),
             "{note}"
         );
-        assert!(!note.contains("alone"), "{note}");
-        assert!(retry_note(ALONE_AFTER_KILLS, GIB, GIB).contains("alone"));
     }
 
     #[test]
