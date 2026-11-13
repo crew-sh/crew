@@ -90,8 +90,8 @@ const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 type Open = Arc<Mutex<HashMap<u64, UnixStream>>>;
 
 pub struct Server {
-    /// Dropping it releases the state directory lock.
-    _lock: fs::File,
+    /// The state directory lock; `stop` releases it.
+    lock: fs::File,
     socket: PathBuf,
     tx: Sender<Msg>,
     actor: Option<JoinHandle<()>>,
@@ -331,7 +331,7 @@ impl Server {
 
         log.line(&format!("START socket={}", paths.socket.display()));
         Ok(Self {
-            _lock: lock,
+            lock,
             socket: paths.socket.clone(),
             tx,
             actor: Some(actor),
@@ -351,6 +351,8 @@ impl Server {
         if let Some(actor) = self.actor.take() {
             let _ = actor.join();
         }
+        // SAFETY: `self.lock` is open; unlocking, not just closing, frees a lock a child forked this moment shares until it execs.
+        unsafe { libc::flock(self.lock.as_raw_fd(), libc::LOCK_UN) };
         let _ = fs::remove_file(&self.socket);
         for stream in self
             .open
