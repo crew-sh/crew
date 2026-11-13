@@ -1,8 +1,8 @@
 //! Typed JSON for every client-visible record: mirrors of the socket messages, enums as snake_case names.
 use crew_proto::{
     AccountingSource, AgentKind, AgentView, DiskView, IdleWatcher, JobKind, JobPhase, JobSummary,
-    JobView, JobsReply, MachineView, OwnerSource, ProjectView, RefusalReason, TopReply,
-    WaitCondition, WaitOutcome, WaitReply, WaitingOn,
+    JobView, JobsReply, MachineView, MemoryRetry, OwnerSource, ProjectView, RefusalReason,
+    TopReply, WaitCondition, WaitOutcome, WaitReply, WaitingOn,
 };
 use serde::Serialize;
 
@@ -128,6 +128,24 @@ mirror!(
         }
 );
 
+/// The usher killed an earlier run of the job for memory and queued it again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct Retry {
+    pub kills: u32,
+    pub expected_mem_bytes: u64,
+    pub peak_mem_bytes: u64,
+}
+
+impl From<&MemoryRetry> for Retry {
+    fn from(r: &MemoryRetry) -> Self {
+        Self {
+            kills: r.kills,
+            expected_mem_bytes: r.expected_mem_bytes,
+            peak_mem_bytes: r.peak_mem_bytes,
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct Job {
     pub id: String,
@@ -146,6 +164,7 @@ pub struct Job {
     pub starts_in_ms: Option<u64>,
     /// Queued jobs: what the wait is, with the numbers.
     pub detail: String,
+    pub retry: Option<Retry>,
 }
 
 impl From<&JobView> for Job {
@@ -165,6 +184,7 @@ impl From<&JobView> for Job {
             waiting_on: v.waiting_on.into(),
             starts_in_ms: v.starts_in_ms,
             detail: v.detail.clone(),
+            retry: v.retry.as_ref().map(Retry::from),
         }
     }
 }
@@ -371,6 +391,7 @@ pub struct JobRecord {
     pub finished_at_unix_ms: u64,
     /// Queued jobs: when the job should start, from learned durations.
     pub starts_in_ms: Option<u64>,
+    pub retry: Option<Retry>,
 }
 
 impl From<&JobSummary> for JobRecord {
@@ -392,6 +413,7 @@ impl From<&JobSummary> for JobRecord {
             started_at_unix_ms: j.started_at_unix_ms,
             finished_at_unix_ms: j.finished_at_unix_ms,
             starts_in_ms: j.starts_in_ms,
+            retry: j.retry.as_ref().map(Retry::from),
         }
     }
 }
@@ -441,6 +463,13 @@ pub enum RunEvent {
     /// The usher is back and the job is queued again under its old id and time.
     Requeued {
         job_id: String,
+    },
+    /// The usher killed the run because memory ran low; the job is queued again and the command reruns once granted.
+    MemoryKilled {
+        job_id: String,
+        kills: u32,
+        peak_mem_bytes: u64,
+        expected_mem_bytes: u64,
     },
 }
 

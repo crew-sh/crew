@@ -30,6 +30,8 @@ const FAST_POLL_WINDOW: Duration = Duration::from_secs(2);
 pub const RECONNECT_BUDGET: Duration = Duration::from_secs(5 * 60);
 const RECONNECT_FIRST: Duration = Duration::from_millis(200);
 const RECONNECT_MAX: Duration = Duration::from_secs(5);
+/// How long a finished run waits for the usher's answer: an Ack, or word that the run was killed for memory and must run again.
+const DONE_REPLY_WAIT: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct RunOptions {
@@ -111,6 +113,10 @@ fn limits_of(grant: &Grant) -> ScopeLimits {
         io_weight: l.io_weight,
         cpus: l.cpus,
     }
+}
+
+fn gib(bytes: u64) -> String {
+    format!("{:.1} GiB", bytes as f64 / (1u64 << 30) as f64)
 }
 
 fn describe_wait(q: &crew_proto::Queued) -> String {
@@ -342,11 +348,11 @@ impl Client {
         self.run_with(opts, |_| Launch::default())
     }
 
-    /// Like `run`, but `launch` sees the grant (none when the job runs unmanaged or inside a granted job) before the command starts.
+    /// Like `run`, but `launch` sees each grant (none when the job runs unmanaged or inside a granted job) before the command starts; a run the usher kills for memory starts again under a new grant.
     pub fn run_with(
         &self,
         opts: &RunOptions,
-        launch: impl FnOnce(Option<&Grant>) -> Launch,
+        mut launch: impl FnMut(Option<&Grant>) -> Launch,
     ) -> Result<i32, ClientError> {
         if opts.argv.is_empty() {
             return Err(ClientError::EmptyCommand);
@@ -403,16 +409,97 @@ impl Client {
             crew_proto::write_frame(&mut stream, &Envelope::of(Body::JobRequest(req.clone())))
                 .is_err();
 
-        // A queued job never falls back to an unmanaged run: if the usher goes away, wait for it and queue again.
-        let grant = loop {
-            if lost {
-                stream = self.requeue(&req, queued_at, opts)?;
-                lost = false;
+        loop {
+            let grant = self.await_grant(&mut stream, &mut lost, &req, queued_at, opts)?;
+            progress(
+                opts,
+                &RunEvent::Granted {
+                    job_id: grant.job_id.clone(),
+                    scope: grant.scope_name.clone(),
+                },
+            );
+            signals::install_termination_handler();
+            let mut run_env = env.clone();
+            let argv = launch(Some(&grant)).apply(&opts.argv, &mut run_env);
+            let (code, done, interrupted) = match run_granted(&argv, &cwd, run_env, &grant) {
+                Ok(v) => v,
+                Err(e) => {
+                    let done = JobDone {
+                        job_id: job_id.clone(),
+                        exit_code: -1,
+                        ..JobDone::default()
+                    };
+                    let _ =
+                        crew_proto::write_frame(&mut stream, &Envelope::of(Body::JobDone(done)));
+                    return Err(e);
+                }
+            };
+            let _ =
+                crew_proto::write_frame(&mut stream, &Envelope::of(Body::JobDone(done.clone())));
+            let _ = stream.set_read_timeout(Some(DONE_REPLY_WAIT));
+            let answer = crew_proto::read_frame(&mut stream);
+            // The usher has queued it again on this connection; an interrupted client leaves, which drops that entry.
+            if let Ok(Some(Envelope {
+                body: Some(Body::MemoryKilled(killed)),
+            })) = answer
+                && !interrupted
+            {
+                let _ = stream.set_read_timeout(None);
+                let retry = killed.retry.unwrap_or_default();
+                if opts.json {
+                    progress(
+                        opts,
+                        &RunEvent::MemoryKilled {
+                            job_id: killed.job_id,
+                            kills: retry.kills,
+                            peak_mem_bytes: retry.peak_mem_bytes,
+                            expected_mem_bytes: retry.expected_mem_bytes,
+                        },
+                    );
+                } else {
+                    eprintln!(
+                        "crew: the usher killed job {} because memory ran low (it reached {}); it is queued again and reruns with {} reserved",
+                        killed.job_id,
+                        gib(retry.peak_mem_bytes),
+                        gib(retry.expected_mem_bytes)
+                    );
+                }
+                continue;
             }
-            let frame = match crew_proto::read_frame(&mut stream) {
+            progress(
+                opts,
+                &RunEvent::Done {
+                    job_id: done.job_id.clone(),
+                    exit_code: done.exit_code,
+                    wall_ms: done.wall_ms,
+                    cpu_usec: done.cpu_usec,
+                    peak_mem_bytes: done.peak_mem_bytes,
+                    io_read_bytes: done.io_read_bytes,
+                    io_write_bytes: done.io_write_bytes,
+                },
+            );
+            return Ok(code);
+        }
+    }
+
+    /// Reads the usher's replies until it grants the job; a queued job never falls back to an unmanaged run: if the usher goes away, wait for it and queue again.
+    fn await_grant(
+        &self,
+        stream: &mut UnixStream,
+        lost: &mut bool,
+        req: &JobRequest,
+        queued_at: u64,
+        opts: &RunOptions,
+    ) -> Result<Grant, ClientError> {
+        loop {
+            if *lost {
+                *stream = self.requeue(req, queued_at, opts)?;
+                *lost = false;
+            }
+            let frame = match crew_proto::read_frame(stream) {
                 Ok(Some(frame)) => frame,
                 Ok(None) | Err(FrameError::Io(_)) => {
-                    lost = true;
+                    *lost = true;
                     continue;
                 }
                 Err(e) => return Err(e.into()),
@@ -424,7 +511,7 @@ impl Client {
                 });
             };
             match outcome {
-                Some(reply::Outcome::Grant(g)) => break g,
+                Some(reply::Outcome::Grant(g)) => return Ok(g),
                 Some(reply::Outcome::Queued(q)) => {
                     if opts.json {
                         progress(
@@ -450,46 +537,7 @@ impl Client {
                 }
                 None => return Err(ClientError::Protocol),
             }
-        };
-
-        progress(
-            opts,
-            &RunEvent::Granted {
-                job_id: grant.job_id.clone(),
-                scope: grant.scope_name.clone(),
-            },
-        );
-        signals::install_termination_handler();
-        let argv = launch(Some(&grant)).apply(&opts.argv, &mut env);
-        let outcome = run_granted(&argv, &cwd, env, &grant);
-        let (code, done) = match outcome {
-            Ok(v) => v,
-            Err(e) => {
-                let done = JobDone {
-                    job_id: job_id.clone(),
-                    exit_code: -1,
-                    ..JobDone::default()
-                };
-                let _ = crew_proto::write_frame(&mut stream, &Envelope::of(Body::JobDone(done)));
-                return Err(e);
-            }
-        };
-        progress(
-            opts,
-            &RunEvent::Done {
-                job_id: done.job_id.clone(),
-                exit_code: done.exit_code,
-                wall_ms: done.wall_ms,
-                cpu_usec: done.cpu_usec,
-                peak_mem_bytes: done.peak_mem_bytes,
-                io_read_bytes: done.io_read_bytes,
-                io_write_bytes: done.io_write_bytes,
-            },
-        );
-        let _ = crew_proto::write_frame(&mut stream, &Envelope::of(Body::JobDone(done)));
-        let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-        let _ = crew_proto::read_frame(&mut stream);
-        Ok(code)
+        }
     }
 }
 
@@ -543,12 +591,13 @@ fn run_unmanaged(
     Ok(exit_code(status))
 }
 
+/// The exit code, the report for the usher, and whether the client was told to stop while it ran.
 fn run_granted(
     argv: &[String],
     cwd: &Path,
     mut env: BTreeMap<String, String>,
     grant: &Grant,
-) -> Result<(i32, JobDone), ClientError> {
+) -> Result<(i32, JobDone, bool), ClientError> {
     for key in &grant.env_unset {
         env.remove(key);
     }
@@ -571,7 +620,7 @@ fn run_granted(
                 source,
             }
         })?;
-    let (status, stats) = supervise(child, &grant.scope_name);
+    let (status, stats, interrupted) = supervise(child, &grant.scope_name);
     if let Some(dir) = &tmpdir {
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -587,7 +636,7 @@ fn run_granted(
         io_write_bytes: stats.io_write,
         working_set: true,
     };
-    Ok((code, done))
+    Ok((code, done, interrupted))
 }
 
 /// Wraps the command in `mbx reserve` when the usher asks for pool capacity and mbx is where it said.
@@ -595,8 +644,8 @@ pub fn with_reserve(argv: &[String], grant: &Grant) -> Vec<String> {
     grant.reserved_argv(argv)
 }
 
-/// Waits for the command, keeps the scope's last readable stats, and turns SIGINT/SIGTERM into scope kills.
-fn supervise(mut child: Child, scope_name: &str) -> (std::io::Result<ExitStatus>, Stats) {
+/// Waits for the command, keeps the scope's last readable stats, and turns SIGINT/SIGTERM into scope kills; says whether one came.
+fn supervise(mut child: Child, scope_name: &str) -> (std::io::Result<ExitStatus>, Stats, bool) {
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
         let _ = tx.send(child.wait());
@@ -608,9 +657,13 @@ fn supervise(mut child: Child, scope_name: &str) -> (std::io::Result<ExitStatus>
     let mut signalled = false;
     loop {
         match rx.recv_timeout(tick) {
-            Ok(status) => return (status, last),
+            Ok(status) => return (status, last, signalled),
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                return (Err(std::io::Error::other("wait thread died")), last);
+                return (
+                    Err(std::io::Error::other("wait thread died")),
+                    last,
+                    signalled,
+                );
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
         }

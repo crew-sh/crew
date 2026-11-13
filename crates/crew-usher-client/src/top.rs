@@ -2,7 +2,7 @@ use std::fmt::Write;
 
 use crew_proto::{
     AccountingSource, AgentKind, AgentView, IdleWatcher, JobKind, JobView, MachineView,
-    OwnerSource, ProjectView, TopReply, WaitingOn,
+    MemoryRetry, OwnerSource, ProjectView, TopReply, WaitingOn,
 };
 
 const GIB: f64 = (1u64 << 30) as f64;
@@ -37,6 +37,16 @@ pub(crate) fn truncate(s: &str, max: usize) -> String {
     } else {
         format!("{}…", s.chars().take(max - 1).collect::<String>())
     }
+}
+
+/// A retried job's kills and what it reserves now.
+pub(crate) fn retry_line(r: &MemoryRetry) -> String {
+    format!(
+        "killed {}x for memory (peak {} GiB); reserves {} GiB",
+        r.kills,
+        gib(r.peak_mem_bytes),
+        gib(r.expected_mem_bytes)
+    )
 }
 
 fn kind_name(v: &JobView) -> &'static str {
@@ -236,6 +246,9 @@ pub fn render(t: &TopReply) -> String {
     }
     for v in &t.running {
         let _ = writeln!(out, "{}", running_row(v));
+        if let Some(r) = &v.retry {
+            let _ = writeln!(out, "         {}", retry_line(r));
+        }
     }
     let _ = writeln!(out, "\nQUEUED ({})", t.queued.len());
     if !t.queued.is_empty() {
@@ -247,6 +260,9 @@ pub fn render(t: &TopReply) -> String {
     }
     for v in &t.queued {
         let _ = writeln!(out, "{}", queued_row(v));
+        if let Some(r) = &v.retry {
+            let _ = writeln!(out, "         {}", retry_line(r));
+        }
     }
     agent_sections(t, &mut out);
     out

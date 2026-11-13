@@ -3,7 +3,7 @@ use std::fmt::Write;
 
 use crew_proto::{JobKind, JobPhase, JobSummary, JobsReply, WaitingOn};
 
-use crate::top::{duration, starts_in, truncate};
+use crate::top::{duration, retry_line, starts_in, truncate};
 
 fn phase(j: &JobSummary) -> JobPhase {
     JobPhase::try_from(j.phase).unwrap_or(JobPhase::Unspecified)
@@ -47,6 +47,10 @@ fn section(
         let _ = writeln!(out, "{}", row(j));
         if !j.log_path.is_empty() {
             let _ = writeln!(out, "    log: {}", j.log_path);
+        }
+        // A queued retry's reason already says it.
+        if let Some(r) = j.retry.as_ref().filter(|_| phase(j) != JobPhase::Queued) {
+            let _ = writeln!(out, "    {}", retry_line(r));
         }
         if !j.reason.is_empty() {
             let _ = writeln!(out, "    {}", j.reason);

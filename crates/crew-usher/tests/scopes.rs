@@ -1233,3 +1233,91 @@ fn a_job_temp_dir_is_private_and_a_killed_clients_leftover_is_swept_at_start() {
     );
     assert!(other.exists(), "only job-id shaped names are swept");
 }
+
+/// Kills whenever a restartable job runs: no machine has this much memory available.
+const ALWAYS_LOW_GIB: u64 = 1 << 30;
+
+/// A command that is killed twice: it records its job id, and only the third run ends, by itself, at once.
+fn third_run_ends(runs: &Path) -> String {
+    let runs = runs.display();
+    format!("echo \"$CREW_JOB\" >> {runs}; [ $(wc -l < {runs}) -ge 3 ] || sleep 60")
+}
+
+fn run_ids(runs: &Path) -> Vec<String> {
+    std::fs::read_to_string(runs)
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+#[test]
+fn a_crew_run_killed_for_memory_runs_again_under_its_id_and_alone_after_two_kills() {
+    let Some(f) = Fixture::start(|c| c.kill_below_free_mem_gib = ALWAYS_LOW_GIB) else {
+        return;
+    };
+    // The third run is exclusive, and exclusive jobs run only while the owner is away.
+    f.client.set_owner(OwnerArg::Away).unwrap();
+    let runs = f.root().join("runs");
+    let code = f
+        .client
+        .run(&opts(JobKind::Build, &["sh", "-c", &third_run_ends(&runs)]))
+        .unwrap();
+    assert_eq!(code, 0, "{}", f.log());
+    let ids = run_ids(&runs);
+    assert_eq!(ids.len(), 3, "{ids:?}\n{}", f.log());
+    assert!(ids.iter().all(|id| *id == ids[0]), "{ids:?}");
+    let log = f.log();
+    assert_eq!(
+        log.matches(&format!("KILL id={}", ids[0])).count(),
+        2,
+        "{log}"
+    );
+    assert_eq!(
+        log.matches(&format!("RETRY id={}", ids[0])).count(),
+        2,
+        "{log}"
+    );
+}
+
+#[test]
+fn a_detached_job_killed_for_memory_runs_again_and_its_log_says_why() {
+    let Some(f) = Fixture::start(|c| c.kill_below_free_mem_gib = ALWAYS_LOW_GIB) else {
+        return;
+    };
+    f.client.set_owner(OwnerArg::Away).unwrap();
+    let runs = f.root().join("runs");
+    let log = f.root().join("job.log");
+    let job = f
+        .client
+        .detach(&detach_opts(
+            JobKind::Test,
+            &["sh", "-c", &third_run_ends(&runs)],
+            Some(&log),
+        ))
+        .unwrap();
+    let w = wait_for(&f.client, &job.job_id, WaitCondition::JobExit);
+    assert_eq!(
+        (WaitOutcome::try_from(w.outcome).unwrap(), w.exit_code),
+        (WaitOutcome::Satisfied, Some(0)),
+        "{}",
+        f.log()
+    );
+    assert_eq!(run_ids(&runs), vec![job.job_id.clone(); 3]);
+    let text = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(text.matches("memory ran low").count(), 2, "{text}");
+    let jobs = f.client.jobs().unwrap();
+    let j = jobs.jobs.iter().find(|j| j.id == job.job_id).unwrap();
+    assert_eq!(JobPhase::try_from(j.phase).unwrap(), JobPhase::Exited);
+    assert_eq!(j.retry.map(|r| r.kills), Some(2));
+}
+
+#[test]
+fn kinds_that_may_not_be_killed_run_through_low_memory() {
+    let Some(f) = Fixture::start(|c| c.kill_below_free_mem_gib = ALWAYS_LOW_GIB) else {
+        return;
+    };
+    let o = opts(JobKind::Harness, &["sh", "-c", "sleep 5"]);
+    assert_eq!(f.client.run(&o).unwrap(), 0);
+    assert!(!f.log().contains("KILL"), "{}", f.log());
+}

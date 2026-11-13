@@ -132,6 +132,18 @@ Every wait is on a resource: memory, cores, the game cap, disk, your presence, o
 - A job that has waited `starve_after_secs` (10 minutes) on memory or cores holds what it lacks. A later job still starts if it should end before the held job can start (by its learned duration), or if it fits in what the held job leaves spare once everything now running has ended. Otherwise it waits with the reason, for example `memory is held for test 1a2b3c4d (myrepo: cargo test), which has waited 11m on memory: ...`.
 - An exclusive job lets others start beside the running ones while it cannot start anyway. Once it has waited `exclusive_drain_after_secs` (10 minutes) while you were away, the usher drains: no new job starts, the running ones finish, and it runs alone. Those jobs wait on `drain`, and `crew top` shows `draining for <job>`. An exclusive job therefore waits at most that long plus the longest job running when the drain began.
 
+#### When memory runs out
+
+Admission is optimistic: a job starts on its expected size, and nothing stops it from growing past it. When available memory (`MemAvailable`, the figure admission uses) falls below `kill_below_free_mem_gib` (3 GiB), the usher kills its newest running job of a kind that may be killed (`build` and `test`; see `restartable` below) and runs it again later. It never kills an exclusive job, and it kills one job at a time: the next kill waits until the killed job's scope is gone and its memory has had 5 seconds to come back.
+
+The killed job goes back into the queue with its id and its original queue time, so it keeps its place, and `crew wait job <id>` and `crew jobs` follow it. Its next run reserves 1.5 times the peak it reached, or what it reserved before if that was more, even over a smaller `--mem`; never more than the machine can admit. The next submission of the same command starts from that figure too, until a run of it succeeds. After its second kill the job runs alone, as with `--exclusive` (so it waits until you are away).
+
+- `crew run` prints that the usher killed the job, waits for a new grant and runs the command again; it does not exit with the kill. `--json` prints a `memory_killed` event instead of `done`.
+- A detached job's log gets a line saying it was killed for memory and will run again.
+- `crew jobs` and `crew top` show how often a job was killed and what it reserves now, and the queued job's reason starts with `killed 1x for memory`.
+- A `crew run` job that a restarted usher adopted has no client left to run it again: it is cancelled as `crew cancel` does, not retried.
+- The usher log has a `KILL` line naming the job, its peak, `MemAvailable` then, and how much crew's jobs hold against the rest of the machine.
+
 #### Detached jobs
 
 A queued `crew run` lives only as long as its client. For a job that waits hours, or must outlive the agent that submitted it, hand it to the usher:
@@ -303,6 +315,7 @@ Other agents run on this machine. Use crew so we do not starve each other.
 - Run `crew top` to see what is running and what you are waiting on. Do not start a second copy of a job that is already queued.
 - Pass `--exclusive` only when a measurement needs the machine to itself (timings). Memory measurements, builds and tests never do; `--kind bench` alone already waits until the owner is away.
 - Never run `crew plan approve`, and never read `~/.config/crew/owner-token`. Approvals come from the owner. If a step is gated, report it and wait.
+- If crew says the usher killed your job because memory ran low, it runs the job again by itself. Do not submit it again.
 - `crew run` exits 75 when it refuses a job (low disk, no display while the owner is here). Do not retry in a loop. Report it.
 - Do not open windows. crew removes DISPLAY and WAYLAND_DISPLAY from your jobs on purpose.
 - Set `CREW_AGENT=<your name>` so crew can tell sessions apart.
@@ -321,6 +334,7 @@ These are the defaults:
 <!-- test:usher-defaults -->
 ```toml
 min_free_mem_gib = 16
+kill_below_free_mem_gib = 3
 max_games = 4
 cpu_oversub = 1.5
 idle_timeout_secs = 120
@@ -343,6 +357,7 @@ freeze_psi_cpu = 40.0
 | Key | Meaning |
 |---|---|
 | `min_free_mem_gib` | Memory kept free. A job waits unless available memory, minus what running jobs have reserved, covers this plus the job's expected size. |
+| `kill_below_free_mem_gib` | Below this much available memory the usher kills its newest restartable job and runs it again with more memory reserved (see [When memory runs out](#when-memory-runs-out)). It must be below `min_free_mem_gib`; `0` never kills. A file that sets `min_free_mem_gib` to 3 or less and leaves this key out gets `0`. |
 | `max_games` | How many `game` jobs may run at once. `0` refuses them. |
 | `cpu_oversub` | Granted cores may add up to `cpu count × this`, minus cores used by processes outside crew. |
 | `watched_paths` | Paths whose free disk space the usher measures and `crew top` shows. Default: `/`, plus `$HOME` when it is on another filesystem. |
@@ -383,8 +398,9 @@ mem_cap_gib = 8
 | `cpu_weight`, `io_weight` | cgroup weights. |
 | `exclusive` | Every job of the kind runs alone, and only while you are away, as with `--exclusive`. |
 | `away_only` | Jobs of the kind run only while you are away. |
+| `restartable` | The usher may kill a running job of the kind when memory runs low, and run it again. |
 
-Built-in values: every kind expects 2 GiB, 1 core and weight 100. Exceptions: `build` expects 4 cores. `game` is capped at 6 GiB and expects 6. `bench` runs only while you are away (it is not exclusive; `--exclusive` asks for that). `lsp` has `cpu_weight` 20.
+Built-in values: every kind expects 2 GiB, 1 core and weight 100. Exceptions: `build` expects 4 cores. `game` is capped at 6 GiB and expects 6. `bench` runs only while you are away (it is not exclusive; `--exclusive` asks for that). `lsp` has `cpu_weight` 20. Only `build` and `test` are `restartable`.
 
 Once the usher has seen a command run, it reserves the median of its last 20 successful runs instead of these numbers (and estimates start times from their median duration), held between half and eight times the kind's expectation. A size you give with `--mem` always wins. The figure is the job's working set (anonymous, shared and kernel memory), sampled while it runs: page cache a build writes is not counted. Commands unseen for 28 days are forgotten. It keeps them in `$XDG_STATE_HOME/crew/usher-sizes.pb`. The log is `usher.log` in the same directory. Detached jobs keep `usher-jobs.pb` and a `jobs/` folder there too.
 
@@ -525,7 +541,7 @@ Why separate programs:
 ## Safety
 
 - crew never opens a window or takes over a display. The usher reads idle time from the Wayland compositor and does nothing else with it. It removes `DISPLAY`, `WAYLAND_DISPLAY` and `WAYLAND_SOCKET` from job environments, so a test cannot open a window on your desktop. A private X display such as `:99` is kept. `--display` jobs are refused while you are present. `CREW_DESKTOP=1` is the one opt-out.
-- The usher kills only its own scopes: a job's scope when its `crew run` goes away or receives SIGTERM, and a detached job's scope on `crew cancel`. It never signals other processes.
+- The usher kills only its own scopes: a job's scope when its `crew run` goes away or receives SIGTERM, a detached job's scope on `crew cancel`, and its newest restartable job's scope when memory runs critically low. It never signals other processes.
 - Agent sessions (processes named `claude` or `codex`) are observed, not managed. `[adopt]` can move a session into a crew cgroup and freeze the busiest one under CPU pressure. Neither is implemented yet. `move` and `freeze` default to `false`, and when set they only write "would do" lines to the log. Sessions with a terminal, without `CREW_AGENT`, or listed in `protect` are never candidates.
 - The usher runs as you and listens on a socket in a `0700` directory. There is no authentication beyond that.
 - `crew queue` runs your `check` commands with your permissions, in worktrees under `.crew/`.
